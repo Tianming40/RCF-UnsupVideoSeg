@@ -236,3 +236,18 @@ Please cite our work if you find our work inspiring or use our code in your work
   year={2022}
 }
 ```
+
+
+# modify from Tianming
+in eval stage to select the object channel 
+
+```
+python maa.py --pretrain_dir path/to/your/pretrained_rcf_folder --dataset davis --num-channels 4 --first-frames-only
+
+CUDA_VISIBLE_DEVICES=0 python tools/SemanticConstraintsAndMAA/maa.py \
+    --pretrain_dir saved/pretrained_rcf \
+    --dataset davis \
+    --num-channels 4 \
+    --step 0 \
+    --first-frames-only
+```

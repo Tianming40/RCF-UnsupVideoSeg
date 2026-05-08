@@ -166,7 +166,7 @@ saved*
 data_example
 Annotations
 JPEGImages
-
+masks
 data/pretrained
 *ignored.*
 *_run*.yaml

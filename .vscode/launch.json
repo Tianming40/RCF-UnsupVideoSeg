@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Remote Attach (lh0603, port 5678)",
+            "name": "Remote Debug (rcf)",
             "type": "python",
             "request": "attach",
             "connect": {
@@ -15,10 +15,9 @@
             "pathMappings": [
                 {
                     "localRoot": "${workspaceFolder}",
-                    "remoteRoot": "."
+                    "remoteRoot": "/media/mitiadmin/Micron_7450_1/tianming/RCF-UnsupVideoSeg"
                 }
-            ],
-            "justMyCode": true
+            ]
         }
     ]
 }

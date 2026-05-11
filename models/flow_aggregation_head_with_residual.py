@@ -3,6 +3,10 @@ import utils
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from scipy.ndimage import binary_dilation
+import math
+# import torch  # Assuming PyTorch is being used, as in code 2
 
 logger = utils.get_logger()
 
@@ -309,6 +313,40 @@ class FlowAggregationHeadWithResidual(nn.Module):
         # Output: [B, C1=2, H, W]
         return flow_overall, flow_agg, residual_adjustment, flow_affine
 
+##### topk + disparity    
+    def calculate_angle(self, v1, v2):
+        unit_v1 = v1 / torch.norm(v1, dim=-1, keepdim=True)
+        unit_v2 = v2 / torch.norm(v2, dim=-1, keepdim=True)
+        dot_product = torch.sum(unit_v1 * unit_v2, dim=-1)
+        angle = torch.acos(dot_product)
+        return angle
+
+    def detect_flow_changes_batch(self, flow_data, threshold=math.pi / 3, dilation_size=7):
+        angle_data = torch.atan2(flow_data[:, 1], flow_data[:, 0])
+
+        B, _, H, W = flow_data.shape
+        mask = torch.zeros_like(angle_data)
+        padded_angle_data = F.pad(angle_data, (1, 1, 1, 1), mode='replicate')
+
+        # Modify the index here
+        diff_left = padded_angle_data[:, 1:-1, 1:-1] - padded_angle_data[:, 1:-1, :-2]
+        diff_right = padded_angle_data[:, 1:-1, 1:-1] - padded_angle_data[:, 1:-1, 2:]
+        diff_up = padded_angle_data[:, 1:-1, 1:-1] - padded_angle_data[:, :-2, 1:-1]
+        diff_down = padded_angle_data[:, 1:-1, 1:-1] - padded_angle_data[:, 2:, 1:-1]
+
+        max_diff = torch.max(torch.max(torch.abs(diff_left), torch.abs(diff_right)),
+                            torch.max(torch.abs(diff_up), torch.abs(diff_down)))
+        mask = max_diff > threshold
+
+        mask_4d = mask.unsqueeze(1).float()  # shape: [B, 1, H, W]
+
+        dilation_kernel = torch.ones(1, 1, dilation_size, dilation_size, device=flow_data.device)
+
+        dilated_mask = F.conv2d(mask_4d, dilation_kernel, padding=dilation_size//2) > 0
+
+        return dilated_mask
+
+    
     def forward(self, imgs, masks, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw):
         # masks [B, C=5, H, W]: expected to sum up to 1 across channel dimension (C=5)
         # gt_fw_flows: [B, im_num - 1, C=2, H, W]
@@ -323,6 +361,12 @@ class FlowAggregationHeadWithResidual(nn.Module):
         # im_num: number of images in "pairs" (usually 2)
         assert im_num == 2, "Other im_num not implemented"
 
+        
+        individual_losses_fw = []
+        individual_losses_bw = []
+        
+        
+        
         for i in range(1, im_num):
             # Now we match the flow for simplicity.
 
@@ -346,26 +390,27 @@ class FlowAggregationHeadWithResidual(nn.Module):
             bw_flow_overall, bw_flow_agg, bw_residual_adjustment, bw_flow_affine = self.aggregate_flow_with_residual(
                 mask2, gt_bw_flow, all_pred_residual_bw)
 
-            # two_frame = torch.cat([im1, im2], 1)
-            # res_dict = self.flownet(two_frame, [mask1, mask2], with_bk=True)
 
-            # loss = self.get_loss(res_dict['flows_fw'], res_dict['flows_bw'])
-            # loss_all = self.get_loss(
-            #     res_dict['flows_fw_all'], res_dict['flows_bw_all'])
+            mask_fw_flow = self.detect_flow_changes_batch(gt_fw_flow)
+            mask_bw_flow = self.detect_flow_changes_batch(gt_bw_flow)
 
-            # flow_loss['seg'] += loss
-            # flow_loss['whole'] += loss_all
 
+            # loss
             if not self.outlier_robust_loss:
-                flow_loss['seg_fw'] += ((gt_fw_flow -
-                                        fw_flow_overall).abs()).view(-1).mean()
-                flow_loss['seg_bw'] += ((gt_bw_flow -
-                                        bw_flow_overall).abs()).view(-1).mean()
+                losses_fw = ((gt_fw_flow - fw_flow_overall).abs())*mask_fw_flow
+                losses_fw = losses_fw.sum(dim=(1,2,3))/(mask_fw_flow.sum(dim=(1,2,3))+1e-6)
+                losses_bw = ((gt_bw_flow - bw_flow_overall).abs())*mask_bw_flow
+                losses_bw = losses_bw.sum(dim=(1,2,3))/(mask_bw_flow.sum(dim=(1,2,3))+1e-6)
             else:
-                flow_loss['seg_fw'] += ((((gt_fw_flow - fw_flow_overall).abs()
-                                          ).view(-1) + self.eps) ** self.q).mean()
-                flow_loss['seg_bw'] += ((((gt_bw_flow - bw_flow_overall).abs()
-                                          ).view(-1) + self.eps) ** self.q).mean()
+                losses_fw = ((((gt_fw_flow - fw_flow_overall).abs()).view(batch_size, -1) + self.eps) ** self.q).mean(dim=1)
+                losses_bw = ((((gt_bw_flow - bw_flow_overall).abs()).view(batch_size, -1) + self.eps) ** self.q).mean(dim=1)
+
+
+            individual_losses_fw.append(losses_fw)
+            individual_losses_bw.append(losses_bw)
+
+
+
 
             _h, _w, flow, flow2 = get_norm_flow(
                 lis1=gt_fw_flow, lis2=gt_bw_flow)
@@ -394,6 +439,35 @@ class FlowAggregationHeadWithResidual(nn.Module):
                 # After cat: [B, C=4, H, W]
                 flows['affine_flow'].append(torch.cat([flow, flow2], dim=1))
 
-        flow_loss['seg'] = flow_loss['seg_fw'] + flow_loss['seg_bw']
 
-        return flows, flow_loss
+
+
+        # Combined and sorted losses topk
+        total_losses_fw = torch.cat(individual_losses_fw)
+        total_losses_bw = torch.cat(individual_losses_bw)
+        total_losses = total_losses_fw + total_losses_bw
+
+        sorted_losses, sorted_indices = torch.sort(total_losses)
+
+        # Select the 2 images with the least loss
+        selected_indices = sorted_indices[:2]
+
+        # Calculate the average loss of the selected images
+        selected_flow_loss = {
+            'seg_fw': total_losses_fw[selected_indices].mean(),
+            'seg_bw': total_losses_bw[selected_indices].mean()
+        }
+        selected_flow_loss['seg'] = selected_flow_loss['seg_fw'] + selected_flow_loss['seg_bw']
+
+        # Update flows and flow_loss to include data for selected images
+        # Make sure the length of the list is at least the same as the length of selected_indices
+        selected_flows = {}
+        for key, value in flows.items():
+                # Check the length of each list to make sure it is not out of range
+                if len(value) >= len(selected_indices):
+                    selected_flows[key] = [value[i] for i in selected_indices]
+                else:
+                    # If the list is not long enough, copy the entire list
+                    selected_flows[key] = value.copy()
+                    
+        return selected_flows, selected_flow_loss

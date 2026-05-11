@@ -3,10 +3,11 @@ import torch.utils.data
 import numpy as np
 import os
 from PIL import Image
+import random
 
-
+# replace with paper
 class VideoDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="", zero_ann=False, pl_root=None):
+    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None):
         super().__init__()
 
         file_path = os.path.join(root, split)
@@ -48,7 +49,10 @@ class VideoDataset(torch.utils.data.Dataset):
         self.load_flow = load_flow
         self.load_pl = load_pl
         self.flow_suffix = flow_suffix
+        self.flow_suffix2 = flow_suffix2
+        self.flow_suffix3 = flow_suffix3
         self.pl_root = pl_root
+        self.pl_root2 = pl_root2
 
         self.zero_ann = zero_ann
 
@@ -80,9 +84,33 @@ class VideoDataset(torch.utils.data.Dataset):
 
         current_seq = self.seq_frames_path_all[seq_ind_within_subset]
 
+        # images = []
+        # for i in range(self.frame_num):
+        #     path = current_seq[frame_ind + i]
+        #     image = self.load_image(path)
+        #     images.append(image)
+        
+        # Randomly select whether to acquire the next frame or two frames apart
+        options = [1, 2, 3]
+        probabilities = [0.7, 0.2, 0.1]
+        frame_gap = np.random.choice(options, p=probabilities)  # 1 means next frame, 2 means two frames apart.
+
         images = []
+        flag_gap = 0
         for i in range(self.frame_num):
-            path = current_seq[frame_ind + i]
+            # Calculate the index of the frame to be acquired
+            frame_to_get = frame_ind + i * frame_gap
+
+            # Make sure the index is within legal limits
+            # If the requirement of two frames apart cannot be met, adjacent frames are used
+            if frame_to_get >= len(current_seq):
+                frame_to_get = frame_ind + i  # Using adjacent frames
+                flag_gap = 1
+            else:
+                frame_to_get = min(frame_to_get, len(current_seq) - 1)  # Using Interval Frames
+                flag_gap = frame_gap
+
+            path = current_seq[frame_to_get]
             image = self.load_image(path)
             images.append(image)
 
@@ -102,7 +130,7 @@ class VideoDataset(torch.utils.data.Dataset):
             assert i == 0, "In eval, we should have one frame only."
             if not self.zero_ann:
                 path = current_seq[frame_ind].replace(
-                    "JPEGImages", "Annotations").replace(".jpg", ".png")
+                    "JPEGImages", "Annotations").replace(".png", ".jpg")    # rewrite by wpr
                 ann = self.load_image(path)
             else:
                 # Set ann to 1x1 zeros
@@ -112,37 +140,98 @@ class VideoDataset(torch.utils.data.Dataset):
             ret['ann'] = ann
 
         if self.load_flow:
-            gt_fw_flows = []
-            gt_bw_flows = []
-            for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                fw_flow_path = current_seq[frame_ind + i].replace(
-                    "JPEGImages", "Flows" + self.flow_suffix)[:-4] + ".npy"
-                bw_flow_path = current_seq[frame_ind + i].replace(
-                    "JPEGImages", "BackwardFlows" + self.flow_suffix)[:-4] + ".npy"
-                if False: # debug
-                    fw_flow_path = "/home/l/lo/longlian/00001.npy"
-                    bw_flow_path = "/home/l/lo/longlian/00001.npy"
-                gt_fw_flow = np.load(fw_flow_path)
-                gt_bw_flow = np.load(bw_flow_path)
+            if flag_gap == 1:
+                gt_fw_flows = []
+                gt_bw_flows = []
+                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
+                    fw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "Flows" + self.flow_suffix)[:-4] + ".npy"
+                    bw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "BackwardFlows" + self.flow_suffix)[:-4] + ".npy"
+                    if False: # debug
+                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
+                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
+                    gt_fw_flow = np.load(fw_flow_path)
+                    gt_bw_flow = np.load(bw_flow_path)
 
-                gt_fw_flows.append(gt_fw_flow)
-                gt_bw_flows.append(gt_bw_flow)
+                    ### Data format modification
+                    gt_fw_flow = gt_fw_flow.astype(np.float32)
+                    gt_bw_flow = gt_bw_flow.astype(np.float32)
+                    
+                    gt_fw_flows.append(gt_fw_flow)
+                    gt_bw_flows.append(gt_bw_flow)
+            elif flag_gap == 2:
+                gt_fw_flows = []
+                gt_bw_flows = []
+                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
+                    fw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "Flows" + self.flow_suffix2)[:-4] + ".npy"
+                    bw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "BackwardFlows" + self.flow_suffix2)[:-4] + ".npy"
+                    if False: # debug
+                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
+                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
+                    gt_fw_flow = np.load(fw_flow_path)
+                    gt_bw_flow = np.load(bw_flow_path)
+
+                    ### Data format modification
+                    gt_fw_flow = gt_fw_flow.astype(np.float32)
+                    gt_bw_flow = gt_bw_flow.astype(np.float32)
+                    
+                    gt_fw_flows.append(gt_fw_flow)
+                    gt_bw_flows.append(gt_bw_flow)
+            elif flag_gap == 3:
+                gt_fw_flows = []
+                gt_bw_flows = []
+                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
+                    fw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "Flows" + self.flow_suffix3)[:-4] + ".npy"
+                    bw_flow_path = current_seq[frame_ind + i].replace(
+                        "JPEGImages", "BackwardFlows" + self.flow_suffix3)[:-4] + ".npy"
+                    if False: # debug
+                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
+                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
+                    gt_fw_flow = np.load(fw_flow_path)
+                    gt_bw_flow = np.load(bw_flow_path)
+
+                    ### Data format modification
+                    gt_fw_flow = gt_fw_flow.astype(np.float32)
+                    gt_bw_flow = gt_bw_flow.astype(np.float32)
+                    
+                    gt_fw_flows.append(gt_fw_flow)
+                    gt_bw_flows.append(gt_bw_flow)
 
             ret['gt_fw_flows'] = gt_fw_flows
             ret['gt_bw_flows'] = gt_bw_flows
             ret['seg_fields'].extend(['gt_fw_flows', 'gt_bw_flows'])
+            
 
         if self.load_pl:
             # PL is different from annotaiton as it requires augmentation
-            pl_masks = []
+            
+            
+            # pl_masks_1
+            pl_masks_1 = []
             for i in range(self.frame_num):
                 # frame_ind + i
                 img_filename = current_seq[frame_ind + i].split('/')[-1][:-4]
                 path = os.path.join(self.pl_root, f'pred_seg_{seq_name}_{img_filename}_0000000.png')
-                pl_mask = np.asarray(self.load_image(path, convert_format="L"))
-                pl_masks.append(pl_mask)
-            ret['pl_masks'] = pl_masks
-            ret['seg_fields'].append('pl_masks')
+                pl_mask_1 = np.asarray(self.load_image(path, convert_format="L"))
+                pl_masks_1.append(pl_mask_1)
+            ret['pl_masks_1'] = pl_masks_1
+            ret['seg_fields'].append('pl_masks_1')
+            
+            # pl_masks_2
+            pl_masks_2 = []
+            for j in range(self.frame_num):
+                # frame_ind + j
+                img_filename2 = current_seq[frame_ind + j].split('/')[-1][:-4]
+                path2 = os.path.join(self.pl_root2, f'pred_seg_{seq_name}_{img_filename2}_0000000.png')
+                pl_mask_2 = np.asarray(self.load_image(path2, convert_format="L"))
+                pl_masks_2.append(pl_mask_2)
+            ret['pl_masks_2'] = pl_masks_2
+            ret['seg_fields'].append('pl_masks_2')
+                                   
 
         if self.transform is not None:
             ret = self.transform(ret)
@@ -163,3 +252,4 @@ if __name__ == "__main__":
 
     for item in dataset:
         continue
+

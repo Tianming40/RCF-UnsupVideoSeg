@@ -15,7 +15,6 @@ class CompactnessHead(nn.Module):
         all_pred_mask = all_pred_mask.flatten(0, 1)
         # all_pred_mask (after flatten): [B * I, C=5, 48, 48] (range from 0 to 1)
         # pred_mask_compact_channel: [B * I, 48, 48]
-        
         if self.compact_channel == -1:
             # Use object channel as compact channel
             if self.args.object_channel is None:

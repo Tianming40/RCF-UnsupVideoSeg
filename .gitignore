@@ -163,6 +163,8 @@ data
 lightning_logs/
 wandb/
 saved*
+!saved/
+!saved_reallynew/
 data_example
 Annotations
 JPEGImages

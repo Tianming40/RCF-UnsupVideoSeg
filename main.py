@@ -484,7 +484,7 @@ def main():
             args.object_channel = cli_args.test_override_object_channel
             logger.info(f"Overriding object channel to {args.object_channel}")
     # TODO delete when train
-    # args.object_channel = None
+        args.object_channel = None
     trainer = pl.Trainer(**trainer_cfg, default_root_dir=args.checkpoints_dir)
     model = Model(args, trainer)
 

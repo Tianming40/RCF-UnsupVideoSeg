@@ -310,8 +310,19 @@ class Model(pl.LightningModule):
         return [optimizer], [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)]
 
     def on_train_epoch_start(self):
-        logger.info(
-            f"LR: {self.optimizers(False).state_dict()['param_groups'][0]['lr']}")
+        current_lr = self.optimizers(False).param_groups[0]['lr']
+
+        logger.info(f"LR: {current_lr}")
+
+        self.log(
+            "lr",
+            current_lr,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True
+        )
 
     def train_dataloader(self):
         train_dataset = self.dataset_cls(
@@ -336,7 +347,7 @@ class Model(pl.LightningModule):
             shuffle=shuffle
         )
 
-    def val_dataloader(self, subsample_frame_interval=10):
+    def val_dataloader(self, subsample_frame_interval=5):
         # subsample_frames for fast evaluation
         test_data_path = self.args.test_data_path if getattr(self.args, 'test_data_path', None) else self.args.data_path
         val_dataset = self.dataset_cls(
@@ -427,13 +438,21 @@ def main():
     # Use checkpoints_dir as the experiment name because we may override checkpoints_dir with CLI options
     exp_name = args.checkpoints_dir.split(
         "/")[-1] + "_" + datetime.now().strftime("%y%m%d_%H%M%S")
-    wandb_logger = pl.loggers.WandbLogger(
-        project="RCF", mode="disabled" if args.disable_wandb else None, name=exp_name, settings=wandb.Settings(start_method="thread"))
-    # save_on_train_epoch_end should be set to True if there is no validation set
+    if args.disable_wandb:
+        wandb_logger = pl.loggers.TensorBoardLogger(  
+            save_dir=args.checkpoints_dir,
+            name='tensorboard_logs',
+            version=None,
+            default_hp_metric=True
+        )
+    else:
+        wandb_logger = pl.loggers.WandbLogger(      
+            project="RCF", mode=None, name=exp_name, settings=wandb.Settings(start_method="thread"))
+        # save_on_train_epoch_end should be set to True if there is no validation set
     # even on rank non-zero we need to have the monitor key (saving is ignored in Stratrgy class so other code that requires the monitor key will run on rank non-zero)
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.checkpoints_dir, save_on_train_epoch_end=False, every_n_epochs=1, monitor='val_miou_frame_avg',
-        save_top_k=2, save_last=True, mode='max', auto_insert_metric_name=True)
+        save_top_k=5, save_last=True, mode='max', auto_insert_metric_name=True)
 
     trainer_cfg = {
         "logger": wandb_logger,
@@ -464,7 +483,7 @@ def main():
         if cli_args.test_override_object_channel is not None:
             args.object_channel = cli_args.test_override_object_channel
             logger.info(f"Overriding object channel to {args.object_channel}")
-
+    args.object_channel = None
     trainer = pl.Trainer(**trainer_cfg, default_root_dir=args.checkpoints_dir)
     model = Model(args, trainer)
 
@@ -473,10 +492,9 @@ def main():
     if not test:
         trainer.fit(model=model)
         if not no_test:
-            # Use hard max to test at the end
             args.saved_eval_dir_name = 'saved_eval_test'
             args.eval_pos_th = -1
-            trainer.test(model=model)
+            trainer.test(model=model, ckpt_path='best')
     else:
         trainer.test(model=model)
 

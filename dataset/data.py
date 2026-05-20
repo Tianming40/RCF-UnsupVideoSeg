@@ -5,7 +5,6 @@ import os
 from PIL import Image
 import random
 
-# replace with paper
 class VideoDataset(torch.utils.data.Dataset):
     def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None):
         super().__init__()
@@ -144,9 +143,9 @@ class VideoDataset(torch.utils.data.Dataset):
                 gt_fw_flows = []
                 gt_bw_flows = []
                 for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i].replace(
+                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "Flows" + self.flow_suffix)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i].replace(
+                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "BackwardFlows" + self.flow_suffix)[:-4] + ".npy"
                     if False: # debug
                         fw_flow_path = "/home/l/lo/longlian/00001.npy"
@@ -164,9 +163,9 @@ class VideoDataset(torch.utils.data.Dataset):
                 gt_fw_flows = []
                 gt_bw_flows = []
                 for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i].replace(
+                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "Flows" + self.flow_suffix2)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i].replace(
+                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "BackwardFlows" + self.flow_suffix2)[:-4] + ".npy"
                     if False: # debug
                         fw_flow_path = "/home/l/lo/longlian/00001.npy"
@@ -184,9 +183,9 @@ class VideoDataset(torch.utils.data.Dataset):
                 gt_fw_flows = []
                 gt_bw_flows = []
                 for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i].replace(
+                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "Flows" + self.flow_suffix3)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i].replace(
+                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
                         "JPEGImages", "BackwardFlows" + self.flow_suffix3)[:-4] + ".npy"
                     if False: # debug
                         fw_flow_path = "/home/l/lo/longlian/00001.npy"
@@ -252,4 +251,3 @@ if __name__ == "__main__":
 
     for item in dataset:
         continue
-

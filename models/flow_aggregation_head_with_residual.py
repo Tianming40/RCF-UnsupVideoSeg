@@ -321,7 +321,7 @@ class FlowAggregationHeadWithResidual(nn.Module):
         angle = torch.acos(dot_product)
         return angle
 
-    def detect_flow_changes_batch(self, flow_data, threshold=math.pi / 3, dilation_size=7):
+    def detect_flow_changes_batch(self, flow_data, threshold=math.pi / 12, dilation_size=7):
         angle_data = torch.atan2(flow_data[:, 1], flow_data[:, 0])
 
         B, _, H, W = flow_data.shape
@@ -397,9 +397,9 @@ class FlowAggregationHeadWithResidual(nn.Module):
 
             # loss
             if not self.outlier_robust_loss:
-                losses_fw = ((gt_fw_flow - fw_flow_overall).abs())*mask_fw_flow
+                losses_fw = ((gt_fw_flow - fw_flow_overall)**2)*mask_fw_flow
                 losses_fw = losses_fw.sum(dim=(1,2,3))/(mask_fw_flow.sum(dim=(1,2,3))+1e-6)
-                losses_bw = ((gt_bw_flow - bw_flow_overall).abs())*mask_bw_flow
+                losses_bw = ((gt_bw_flow - bw_flow_overall)**2)*mask_bw_flow
                 losses_bw = losses_bw.sum(dim=(1,2,3))/(mask_bw_flow.sum(dim=(1,2,3))+1e-6)
             else:
                 losses_fw = ((((gt_fw_flow - fw_flow_overall).abs()).view(batch_size, -1) + self.eps) ** self.q).mean(dim=1)

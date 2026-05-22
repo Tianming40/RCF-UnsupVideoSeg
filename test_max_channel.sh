@@ -1,60 +1,57 @@
 #!/bin/bash
 
-#SBATCH --job-name=rcf_test_max_ch
+#SBATCH --job-name=rcf_eval_all
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
-#SBATCH --output=slurm_rcf_test_max_channel_%j.out
+#SBATCH --time=08:00:00
+#SBATCH --output=slurm_rcf_eval_all_%j.out
 
 source /home/tianming/anaconda3/etc/profile.d/conda.sh
 conda activate rcf
 
 cd /media/mitiadmin/Micron_7450_1/tianming/RCF-UnsupVideoSeg
 
+EVAL_DIR="saved/eval_all_ckpts"
+mkdir -p "$EVAL_DIR"
 
-find_best_ckpt() {
-    local dir=$1
-    python -c "
-import torch, glob, os
-ckpts = [f for f in glob.glob('${dir}/*.ckpt') if 'last' not in f]
-best_score = -1
-best_path = ''
-for ckpt in sorted(ckpts):
-    try:
-        d = torch.load(ckpt, map_location='cpu')
-        for k, v in d.get('callbacks', {}).items():
-            if 'ModelCheckpoint' in str(k):
-                score = float(v.get('best_model_score') or -1)
-                path  = v.get('best_model_path', '')
-                if score > best_score and path and os.path.exists(path):
-                    best_score = score
-                    best_path  = path
-    except Exception as e:
-        pass
-print(best_path if best_path else sorted(ckpts)[0])
-"
-}
+RESULT_FILE="${EVAL_DIR}/results.txt"
+echo "ckpt,test_miou" > $RESULT_FILE
 
-for fold in 1 2 3 4; do
-    echo "=========================================="
-    echo "Testing Fold $fold  (max channel, hard argmax)"
-    echo "Started at: $(date)"
-    echo "=========================================="
+for RUN_DIR in saved/saved_instrument_trainval_run*/; do
+    for CKPT in "${RUN_DIR}"*.ckpt; do
+        [[ "$CKPT" == *"last.ckpt" ]] && continue
 
-    CKPT=$(find_best_ckpt "saved/saved_instrument_fold${fold}")
-    echo "Using checkpoint: $CKPT"
 
-    # eval_pos_th=-1 → hard argmax
-    # object_channel  → main.py  None → max channel
-    CUDA_VISIBLE_DEVICES=0 python main.py \
-        configs/instrument/rcf_instrument_fold${fold}.yaml \
-        --test \
-        --test-override-pretrained "$CKPT" \
-        --opts allow_overwriting_checkpoints_dir True eval_pos_th -1
+        RUN_NAME=$(basename "$RUN_DIR")
+        CKPT_NAME=$(basename "$CKPT" .ckpt)
+        CKPT_EVAL_DIR="${EVAL_DIR}/${RUN_NAME}_${CKPT_NAME}"
 
-    echo "Fold $fold done at: $(date)"
-    echo ""
+        echo ""
+        echo "=============================="
+        echo "Evaluating: $CKPT"
+        echo "Output dir: $CKPT_EVAL_DIR"
+        echo "=============================="
+
+        SCORE=$(CUDA_VISIBLE_DEVICES=0 python main.py \
+            configs/instrument/rcf_instrument_trainval.yaml \
+            --test \
+            --test-override-pretrained "$CKPT" \
+            --opts allow_overwriting_checkpoints_dir True \
+                   checkpoints_dir "$CKPT_EVAL_DIR" \
+                   eval_pos_th -1 \
+                   test_dataset_kwargs.split trainval.txt \
+            2>&1 | grep "test_miou: " | tail -1 | grep -oP "test_miou: \K[0-9.]+")
+
+        SCORE=${SCORE:-0}
+        echo "  Score: $SCORE"
+        echo "${CKPT},${SCORE}" >> $RESULT_FILE
+    done
 done
 
-echo "All folds finished at: $(date)"
+echo ""
+echo "=============================="
+echo "All done! Results saved to $RESULT_FILE"
+echo "Top 3 checkpoints:"
+tail -n +2 $RESULT_FILE | sort -t',' -k2 -rn | head -3
+echo "=============================="

@@ -9,8 +9,8 @@ weight_decay: 1.e-4
 
 workers: 16
 
-checkpoints_dir: saved/saved_instrument_trainval
-pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+checkpoints_dir: test/saved_instrument_fold2
+pretrained_model: saved_reallynew/saved_instrument_fold2/epoch=23-step=4056.ckpt
 model_cls: RCFModel
 
 eval_pos_th: 0.35
@@ -29,7 +29,7 @@ loss_log_interval: 10
 object_channel: null
 
 # Use Endovis  as training set
-data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/data_medical
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_medical_format
 dataset_kwargs: {}
 
 train_dataset_kwargs:
@@ -38,14 +38,14 @@ train_dataset_kwargs:
   flow_suffix: "_NewCT"      # gap=1: Flows_NewCT
   flow_suffix2: "_NewCT2"    # gap=2: Flows_NewCT2
   flow_suffix3: "_NewCT3"  # gap=3: Flows_NewCT3
-  split: trainval.txt
+  split: fold2_train.txt
   zero_ann: false
 
 test_dataset_kwargs:
   frame_num: 1
   load_flow: false
-  split: fold1_val.txt
-  zero_ann: false
+  split: all_frames.txt
+  zero_ann: true
 
 lr_scheduler_kwargs:
   # policy: 'poly'

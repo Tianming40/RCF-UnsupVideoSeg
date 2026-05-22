@@ -173,3 +173,4 @@ data/pretrained
 sync*.sh
 notebooks/visualizations
 notebooks/visualizations_bw
+*.out

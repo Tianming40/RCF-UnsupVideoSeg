@@ -73,7 +73,7 @@ class Model(pl.LightningModule):
         self.args = args
         self.model = models.__dict__[args.model_cls](args, **args.model_kwargs)
 
-        if args.pretrained_model is not None:
+        if args.pretrained_model is not None and not getattr(args, 'resume_from_checkpoint', None):
             if "*" in args.pretrained_model:
                 potential_matches = glob(args.pretrained_model)
                 assert len(
@@ -406,6 +406,8 @@ def main():
                         default=None, type=int)
     parser.add_argument('--no-test', help='no test at the end of training',
                         default=False, action="store_true")
+    parser.add_argument('--resume', help='resume training from checkpoint (restores model weights, optimizer, lr scheduler, and epoch)',
+                        default=None, type=str)
     # From detectron2
     parser.add_argument(
         "--opts",
@@ -467,6 +469,7 @@ def main():
     args.config_path = config_path
     args.test = test
     args.rank = rank
+    args.resume_from_checkpoint = cli_args.resume
     args.multi_gpu = rank > -1
 
     if args.multi_gpu:
@@ -491,7 +494,7 @@ def main():
     logger.info(f"{model}")
 
     if not test:
-        trainer.fit(model=model)
+        trainer.fit(model=model, ckpt_path=args.resume_from_checkpoint)
         if not no_test:
             args.saved_eval_dir_name = 'saved_eval_test'
             args.eval_pos_th = -1

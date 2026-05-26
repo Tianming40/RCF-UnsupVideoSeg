@@ -1,22 +1,19 @@
-# Note: By default, this config uses trainval as training
-
-# Uses pre-extracted flows.
 batch_size: 8
-epochs: 120
-learning_rate: 1.e-4
+epochs: 30
+learning_rate: 5.e-5
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 16
 
-checkpoints_dir: saved/saved_instrument_fold2
-pretrained_model: saved_reallynew/saved_instrument_fold2/epoch=23-step=4056.ckpt
+checkpoints_dir: test/saved_cmc_val
+pretrained_model: saved/saved_cmc_finetune/epoch=13-step=2526.ckpt
 model_cls: RCFModel
 
 eval_pos_th: 0.35
 
 disable_wandb: true
-allow_overwriting_checkpoints_dir: false
+allow_overwriting_checkpoints_dir: true
 
 train_transform_kwargs:
   strong_aug: true
@@ -28,54 +25,45 @@ loss_log_interval: 10
 
 object_channel: null
 
-# Use Endovis  as training set
-data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_medical_format
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_finetune
 dataset_kwargs: {}
 
 train_dataset_kwargs:
   frame_num: 2
   load_flow: true
-  flow_suffix: "_NewCT"      # gap=1: Flows_NewCT
-  flow_suffix2: "_NewCT2"    # gap=2: Flows_NewCT2
-  flow_suffix3: "_NewCT3"  # gap=3: Flows_NewCT3
-  split: fold2_train.txt
+  flow_suffix: "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train.txt
   zero_ann: false
 
 test_dataset_kwargs:
   frame_num: 1
   load_flow: false
-  split: all_frames.txt
-  zero_ann: true
+  split: ImageSets/val.txt
+  zero_ann: true            # CMC val has no annotations
 
 lr_scheduler_kwargs:
-  # policy: 'poly'
   power: 0.9
   min_lr: 1.e-6
 
-# Get object channel after 1 epoch
 set_object_channel_after_epoch: 10
 
 trainer_kwargs:
   check_val_every_n_epoch: 1
   amp_backend: "native"
   precision: 32
-  # Enable cudnn benchmark
   benchmark: true
 
 model_kwargs:
   w_seg: 1.0
-  # Use entropy and do not use sharpen
   w_sharpen: 0
   w_entropy: 0.05
-  # Use different last convolution for fw and bw residual
   separate_residual: true
   mask_layer: 3
   align_corners: false
   mask_size: [96, 96]
-  # Enable residual and clamp
   backbone2:
-    # Changed to v2.1
-    # dilations: [1, 1, 1, 2]
     dilations: [1, 1, 2, 4]
     strides: [1, 2, 1, 1]
     type: ResNet
@@ -87,8 +75,6 @@ model_kwargs:
       requires_grad: true
     norm_eval: false
     style: pytorch
-    # Changed to v2.1
-    # contract_dilation: false
     contract_dilation: true
   decode_head:
     ssim_sz: 1
@@ -108,8 +94,6 @@ model_kwargs:
     q: 0.4
     allow_residual_resize: true
     residual_adjustment_scale: 10.
-    # Default value: put here to allow overriding from command line
-    # This is the division coefficient before tanh.
     pred_div_coeff: 10.
   decode_head2:
     input_transform: resize_concat
@@ -134,13 +118,9 @@ model_kwargs:
     channels: 256
     type: FCNHead
     in_channels: 4096
-    # Only use the last map
     in_index: -1
     num_convs: 2
     dropout_ratio: 0.1
-    # in_channel is 4096 (2048 * 2 as we have two frames) as in the original one
-    # Predicted residual is 48x48, resize in `decode_head` with `allow_residual_resize`
-    # Output dimension is 16 because we need to split to fw and bw
     num_classes: 12
     norm_cfg: *id001
     align_corners: false
@@ -150,6 +130,5 @@ model_kwargs:
       loss_weight: 1.0
 
 eval_save: true
-# export depends on save
 eval_export: true
 export_all_seg: true

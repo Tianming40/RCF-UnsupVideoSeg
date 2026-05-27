@@ -1,6 +1,6 @@
 
 """
-python generate_flows_cmc.py       --model models/raft-things.pth       --data_root /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_finetune
+python generate_flows_cmc.py       --model models/raft-things.pth       --data_root /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_from_raw
 """
 
 import sys

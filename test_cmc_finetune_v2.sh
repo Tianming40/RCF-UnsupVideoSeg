@@ -12,16 +12,16 @@ conda activate rcf
 
 cd /media/mitiadmin/Micron_7450_1/tianming/RCF-UnsupVideoSeg
 
-# V2 checkpoints from saved_cmc_finetune_v2_0527_150009
-# (correct deinterlace + normalized flows _NewCT_nm)
+# V2 checkpoints from saved_cmc_all_finetune_v2_0528_103539
+# (topk=4, grasp-0+5+10 merged, correct deinterlace, original flows _NewCT)
 # Ranked by val_miou on data_medical/fold1_val:
-#   epoch=14: 64.67%  ← best
-#   epoch=8:  62.80%  ← 2nd
-#   last:     28.65%  (epoch 28)
+#   epoch=8:  68.95%  ← best
+#   epoch=15: 68.46%  ← 2nd
+#   last:     62.12%  (epoch 29)
 CKPTS=(
-    "saved/saved_cmc_finetune_v2_0527_150009/epoch=14-step=2647.ckpt"
-    "saved/saved_cmc_finetune_v2_0527_150009/epoch=8-step=1921.ckpt"
-    "saved/saved_cmc_finetune_v2_0527_150009/last.ckpt"
+    "saved/saved_cmc_all_finetune_v2_0528_103539/epoch=8-step=2161.ckpt"
+    "saved/saved_cmc_all_finetune_v2_0528_103539/epoch=15-step=4688.ckpt"
+    "saved/saved_cmc_all_finetune_v2_0528_103539/last.ckpt"
 )
 
 TIMESTAMP=$(date +%m%d_%H%M%S)

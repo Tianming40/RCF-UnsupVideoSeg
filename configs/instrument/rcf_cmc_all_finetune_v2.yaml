@@ -1,13 +1,8 @@
-# Train on CMC_grasp10_finetune (self-supervised, no labels needed).
+# Train on CMC_grasp0_5_10_merged (grasp-0 + grasp-5 + grasp-10, 1443 train pairs).
 # Validate on data_medical fold1_val (has real annotations → meaningful mIoU).
 #
-# V2 changes vs rcf_cmc_finetune.yaml:
-#   - decode_head.type: FlowAggregationHeadWithResidualV2
-#   - decode_head.topk: 4          (was hard-coded 2; select 4 easiest per batch)
-#   - decode_head.boundary_threshold: 0.1745  (π/18 ≈ 0.1745; was π/12 ≈ 0.2618)
-#
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0 python main_v2.py configs/instrument/rcf_cmc_finetune_v2.yaml
+#   CUDA_VISIBLE_DEVICES=0 python main_v2.py configs/instrument/rcf_cmc_all_finetune_v2.yaml
 
 batch_size: 8
 epochs: 30
@@ -17,7 +12,7 @@ weight_decay: 1.e-4
 
 workers: 16
 
-checkpoints_dir: saved/saved_cmc_finetune_v2
+checkpoints_dir: saved/saved_cmc_all_finetune_v2
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFModel
 
@@ -36,8 +31,8 @@ loss_log_interval: 10
 
 object_channel: null
 
-# ── Training data: CMC (no annotations needed for self-supervised training) ──
-data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+# ── Training data: CMC grasp-0 + grasp-5 + grasp-10 merged (1443 train pairs) ──
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged
 dataset_kwargs: {}
 
 train_dataset_kwargs:
@@ -62,7 +57,6 @@ lr_scheduler_kwargs:
   power: 0.9
   min_lr: 1.e-6
 
-# Get object channel after 10 epochs
 set_object_channel_after_epoch: 10
 
 trainer_kwargs:
@@ -96,9 +90,9 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 3
-    type: FlowAggregationHeadWithResidualV2   # ← V2 class
-    topk: 4                                    # ← select 4 easiest samples
-    boundary_threshold: 0.1745                 # ← π/18 (was π/12=0.2618); more sensitive
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]

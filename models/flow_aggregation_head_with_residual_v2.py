@@ -41,6 +41,14 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         assert topk >= 1, "topk must be >= 1"
         self.topk = topk
         self.boundary_threshold = boundary_threshold
+        # coord_map is created by parent as a plain .cuda() tensor attribute
+        # (not register_buffer), which causes CUDA illegal memory access when
+        # PL resumes training and calls optimizers_to_device. Re-register it
+        # as a proper buffer so PL manages device placement correctly.
+        if hasattr(self, 'coord_map') and not isinstance(self.coord_map, torch.nn.Parameter):
+            coord_map_data = self.coord_map.cpu()
+            del self.coord_map
+            self.register_buffer('coord_map', coord_map_data)
 
     # ------------------------------------------------------------------ #
     # Override detect_flow_changes_batch to use self.boundary_threshold   #

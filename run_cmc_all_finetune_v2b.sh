@@ -25,8 +25,8 @@ echo "Checkpoint dir: ${RUN_DIR}"
 
 CUDA_VISIBLE_DEVICES=0 python main_v2.py \
     configs/instrument/rcf_cmc_all_finetune_v2b.yaml \
-    --resume saved_this_use8datatrain_3best_test_MITI/saved_instrument_trainval_run0/epoch=7-step=1800.ckpt \
     --opts checkpoints_dir "${RUN_DIR}" \
+           pretrained_model "saved_this_use8datatrain_3best_test_MITI/saved_instrument_trainval_run0/epoch=7-step=1800.ckpt" \
            allow_overwriting_checkpoints_dir True
 
 echo "=========================================="

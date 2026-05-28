@@ -12,16 +12,16 @@ conda activate rcf
 
 cd /media/mitiadmin/Micron_7450_1/tianming/RCF-UnsupVideoSeg
 
-# V2 checkpoints from saved_cmc_all_finetune_v2_0528_103539
-# (topk=4, grasp-0+5+10 merged, correct deinterlace, original flows _NewCT)
+# V2b checkpoints from saved_cmc_all_finetune_v2b_0528_132020
+# (mask_size=128, clamp_flow_t=10, free_residual_with_affine=True, grasp-0+5+10)
 # Ranked by val_miou on data_medical/fold1_val:
-#   epoch=8:  68.95%  ← best
-#   epoch=15: 68.46%  ← 2nd
-#   last:     62.12%  (epoch 29)
+#   epoch=17: 65.21%  ← best
+#   epoch=30: 64.14%  ← 2nd
+#   last:     57.38%  (epoch 59)
 CKPTS=(
-    "saved/saved_cmc_all_finetune_v2_0528_103539/epoch=8-step=2161.ckpt"
-    "saved/saved_cmc_all_finetune_v2_0528_103539/epoch=15-step=4688.ckpt"
-    "saved/saved_cmc_all_finetune_v2_0528_103539/last.ckpt"
+    "saved/saved_cmc_all_finetune_v2b_0528_132020/epoch=17-step=6498.ckpt"
+    "saved/saved_cmc_all_finetune_v2b_0528_132020/epoch=30-step=11191.ckpt"
+    "saved/saved_cmc_all_finetune_v2b_0528_132020/last.ckpt"
 )
 
 TIMESTAMP=$(date +%m%d_%H%M%S)
@@ -37,7 +37,7 @@ for CKPT in "${CKPTS[@]}"; do
     echo "=============================="
 
     CUDA_VISIBLE_DEVICES=0 python main_v2.py \
-        configs/instrument/test_cmc_val_v2.yaml \
+        configs/instrument/test_cmc_val_v2b.yaml \
         --test \
         --opts allow_overwriting_checkpoints_dir True \
                checkpoints_dir "$CKPT_EVAL_DIR" \

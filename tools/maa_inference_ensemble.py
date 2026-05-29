@@ -339,15 +339,14 @@ class CombinedEnsemble:
                     gt_fw_flows is not None)
 
         prob_map = soft_mask[obj_ch]   # [H, W]
-        scores = []
+        raw = []   # collect raw scores before alpha is applied
 
         for th in self.ths:
             binary = (prob_map > th).float()
             frac   = binary.mean().item()
 
             if frac < 0.005 or frac > 0.995:
-                scores.append({"th": th, "maa": -1e9,
-                               "flow": -1e9, "combined": -1e9, "binary": binary})
+                raw.append({"th": th, "maa": None, "flow": None, "binary": binary})
                 continue
 
             # MAA score
@@ -362,11 +361,40 @@ class CombinedEnsemble:
                 cand[obj_ch] = binary
                 flow_s = self.flow.score(internals, gt_fw_flows, gt_bw_flows, cand)
             else:
-                flow_s = 0.0
+                flow_s = None
 
-            combined = self.alpha * maa_s + (1.0 - self.alpha) * flow_s
-            scores.append({"th": th, "maa": maa_s, "flow": flow_s,
-                           "combined": combined, "binary": binary})
+            raw.append({"th": th, "maa": maa_s, "flow": flow_s, "binary": binary})
+
+        # ── Adaptive alpha ────────────────────────────────────────────────────
+        # Discriminative power = std of valid scores across thresholds.
+        # Higher std → that scorer is more discriminative for this frame
+        # → should get more weight.
+        valid_maa  = [r["maa"]  for r in raw if r["maa"]  is not None]
+        valid_flow = [r["flow"] for r in raw if r["flow"] is not None]
+
+        if use_flow and len(valid_maa) > 1 and len(valid_flow) > 1:
+            maa_std  = float(np.std(valid_maa))
+            flow_std = float(np.std(valid_flow))
+            denom = maa_std + flow_std
+            if denom > 1e-8:
+                alpha = maa_std / denom      # adaptive per-frame alpha
+            else:
+                alpha = self.alpha           # fallback to fixed alpha
+        else:
+            alpha = 1.0 if not use_flow else self.alpha
+
+        # ── Combine with adaptive alpha ───────────────────────────────────────
+        scores = []
+        for r in raw:
+            if r["maa"] is None:
+                scores.append({"th": r["th"], "maa": -1e9, "flow": -1e9,
+                               "combined": -1e9, "binary": r["binary"]})
+            else:
+                flow_val = r["flow"] if r["flow"] is not None else 0.0
+                combined = alpha * r["maa"] + (1.0 - alpha) * flow_val
+                scores.append({"th": r["th"], "maa": r["maa"],
+                               "flow": flow_val if r["flow"] is not None else 0.0,
+                               "combined": combined, "binary": r["binary"]})
 
         combined_vals = torch.tensor([s["combined"] for s in scores],
                                      dtype=torch.float32)
@@ -379,6 +407,7 @@ class CombinedEnsemble:
         best_idx = int(combined_vals.argmax().item())
         best_th  = scores[best_idx]["th"]
         log = [{k: v for k, v in s.items() if k != "binary"} for s in scores]
+        log.append({"adaptive_alpha": round(alpha, 4)})
         return final, best_th, log
 
 
@@ -463,38 +492,42 @@ def get_img_01(batch: dict) -> torch.Tensor:
     return ((img + 2.0) / 4.0).clamp(0, 1)[:1]
 
 
-def save_pair(img_01: torch.Tensor, mask_np: np.ndarray,
-              out_dir: Path, seq: str, fname: str):
+def save_pair(img_01: torch.Tensor, soft_mask: torch.Tensor,
+              out_dir: Path, seq: str, fname: str, eval_pos_th: float = 0.35):
     """
-    Save mask.png and overlay.jpg into the same folder at original image resolution.
+    Save mask.png and overlay.jpg at full image resolution.
+    soft_mask is bilinearly upsampled BEFORE thresholding → smooth edges.
       out_dir/<seq>/<fname>_mask.png
       out_dir/<seq>/<fname>_overlay.jpg
-    Mask is upsampled to image resolution. Overlay uses bright green.
+    Overlay uses bright green.
     """
     folder = out_dir / seq
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Original image at full resolution
     img_np = img_01[0].permute(1, 2, 0).cpu().numpy()
     img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
     img_h, img_w = img_np.shape[:2]
 
-    # Upsample mask to original image resolution
-    mask_tensor = torch.from_numpy(mask_np)[None, None].float()
-    mask_full = F.interpolate(mask_tensor, (img_h, img_w),
-                              mode="nearest")[0, 0].numpy()
+    # Bilinear upsample soft mask → then threshold (smooth boundaries)
+    soft_full = F.interpolate(
+        soft_mask[None, None].float(),
+        size=(img_h, img_w),
+        mode="bilinear",
+        align_corners=False
+    )[0, 0]                                    # [img_h, img_w]  0-1 float
+    mask_full = (soft_full > eval_pos_th).cpu().numpy()   # bool
 
-    # ── mask (binary 0/255 at full resolution) ───────────────────────────────
+    # ── mask (binary 0/255) ──────────────────────────────────────────────────
     Image.fromarray(
-        (mask_full * 255).clip(0, 255).astype(np.uint8)
+        (mask_full * 255).astype(np.uint8)
     ).save(str(folder / f"{fname}_mask.png"))
 
-    # ── overlay (green highlight at full resolution) ─────────────────────────
+    # ── overlay (green highlight) ────────────────────────────────────────────
     overlay = img_np.astype(np.float32)
-    m = mask_full > 0.5
-    overlay[m, 0] = overlay[m, 0] * 0.3                           # R dim
-    overlay[m, 1] = np.clip(overlay[m, 1] * 0.5 + 180, 0, 255)   # G bright
-    overlay[m, 2] = overlay[m, 2] * 0.3                           # B dim
+    m = mask_full
+    overlay[m, 0] = overlay[m, 0] * 0.3
+    overlay[m, 1] = np.clip(overlay[m, 1] * 0.5 + 180, 0, 255)
+    overlay[m, 2] = overlay[m, 2] * 0.3
 
     Image.fromarray(overlay.astype(np.uint8)).save(
         str(folder / f"{fname}_overlay.jpg"))
@@ -627,16 +660,19 @@ def run(args):
         final_soft, best_th, score_log = ensemble.combine(
             soft_mask, img_01, obj_ch, internals, gt_fw, gt_bw)
 
-        binary = (final_soft > args.eval_pos_th).cpu().numpy().astype(np.float32)
-        fname  = f"{fidx:05d}"
-        save_pair(img_01, binary, out_dir / "results", seq, fname)
+        fname = f"{fidx:05d}"
+        save_pair(img_01, final_soft, out_dir / "results", seq, fname,
+                  eval_pos_th=args.eval_pos_th)
 
+        th_entries = [s for s in score_log if "th" in s]
+        alpha_entry = next((s for s in score_log if "adaptive_alpha" in s), {})
         detail = " | ".join(
             f"th={s['th']:.2f} maa={s['maa']:.3f} "
             f"flow={s['flow']:.3f} comb={s['combined']:.3f}"
-            for s in score_log)
+            for s in th_entries)
         log_lines.append(
-            f"{seq}/{fname}  best_th={best_th:.2f}  [{detail}]")
+            f"{seq}/{fname}  best_th={best_th:.2f} "
+            f"alpha={alpha_entry.get('adaptive_alpha', '?'):.4f}  [{detail}]")
 
     (out_dir / "scores.txt").write_text("\n".join(log_lines))
     logger.info(f"Done. Results in {out_dir / 'results'} | Log: {out_dir / 'scores.txt'}")

@@ -82,6 +82,7 @@ def load_config(path: str) -> dict:
 
 def build_model(cfg: dict, output_dir: str = "/tmp/maa_inference") -> RCFModel:
     import argparse as _ap
+    import copy
     fake_args = _ap.Namespace(
         checkpoints_dir=output_dir,
         eval_save=False,
@@ -91,7 +92,8 @@ def build_model(cfg: dict, output_dir: str = "/tmp/maa_inference") -> RCFModel:
         object_channel=cfg.get("object_channel", None),
         log_interval=9999,
     )
-    return RCFModel(args=fake_args, **cfg["model_kwargs"])
+    # Deep copy to avoid mutating cfg (RCFModel pops keys like 'type' in-place)
+    return RCFModel(args=fake_args, **copy.deepcopy(cfg["model_kwargs"]))
 
 
 def load_checkpoint(model: RCFModel, ckpt_path: str) -> RCFModel:
@@ -145,6 +147,96 @@ class RCFFeatureExtractor:
         return dict(imgs=imgs, soft_mask=soft_mask,
                     res_fw=res_fw, res_bw=res_bw,
                     B=B, im_num=im_num)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2b. TTA helper — horizontal flip average
+# ════════════════════════════════════════════════════════════════════════════
+
+def extract_with_tta(extractor: "RCFFeatureExtractor", batch: dict) -> dict:
+    """
+    Runs the extractor on original + horizontally flipped input,
+    averages the soft masks, returns the merged internals.
+    Flow residuals come from the original (not flipped) pass.
+    """
+    # Original pass
+    orig = extractor.extract(batch)
+
+    # Flip the images in the batch
+    flipped_batch = dict(batch)
+    flipped_imgs = [torch.flip(img, dims=[-1]) for img in batch["imgs"]]
+    flipped_batch = {**batch, "imgs": flipped_imgs}
+    flip = extractor.extract(flipped_batch)
+
+    # Flip the mask back and average
+    flipped_mask_back = torch.flip(flip["soft_mask"], dims=[-1])
+    avg_mask = (orig["soft_mask"] + flipped_mask_back) / 2.0
+
+    return {**orig, "soft_mask": avg_mask}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2c. Multi-checkpoint ensemble — average soft masks from several ckpts
+# ════════════════════════════════════════════════════════════════════════════
+
+def extract_multi_ckpt(extractors: list, batch: dict, use_tta: bool) -> dict:
+    """
+    Run all extractors (one per checkpoint), average their soft masks.
+    Returns internals from the first extractor (for flow scoring).
+    """
+    all_masks = []
+    primary = None
+    for i, ext in enumerate(extractors):
+        if use_tta:
+            internals = extract_with_tta(ext, batch)
+        else:
+            internals = ext.extract(batch)
+        all_masks.append(internals["soft_mask"])
+        if i == 0:
+            primary = internals   # flow residuals from primary checkpoint
+
+    avg_mask = torch.stack(all_masks, dim=0).mean(dim=0)
+    return {**primary, "soft_mask": avg_mask}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2d. CRF post-processing — refine mask boundaries using image appearance
+# ════════════════════════════════════════════════════════════════════════════
+
+class CRFRefiner:
+    """
+    Wraps CRFHead.crf_cpu() to refine a soft mask using the RGB image.
+    Uses pydensecrf (CPU) since torchcrf_cpp is not available.
+    """
+
+    def __init__(self, srgb: float = 5., sxy: float = 60.,
+                 scomp: float = 5., refine_iters: int = 10,
+                 crf_scale: float = 0.7):
+        sys.path.insert(0, str(ROOT))
+        from models.crf_head import CRFHead
+        # Dummy args; CRFHead only uses args for save_dir which we don't need
+        import argparse as _ap
+        fake = _ap.Namespace(checkpoints_dir="/tmp")
+        self.head = CRFHead(args=fake, srgb=srgb, sxy=sxy,
+                            scomp=scomp, refine_iters=refine_iters,
+                            crf_scale=crf_scale)
+        logger.info(f"CRF refiner ready (srgb={srgb} sxy={sxy} iters={refine_iters})")
+
+    def refine(self, img_01: torch.Tensor, soft_mask: torch.Tensor) -> torch.Tensor:
+        """
+        img_01    : [1, 3, H, W]  0-1  (full image resolution)
+        soft_mask : [H, W]        0-1  (already upsampled to image resolution)
+        Returns refined soft mask [H, W] 0-1.
+        """
+        # CRFHead expects uint8 image [H, W, 3] on CUDA, mask [H, W] float on CUDA
+        img_np = img_01[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 3] 0-1
+        img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+        import torch as _t
+        img_t  = _t.from_numpy(img_np).to(DEVICE)          # [H, W, 3] uint8
+        mask_t = soft_mask.to(DEVICE)                      # [H, W] float
+
+        refined = self.head.crf_cpu(img_t, mask_t)         # [H, W] float
+        return refined.to(DEVICE)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -595,16 +687,33 @@ def run(args):
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model
+    # ── Primary model ────────────────────────────────────────────────────────
     model = build_model(cfg, output_dir=str(out_dir))
     model = load_checkpoint(model, args.ckpt)
+    extractors = [RCFFeatureExtractor(model)]
 
-    # Extractors / scorers
-    extractor  = RCFFeatureExtractor(model)
-    maa_scorer = MAAScorer(arch=args.dino_arch,
-                           patch_size=args.dino_patch_size,
-                           tau=args.dino_tau)
+    # ── Extra checkpoints (multi-ckpt ensemble) ───────────────────────────────
+    if args.extra_ckpts:
+        for ckpt_path in args.extra_ckpts:
+            extra_model = build_model(cfg, output_dir=str(out_dir))
+            extra_model = load_checkpoint(extra_model, ckpt_path)
+            extractors.append(RCFFeatureExtractor(extra_model))
+        logger.info(f"Multi-checkpoint ensemble: {len(extractors)} checkpoints")
+
+    if args.tta:
+        logger.info("TTA ENABLED (horizontal flip)")
+
+    # ── Scorers ───────────────────────────────────────────────────────────────
+    maa_scorer  = MAAScorer(arch=args.dino_arch,
+                            patch_size=args.dino_patch_size,
+                            tau=args.dino_tau)
     flow_scorer = FlowScorer(model) if args.use_flow else None
+
+    # ── CRF refiner ──────────────────────────────────────────────────────────
+    crf_refiner = None
+    if args.use_crf:
+        crf_refiner = CRFRefiner(srgb=args.crf_srgb, sxy=args.crf_sxy,
+                                 refine_iters=args.crf_iters)
 
     if not args.use_flow:
         logger.info("Flow scoring DISABLED — using MAA only")
@@ -625,7 +734,7 @@ def run(args):
         logger.info(f"Using fixed object_channel={obj_ch} from CLI")
     else:
         obj_ch = detect_object_channel(
-            extractor, maa_scorer, dataset,
+            extractors[0], maa_scorer, dataset,
             n_probe=args.channel_probe_frames,
             probe_th=args.eval_pos_th)
     logger.info(f"Instrument channel: {obj_ch}")
@@ -647,7 +756,8 @@ def run(args):
         seq   = batch["seq_names"][0]
         fidx  = int(batch.get("frame_ind_start", [0])[0])
 
-        internals = extractor.extract(batch)
+        # TTA + multi-checkpoint ensemble
+        internals = extract_multi_ckpt(extractors, batch, use_tta=args.tta)
         soft_mask = internals["soft_mask"][0, 0]   # [C, H, W]
 
         gt_fw = (torch.stack(batch["gt_fw_flows"], dim=1)
@@ -661,8 +771,20 @@ def run(args):
             soft_mask, img_01, obj_ch, internals, gt_fw, gt_bw)
 
         fname = f"{fidx:05d}"
-        save_pair(img_01, final_soft, out_dir / "results", seq, fname,
-                  eval_pos_th=args.eval_pos_th)
+
+        # CRF refinement (operate on soft mask upsampled to image resolution)
+        if crf_refiner is not None:
+            img_np = img_01[0].permute(1, 2, 0).cpu().numpy()
+            ih, iw = img_np.shape[:2]
+            soft_full = F.interpolate(
+                final_soft[None, None].float(), (ih, iw),
+                mode="bilinear", align_corners=False)[0, 0]
+            soft_full = crf_refiner.refine(img_01, soft_full)
+            save_pair(img_01, soft_full, out_dir / "results", seq, fname,
+                      eval_pos_th=args.eval_pos_th)
+        else:
+            save_pair(img_01, final_soft, out_dir / "results", seq, fname,
+                      eval_pos_th=args.eval_pos_th)
 
         th_entries = [s for s in score_log if "th" in s]
         alpha_entry = next((s for s in score_log if "adaptive_alpha" in s), {})
@@ -693,7 +815,25 @@ if __name__ == "__main__":
     p.add_argument("--flow_suffix", default="_NewCT",
                    help="Flow file suffix (overrides config)")
     p.add_argument("--alpha", type=float, default=0.5,
-                   help="Weight of MAA score (1-alpha = weight of flow score)")
+                   help="Fallback MAA weight (adaptive alpha overrides this)")
+
+    # TTA
+    p.add_argument("--tta", action="store_true",
+                   help="Test-time augmentation: average original + h-flip")
+
+    # Multi-checkpoint ensemble
+    p.add_argument("--extra_ckpts", nargs="*", default=[],
+                   help="Additional checkpoints to ensemble (paths)")
+
+    # CRF
+    p.add_argument("--use_crf",   action="store_true",
+                   help="Apply Dense CRF post-processing")
+    p.add_argument("--crf_srgb",  type=float, default=5.,
+                   help="CRF color sigma")
+    p.add_argument("--crf_sxy",   type=float, default=60.,
+                   help="CRF spatial sigma")
+    p.add_argument("--crf_iters", type=int,   default=10,
+                   help="CRF inference iterations")
 
     p.add_argument("--thresholds", nargs="+", type=float,
                    default=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50])

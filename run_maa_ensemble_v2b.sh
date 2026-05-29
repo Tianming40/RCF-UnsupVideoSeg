@@ -31,6 +31,11 @@ echo "Alpha(MAA) : $ALPHA   Flow: $(echo "1 - $ALPHA" | bc)"
 echo "Started at : $(date)"
 echo "=========================================="
 
+# Optional flags (uncomment to enable):
+# TTA_FLAG="--tta"
+# CRF_FLAG="--use_crf"
+# EXTRA="--extra_ckpts saved/saved_cmc_all_finetune_v2b_0528_132020/epoch=30-step=11191.ckpt"
+
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python tools/maa_inference_ensemble.py \
     --config    "$CONFIG" \
     --ckpt      "$CKPT" \
@@ -43,7 +48,10 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python tools/maa_inference_ensem
     --dino_arch vit_small \
     --dino_patch_size 8 \
     --dino_tau 0.2 \
-    --workers 8
+    --workers 8 \
+    ${TTA_FLAG:-} \
+    ${CRF_FLAG:-} \
+    ${EXTRA:-}
 
 echo "=========================================="
 echo "FINISHED at: $(date)"

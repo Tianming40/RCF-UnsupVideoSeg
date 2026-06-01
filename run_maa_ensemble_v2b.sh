@@ -13,6 +13,9 @@
 source /home/tianming/anaconda3/etc/profile.d/conda.sh
 conda activate rcf
 
+# Make torchcrf_cpp (CUDA CRF) findable at runtime
+export LD_LIBRARY_PATH=/home/tianming/anaconda3/envs/rcf/lib/python3.9/site-packages/torch/lib:$LD_LIBRARY_PATH
+
 cd /media/mitiadmin/Micron_7450_1/tianming/RCF-UnsupVideoSeg
 
 CKPT="saved/saved_cmc_all_finetune_v2b_0528_132020/epoch=17-step=6498.ckpt"

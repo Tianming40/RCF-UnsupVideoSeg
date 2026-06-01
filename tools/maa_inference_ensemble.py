@@ -200,43 +200,48 @@ def extract_multi_ckpt(extractors: list, batch: dict, use_tta: bool) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2d. CRF post-processing — refine mask boundaries using image appearance
+# 2d. CRF post-processing — uses project's CRFHead directly
 # ════════════════════════════════════════════════════════════════════════════
 
-class CRFRefiner:
+def build_crf_head(srgb: float = 5., sxy: float = 60.,
+                   scomp: float = 5., refine_iters: int = 10,
+                   crf_scale: float = 0.7):
     """
-    Wraps CRFHead.crf_cpu() to refine a soft mask using the RGB image.
-    Uses pydensecrf (CPU) since torchcrf_cpp is not available.
+    Instantiate the project's CRFHead (models/crf_head.py).
+    torchcrf_cpp (GPU) is not available in this env, so we use crf_cpu
+    (pydensecrf, CPU) which is the same algorithm, just slightly slower.
     """
+    from models.crf_head import CRFHead
+    import argparse as _ap
+    fake = _ap.Namespace(checkpoints_dir="/tmp")
+    head = CRFHead(args=fake, srgb=srgb, sxy=sxy,
+                   scomp=scomp, refine_iters=refine_iters,
+                   crf_scale=crf_scale)
+    logger.info(f"CRF ready (models/crf_head.py  srgb={srgb} sxy={sxy} iters={refine_iters})")
+    return head
 
-    def __init__(self, srgb: float = 5., sxy: float = 60.,
-                 scomp: float = 5., refine_iters: int = 10,
-                 crf_scale: float = 0.7):
-        sys.path.insert(0, str(ROOT))
-        from models.crf_head import CRFHead
-        # Dummy args; CRFHead only uses args for save_dir which we don't need
-        import argparse as _ap
-        fake = _ap.Namespace(checkpoints_dir="/tmp")
-        self.head = CRFHead(args=fake, srgb=srgb, sxy=sxy,
-                            scomp=scomp, refine_iters=refine_iters,
-                            crf_scale=crf_scale)
-        logger.info(f"CRF refiner ready (srgb={srgb} sxy={sxy} iters={refine_iters})")
 
-    def refine(self, img_01: torch.Tensor, soft_mask: torch.Tensor) -> torch.Tensor:
-        """
-        img_01    : [1, 3, H, W]  0-1  (full image resolution)
-        soft_mask : [H, W]        0-1  (already upsampled to image resolution)
-        Returns refined soft mask [H, W] 0-1.
-        """
-        # CRFHead expects uint8 image [H, W, 3] on CUDA, mask [H, W] float on CUDA
-        img_np = img_01[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 3] 0-1
-        img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-        import torch as _t
-        img_t  = _t.from_numpy(img_np).to(DEVICE)          # [H, W, 3] uint8
-        mask_t = soft_mask.to(DEVICE)                      # [H, W] float
-
-        refined = self.head.crf_cpu(img_t, mask_t)         # [H, W] float
-        return refined.to(DEVICE)
+def apply_crf(crf_head, img_01: torch.Tensor,
+              soft_mask: torch.Tensor) -> torch.Tensor:
+    """
+    img_01    : [1, 3, H, W]  float 0-1
+    soft_mask : [H, W]        float 0-1  (upsampled to image resolution)
+    Returns refined soft mask [H, W] float 0-1.
+    Uses GPU (torchcrf_cpp) if available, falls back to CPU (pydensecrf).
+    """
+    img_np = img_01[0].permute(1, 2, 0).cpu().numpy()
+    img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+    img_t  = torch.from_numpy(img_np).to(DEVICE)   # [H, W, 3] uint8
+    mask_t = soft_mask.to(DEVICE)                  # [H, W] float
+    try:
+        result = crf_head.crf(img_t, mask_t)        # GPU (torchcrf_cpp)
+        if not getattr(apply_crf, "_gpu_logged", False):
+            logger.info("CRF running on GPU (torchcrf_cpp) ✓")
+            apply_crf._gpu_logged = True
+        return result
+    except Exception as e:
+        logger.warning(f"GPU CRF failed ({e}), falling back to CPU")
+        return crf_head.crf_cpu(img_t, mask_t)      # CPU fallback (pydensecrf)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -709,11 +714,11 @@ def run(args):
                             tau=args.dino_tau)
     flow_scorer = FlowScorer(model) if args.use_flow else None
 
-    # ── CRF refiner ──────────────────────────────────────────────────────────
-    crf_refiner = None
+    # ── CRF (project's CRFHead via crf_cpu) ─────────────────────────────────
+    crf_head = None
     if args.use_crf:
-        crf_refiner = CRFRefiner(srgb=args.crf_srgb, sxy=args.crf_sxy,
-                                 refine_iters=args.crf_iters)
+        crf_head = build_crf_head(srgb=args.crf_srgb, sxy=args.crf_sxy,
+                                  refine_iters=args.crf_iters)
 
     if not args.use_flow:
         logger.info("Flow scoring DISABLED — using MAA only")
@@ -772,14 +777,13 @@ def run(args):
 
         fname = f"{fidx:05d}"
 
-        # CRF refinement (operate on soft mask upsampled to image resolution)
-        if crf_refiner is not None:
-            img_np = img_01[0].permute(1, 2, 0).cpu().numpy()
-            ih, iw = img_np.shape[:2]
+        # CRF post-processing (project's CRFHead.crf_cpu)
+        if crf_head is not None:
+            ih, iw = img_01.shape[-2:]
             soft_full = F.interpolate(
                 final_soft[None, None].float(), (ih, iw),
                 mode="bilinear", align_corners=False)[0, 0]
-            soft_full = crf_refiner.refine(img_01, soft_full)
+            soft_full = apply_crf(crf_head, img_01, soft_full)
             save_pair(img_01, soft_full, out_dir / "results", seq, fname,
                       eval_pos_th=args.eval_pos_th)
         else:

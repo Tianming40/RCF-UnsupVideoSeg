@@ -1,0 +1,140 @@
+# Phase 1: K-fold cross-validation
+# Train: fold{N}_train.txt (6 datasets), Val: fold{N}_val.txt (2 held-out)
+# Purpose: find the optimal stopping epoch for each fold → average → use in Phase 2
+# Splits are overridden per fold by script/run_phase1_kfold.sh
+
+batch_size: 8
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 16
+
+checkpoints_dir: saved/saved_kfold_phase1_fold1
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFModel
+
+eval_pos_th: 0.35
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+
+object_channel: null
+
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/data_medical
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix: "_NewCT"
+  flow_suffix2: "_NewCT2"
+  flow_suffix3: "_NewCT3"
+  split: fold1_train.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: fold1_val.txt
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+set_object_channel_after_epoch: 5
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidual
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]
+    norm_flow: false
+    clamp_flow_t: 20.
+    free_residual: true
+    free_residual_with_affine: false
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    # 5 mask layers * 2 directions (fw/bw) * 2 coords (x/y) = 20
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+eval_save: true
+eval_export: true
+export_all_seg: true

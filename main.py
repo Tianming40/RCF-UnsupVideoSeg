@@ -151,6 +151,9 @@ class Model(pl.LightningModule):
         # self.args.object_channel is for global use
         self.args.object_channel = self.object_channel
         logger.info(f"Using {self.object_channel} as object channel")
+        # Per-sequence channels: {seq_name: [ch_idx, ...]}, set after set_object_channel_after_epoch
+        # May contain multiple channels if instruments are split across channels (union at eval time)
+        self.seq_object_channels = {}
 
     def forward(self, x):
         return self.model(x)
@@ -195,6 +198,7 @@ class Model(pl.LightningModule):
     def on_test_start(self):
         self.iou_all_sequences = {}
         self.max_channel_freq = [0 for _ in range(self.args.model_kwargs["mask_layer"])]
+        self.seq_channel_freq = {}  # {seq_name: np.array of shape [mask_layer]}
 
     @rank_zero_only
     def test_step(self, batch, batch_idx, always_use_max_iou_channel=False):
@@ -218,24 +222,72 @@ class Model(pl.LightningModule):
             ).permute((0, 3, 1, 2)).long().cpu().numpy()
 
         ignore_locations = batch['ann'] == 128
-        anns_np = (batch['ann'] / 255).long()
+        anns_np = (batch['ann'] > 128).long()
         anns_np[ignore_locations] = -1
         anns_np = anns_np.cpu().numpy()
-        for pred_mask_resize, ann, seq_name in zip(pred_masks_current_batch_resize, anns_np, batch['seq_names']):
+        # Accumulate per-item GT and union masks for finalize_eval_save (locked mode)
+        _eval_gt_list, _eval_union_list = [], []
+        _in_oracle_mode = always_use_max_iou_channel or (self.object_channel is None)
+
+        for batch_idx_item, (pred_mask_resize, ann, seq_name) in enumerate(
+                zip(pred_masks_current_batch_resize, anns_np, batch['seq_names'])):
             # pred_mask_resize and ann are numpy array
             # index 1 selects the iou in the foreground
-            if always_use_max_iou_channel or (self.object_channel is None):
+            if _in_oracle_mode:
                 frame_ious = [
                     utils.iou(pred_mask_resize_item, ann, num_classes=2, ignore_index=-1)[1] for pred_mask_resize_item in pred_mask_resize]
-                max_channel = np.argmax(frame_ious)
-                self.max_channel_freq[max_channel] += 1
-                frame_iou = frame_ious[max_channel]
+                # Greedy union oracle: start with best single channel, greedily add
+                # channels (in descending IoU order) if they improve the union IoU.
+                # This correctly identifies all instrument channels even when one
+                # instrument rarely "wins" head-to-head against another.
+                best_ch = int(np.argmax(frame_ious))
+                active_channels = [best_ch]
+                best_iou = frame_ious[best_ch]
+                remaining = sorted(
+                    [k for k in range(num_channels) if k != best_ch],
+                    key=lambda k: frame_ious[k], reverse=True)
+                for ch in remaining:
+                    candidate_mask = np.any(
+                        np.stack([pred_mask_resize[c] for c in active_channels + [ch]]), axis=0
+                    ).astype(pred_mask_resize.dtype)
+                    candidate_iou = utils.iou(candidate_mask, ann, num_classes=2, ignore_index=-1)[1]
+                    if candidate_iou > best_iou + 0.01:
+                        active_channels.append(ch)
+                        best_iou = candidate_iou
+                seq_freq = self.seq_channel_freq.setdefault(seq_name, np.zeros(num_channels, dtype=int))
+                for ch in active_channels:
+                    self.max_channel_freq[ch] += 1
+                    seq_freq[ch] += 1
+                frame_iou = best_iou
             else:
-                frame_iou = utils.iou(
-                    pred_mask_resize[self.object_channel], ann, num_classes=2, ignore_index=-1)[1]
+                channels = self.seq_object_channels.get(seq_name, [self.object_channel])
+                if len(channels) == 1:
+                    union_mask = pred_mask_resize[channels[0]]
+                else:
+                    union_mask = np.any(
+                        np.stack([pred_mask_resize[ch] for ch in channels]), axis=0
+                    ).astype(pred_mask_resize.dtype)
+                frame_iou = utils.iou(union_mask, ann, num_classes=2, ignore_index=-1)[1]
+                # Collect per-item GT and union mask for batch-correct visualization
+                if self.args.eval_save:
+                    ann_vis = np.clip(ann, 0, 1).astype('float32')
+                    if ann_vis.ndim == 3:
+                        ann_vis = ann_vis[..., 0]
+                    _eval_gt_list.append(ann_vis)
+                    _eval_union_list.append(union_mask.astype('float32'))
             iou_current_sequence = self.iou_all_sequences.setdefault(
                 seq_name, [])
             iou_current_sequence.append(frame_iou)
+
+        # Call finalize_eval_save once after the loop with full-batch arrays
+        if self.args.eval_save:
+            if _in_oracle_mode:
+                self.model.finalize_eval_save([])
+            elif _eval_gt_list:
+                self.model.finalize_eval_save([
+                    np.stack(_eval_gt_list, axis=0),    # [B, H, W]
+                    np.stack(_eval_union_list, axis=0), # [B, H, W]
+                ])
 
     def test_epoch_end(self, outputs, name="test_miou", display_all=True):
         if (self.object_channel is None) and (not self.trainer.sanity_checking) and ((self.current_epoch >= getattr(self.args, "set_object_channel_after_epoch", 1) - 1) or self.trainer.testing):
@@ -254,8 +306,24 @@ class Model(pl.LightningModule):
 
             self.object_channel = object_channel
             self.args.object_channel = self.object_channel
+            # Build per-sequence channel list: include channels with freq >= 30% of the best
+            # channel's freq. This unions channels when instruments are split across channels.
+            union_rel_th = getattr(self.args, "union_channel_rel_th", 0.3)
+            self.seq_object_channels = {}
+            for seq, freq in self.seq_channel_freq.items():
+                freq_arr = np.array(freq)
+                best_freq = freq_arr.max()
+                if best_freq == 0:
+                    self.seq_object_channels[seq] = [int(np.argmax(freq_arr))]
+                else:
+                    chs = [k for k in range(len(freq_arr))
+                           if freq_arr[k] >= union_rel_th * best_freq]
+                    self.seq_object_channels[seq] = chs
             if self.args.rank <= 0:
-                print(f"Rank {self.args.rank}: Set object channel to {self.object_channel} (Max channel distribution at local rank: {self.max_channel_freq})")
+                print(f"Rank {self.args.rank}: Set object channel to {self.object_channel} (global fallback, Max channel distribution: {self.max_channel_freq})")
+                for seq, chs in self.seq_object_channels.items():
+                    freq_str = self.seq_channel_freq[seq].tolist()
+                    print(f"  {seq}: channels {chs} (freq: {freq_str})")
             else:
                 print(f"Rank {self.args.rank}: Set object channel to {self.object_channel}")
         
@@ -273,7 +341,7 @@ class Model(pl.LightningModule):
             miou = np.nanmean(miou_current_sequence).astype(np.float32)
             miou_each_sequence[seq_name] = miou
 
-            iou_sum += np.sum(miou_current_sequence).astype(np.float32)
+            iou_sum += np.nansum(miou_current_sequence).astype(np.float32)
             iou_num_frames += len(miou_current_sequence)
 
             if display_all:
@@ -486,21 +554,45 @@ def main():
         if cli_args.test_override_object_channel is not None:
             args.object_channel = cli_args.test_override_object_channel
             logger.info(f"Overriding object channel to {args.object_channel}")
-    # TODO delete when train
-        args.object_channel = None
+
+    zero_ann = args.test_dataset_kwargs.get('zero_ann', False)
+
     trainer = pl.Trainer(**trainer_cfg, default_root_dir=args.checkpoints_dir)
     model = Model(args, trainer)
 
     logger.info(f"{model}")
+
+    def _two_pass_test(ckpt_path=None):
+        """Pass 1: subsampled oracle via validate() to lock per-seq channels.
+           Pass 2: full test() with locked channels to compute real mIoU."""
+        # set_object_channel_after_epoch=0 ensures channels are locked even at
+        # epoch 0 (trainer.validate() runs outside of training, current_epoch=0)
+        args.set_object_channel_after_epoch = 0
+        # Pass 1: channel selection only — disable eval_save to avoid writing
+        # oracle images (no GT rows) that would clutter the output directory.
+        _eval_save = args.eval_save
+        args.eval_save = False
+        logger.info("Pass 1/2: oracle channel selection (subsampled) ...")
+        trainer.validate(model=model, ckpt_path=ckpt_path)
+        # Pass 2: locked channel eval — restore eval_save, saves GT + union rows.
+        args.eval_save = _eval_save
+        logger.info("Pass 2/2: locked channel mIoU evaluation (full dataset) ...")
+        trainer.test(model=model, ckpt_path=ckpt_path)
 
     if not test:
         trainer.fit(model=model, ckpt_path=args.resume_from_checkpoint)
         if not no_test:
             args.saved_eval_dir_name = 'saved_eval_test'
             args.eval_pos_th = -1
-            trainer.test(model=model, ckpt_path='best')
+            if zero_ann or model.object_channel is not None:
+                trainer.test(model=model, ckpt_path='best')
+            else:
+                _two_pass_test(ckpt_path='best')
     else:
-        trainer.test(model=model)
+        if zero_ann or model.object_channel is not None:
+            trainer.test(model=model)
+        else:
+            _two_pass_test()
 
 
 if __name__ == "__main__":

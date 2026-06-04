@@ -305,7 +305,16 @@ class RCFModel(nn.Module):
         tosave = torch.cat([ith_img_resize] + pred_vis_list, 2)
 
         if self.args.eval_save:
-            self.save_eval_visualizations(tosave, paths, seq_ids, seq_names, train_iter=self.train_iter)
+            # Store base visualization for augmentation by test_step (GT + union mask rows).
+            # finalize_eval_save() will append the extra rows and do the actual write.
+            self._pending_eval_viz = {
+                'tosave': tosave,
+                'paths': paths,
+                'seq_ids': seq_ids,
+                'seq_names': seq_names,
+                'row_h': toH * 2,
+                'row_w': toW * 2,
+            }
             if self.args.eval_export:
                 # Note that saved images are resized to 2x (for visualization and here we did not change the resize)
                 if getattr(self.args, "export_all_seg", False):
@@ -318,6 +327,37 @@ class RCFModel(nn.Module):
             return pred_masks, pred_vis_list
 
         return pred_masks
+
+    @rank_zero_only
+    def finalize_eval_save(self, extra_masks_np):
+        """Append extra rows (GT, union mask, …) to the pending eval grid and save.
+
+        Args:
+            extra_masks_np: list of 2-D numpy arrays (H, W), values 0/1.
+                            Each becomes one extra row in the visualization grid.
+        """
+        if not hasattr(self, '_pending_eval_viz') or self._pending_eval_viz is None:
+            return
+        p = self._pending_eval_viz
+        row_h, row_w = p['row_h'], p['row_w']
+        base = p['tosave']
+        device, B = base.device, base.shape[0]
+        extra_rows = []
+        for mask_np in extra_masks_np:
+            if mask_np.ndim == 2:
+                # Single mask → expand to full batch (oracle mode)
+                t = torch.from_numpy(mask_np.astype('float32'))[None, None].repeat(B, 3, 1, 1)
+            elif mask_np.ndim == 3:
+                # Per-batch masks [B, H, W] → add channel dim and repeat to 3ch
+                t = torch.from_numpy(mask_np.astype('float32'))[:, None].repeat(1, 3, 1, 1)
+            else:
+                continue
+            t = F.interpolate(t, (row_h, row_w), mode='nearest').to(device)
+            extra_rows.append(t)
+        tosave = torch.cat([base] + extra_rows, dim=2)
+        self.save_eval_visualizations(
+            tosave, p['paths'], p['seq_ids'], p['seq_names'], train_iter=self.train_iter)
+        self._pending_eval_viz = None
 
     def pred_separate_residual(self, feats, batch_size, im_num):
         # separate residual has different input compared to joint residual to make passing features with multiple resolutions easier

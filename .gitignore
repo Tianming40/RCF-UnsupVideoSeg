@@ -174,3 +174,7 @@ sync*.sh
 notebooks/visualizations
 notebooks/visualizations_bw
 *.out
+analysis_channel_roles/
+*.pdf
+analysis/
+*.sh

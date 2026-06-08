@@ -251,3 +251,33 @@ CUDA_VISIBLE_DEVICES=0 python tools/SemanticConstraintsAndMAA/maa.py \
     --step 0 \
     --first-frames-only
 ```
+
+## DINO-guided RCF on CMC Surgical Instrument Dataset
+
+Three-stage pipeline for training and evaluating on `data_medical` / `CMC_grasp10_deinterlaced`.
+
+### Phase 1 — DINO-guided training on data_medical
+Config: `configs/instrument/rcf_cmc_dino_phase1.yaml`
+```shell
+CUDA_VISIBLE_DEVICES=0 python main_dino.py configs/instrument/rcf_cmc_dino_phase1.yaml
+```
+
+### Phase 2 — Fine-tune on CMC_grasp10 (4-fold cross-validation)
+Config: `configs/instrument/rcf_cmc_grasp10_finetune_dino.yaml`
+```shell
+# Run all 4 folds sequentially (recommended)
+bash script/run_grasp10_finetune.sh all 0
+
+# Or run a single fold
+bash script/run_grasp10_finetune.sh 1 0
+```
+
+### Evaluation — Full 601-sequence eval across checkpoints
+Config: `configs/instrument/rcf_cmc_grasp10_eval.yaml`
+```shell
+# Evaluate best checkpoints from all folds on full 601 sequences
+bash script/run_grasp10_eval_full.sh 0
+
+# Evaluate a single checkpoint on a specific fold val split
+bash script/run_grasp10_eval_fold.sh 1 saved/grasp10_ft_fold1_<timestamp>/last.ckpt 0
+```

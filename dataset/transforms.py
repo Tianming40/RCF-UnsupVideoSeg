@@ -816,6 +816,24 @@ class AnnotationTransform(object):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
 
+class AnnResize(object):
+    """Resize data['ann'] (PIL image) to a fixed (h, w) before AnnotationTransform.
+    Needed when batch_size > 1 and images have varying original sizes, since
+    data.py intentionally excludes 'ann' from seg_fields.
+    """
+    def __init__(self, size):
+        self.h, self.w = size[0], size[1]
+
+    def __call__(self, data):
+        if 'ann' in data and data['ann'] is not None:
+            ann = data['ann']
+            if hasattr(ann, 'resize'):  # PIL Image
+                data['ann'] = ann.resize((self.w, self.h), Image.NEAREST)
+        return data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(size=({self.h}, {self.w}))"
+
 class AttnTransform(object):
     def __call__(self, data):
         # data['attn']: one numpy array
@@ -886,7 +904,7 @@ class Transform(object):
     This is the transform used by v1 and v2 (v2.1).
     Training and evaluation have different shape (training is rectangular).
     """
-    def __init__(self, training, strong_aug=False, has_flow=True, has_attn=False, has_pl=False, scale_flow=False):
+    def __init__(self, training, strong_aug=False, has_flow=True, has_attn=False, has_pl=False, scale_flow=False, test_crop_size=None):
         # v1 by default uses weak_aug
         self.training = training
         self.has_pl = has_pl
@@ -906,8 +924,15 @@ class Transform(object):
                 TorchNormalize(**normalize_kwargs)
             ])
         else:
+            # test_crop_size: fixed-size resize (keep_ratio=False) applied BEFORE
+            # AnnotationTransform so that both img and ann are resized together.
+            if test_crop_size is not None:
+                test_resize = Resize(img_scale=tuple(test_crop_size), keep_ratio=False)
+            else:
+                test_resize = Resize(img_scale=(9999, 400), ratio_range=(0.98, 0.98))
             self.group_transform = transforms.Compose([
-                Resize(img_scale=(9999, 400), ratio_range=(0.98, 0.98)),
+                test_resize,
+                *([AnnResize(test_crop_size)] if test_crop_size is not None else []),
                 AnnotationTransform(),
                 NumpyToTensor(['img']),
                 TorchNormalize(**normalize_kwargs)

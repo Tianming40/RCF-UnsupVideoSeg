@@ -1,0 +1,183 @@
+# rcf_cmc_tissue_v1.yaml
+#
+# Fine-tune from cmc_grasp10_finetune_v2b checkpoint with three additional
+# tissue-role losses that reinforce channel specialisation:
+#
+#   L_compact  (w_compact 0.05) — instrument channels stay spatially compact
+#   L_align    (w_align   0.10) — tissue channel flow aligns with grasping-point
+#   L_motion   (w_motion  0.05) — tissue channel moves more than background
+#
+# Channel convention (from 60-frame empirical analysis):
+#   ch0 = instrument shaft   (lowest dir-var 0.948, area 6.3%)
+#   ch1 = soft tissue        (largest moving region, area 34%, residual 0.479)
+#   ch2 = grasping point     (highest convergence 0.121, area 2.8%)
+#   ch3 = instrument joint   (highest flow-mag 12.9, area 3.3%)
+#   ch4 = background         (lowest flow 5.5, area 53%)
+#
+# Usage:
+#   python main_tissue.py configs/instrument/rcf_cmc_tissue_v1.yaml
+
+batch_size: 8
+epochs: 30
+learning_rate: 2.e-5        # lower than v2b (5e-5) — fine-tuning from ckpt
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 16
+
+checkpoints_dir: saved/cmc_tissue_v1
+pretrained_model: saved/cmc_grasp10_finetune_v2b_260604_120527/last.ckpt
+model_cls: RCFTissueModel   # ← registered by main_tissue.py
+
+eval_pos_th: 0.35
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+
+object_channel: null
+
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train.txt
+  zero_ann: true
+
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/data_medical
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: fold1_val.txt
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+set_object_channel_after_epoch: 5
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  # ── standard RCF/V2b params (unchanged from v2b) ─────────────────────────
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  # ── tissue-role losses ────────────────────────────────────────────────────
+  instrument_channels: [0, 2, 3]  # which channels get compactness loss
+  tissue_channel:      1          # soft tissue channel
+  grasping_channel:    2          # instrument tip / highest convergence
+  bg_channels:         [4]        # background channel(s)
+
+  # Loss weights — conservative starting point.
+  # If tissue separation is weak after training, raise w_align / w_motion.
+  # If instrument masks fragment, lower w_compact or raise it.
+  w_compact: 0.05
+  w_align:   0.10
+  w_motion:  0.05
+
+  # L_align: suppress on frames where grasping channel covers < 0.5% of pixels
+  min_grasp_frac: 0.005
+
+  # L_motion: tissue must flow at least this many px/frame more than background
+  motion_margin: 1.0
+
+eval_save: true
+eval_export: true
+export_all_seg: true

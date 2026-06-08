@@ -1,0 +1,185 @@
+# Phase 1 — DINO-guided training on data_medical (Method B)
+#
+# Adds L_dino (soft K-means in frozen DINO ViT-small feature space) to
+# standard RCF warp loss. This breaks channel symmetry much faster and
+# encourages visually coherent regions (instrument / tissue / background)
+# to cluster into separate channels from the very beginning of training.
+#
+# Key differences vs rcf_kfold_phase1.yaml:
+#   - model_cls: RCFDinoModel  (adds L_dino)
+#   - V2b architecture: mask_size=128, FlowAggregationHeadWithResidualV2
+#   - dino_checkpoint: local torch-hub cache (no internet needed)
+#   - Train on train.txt (all training data, not kfold)
+#
+# Usage:
+#   python main_dino.py configs/instrument/rcf_cmc_dino_phase1.yaml
+
+batch_size: 8   # 8×2=16 images, nrow=8 → two rows exactly filled, no black padding
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 16
+
+checkpoints_dir: saved/cmc_dino_phase1
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFDinoModel
+
+eval_pos_th: 0.35
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+
+object_channel: null
+
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/data_medical
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix: "_NewCT"
+  flow_suffix2: "_NewCT2"
+  flow_suffix3: "_NewCT3"
+  split: trainval.txt        # all 8 datasets (1-8)
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: fold1_val.txt       # datasets 1,3: have annotations, used to monitor val_miou
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+set_object_channel_after_epoch: 5
+
+trainer_kwargs:
+  check_val_every_n_epoch: 2
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  # ── Standard RCF losses ───────────────────────────────────────────────
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+
+  # ── Training visualisation ────────────────────────────────────────────
+  # Saves a mask image to {checkpoints_dir}_train_export/ every log_interval steps.
+  # Content: soft masks for all 5 channels (greyscale) + original image + optical flow.
+  # Set lower (e.g. 20) to observe early channel differentiation.
+  log_interval: 20
+
+  # ── DINO consistency loss ─────────────────────────────────────────────
+  # w_dino: contribution of L_dino to total loss.
+  #   0.05 → gentle appearance guidance, warp loss stays dominant
+  #   0.10 → stronger, breaks symmetry faster
+  w_dino: 0.08
+
+  # dino_checkpoint: local torch-hub cached weight (avoids download on
+  # compute nodes without internet access).
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+
+  # dino_input_size: frames are resized to this square before DINO.
+  # 128 → 16×16 = 256 patches; matches mask_size → no resize for loss.
+  # Increase to 160 or 192 for richer features (slower).
+  dino_input_size: 128
+
+  # ── Backbone ──────────────────────────────────────────────────────────
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  # ── Flow aggregation head (V2) ────────────────────────────────────────
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745   # pi/18 ≈ 0.1745; better for small CMC motion
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  # ── Mask prediction head ──────────────────────────────────────────────
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  # ── Residual head ─────────────────────────────────────────────────────
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20    # 5 channels * 2 frames * 2 xy = 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+eval_save: true
+eval_export: true
+export_all_seg: true

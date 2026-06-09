@@ -1,0 +1,213 @@
+# rcf_cmc_grasp10_ft_progressive.yaml
+#
+# Progressive-unfreezing fine-tune on CMC_grasp10 (with domain adapters).
+#
+# Strategy
+# --------
+#  Epoch  0- 4  freeze_backbone_stages=4, freeze_flow_head=true
+#               Backbone fully frozen; only FCNHead (5.9M) + adapters (0.6M) train.
+#               BN running stats unchanged → Phase 1 feature distribution preserved.
+#               Avoids the 14% drop seen when backbone trains from epoch 0.
+#
+#  Epoch  5- 9  freeze_backbone_stages=2, freeze_flow_head=true
+#               Unfreeze layer3 + layer4 (high-level semantic, ~22M params).
+#               Backbone trains at backbone_lr_scale × base_lr (slow update).
+#               FlowHead stays frozen to preserve Phase 1 flow features.
+#
+#  Epoch 10-14  freeze_backbone_stages=0, freeze_flow_head=false
+#               Unfreeze everything; joint fine-tuning at very low lr.
+#               Backbone lr = backbone_lr_scale × base_lr (2e-6).
+#
+# The progressive_unfreeze schedule lives at the top level of the config.
+# main.py reads it in on_train_epoch_start and calls _apply_progressive_unfreeze.
+#
+# Differential lr (from RCFDinoAdapterModel.get_param_groups):
+#   backbone  : backbone_lr_scale × base_lr = 0.1 × 2e-5 = 2e-6
+#   adapter   : base_lr = 2e-5
+#   FCNHead   : base_lr = 2e-5
+#
+# Frozen params receive requires_grad=False → no gradient → not updated,
+# regardless of which optimizer param group they belong to.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 15
+learning_rate: 2.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp10_progressive_fold1   # overridden via --opts
+pretrained_model: saved/cmc_dino_phase1_260605_143205/epoch=7-step=1800.ckpt
+model_cls: RCFDinoAdapterModel
+
+eval_pos_th: 0.35
+eval_save: true
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+
+test_transform_kwargs:
+  strong_aug: false
+  # no test_crop_size — full resolution (val_batch_size=1)
+
+loss_log_interval: 10
+log_interval: 200
+
+object_channel: 1
+set_object_channel_after_epoch: 0
+
+# ── Progressive Unfreeze Schedule ────────────────────────────────────────────
+# Processed in on_train_epoch_start → _apply_progressive_unfreeze.
+# Each entry takes effect at `epoch` and stays until the next entry.
+progressive_unfreeze:
+  - epoch: 0
+    freeze_backbone_stages: 4   # all backbone frozen (stem+L1+L2+L3+L4)
+    freeze_flow_head: true      # FlowHead + ResidualHead frozen
+    freeze_all_bn: true         # lock ALL BN running stats to Phase-1 values;
+                                # prevents crop(384) vs full-res val mismatch
+  - epoch: 5
+    freeze_backbone_stages: 2   # unfreeze L3+L4; keep stem+L1+L2 frozen
+    freeze_flow_head: true
+    freeze_all_bn: false        # let BN stats adapt as L3+L4 become trainable
+  - epoch: 10
+    freeze_backbone_stages: 0   # full backbone trainable
+    freeze_flow_head: false     # FlowHead also trainable
+    freeze_all_bn: false
+
+# ── Training: grasp10 fold-train ─────────────────────────────────────────────
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/grasp10_fold1_train.txt   # overridden via --opts
+  zero_ann: false
+
+# ── Validation: grasp10 fold-val ─────────────────────────────────────────────
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/grasp10_fold1_val.txt     # overridden via --opts
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-7
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 200
+
+  # Initial freeze state (epoch 0 schedule entry takes effect at on_train_epoch_start,
+  # but the model __init__ also needs a starting state for the very first forward pass).
+  freeze_backbone: false
+  freeze_backbone_stages: 4     # all backbone frozen at init (matches epoch-0 schedule)
+  freeze_flow_head: true        # FlowHead frozen at init
+
+  # Adapter config
+  adapter_bottleneck_s1: 64    # 256  → 64 → 256,  ~0.07M params
+  adapter_bottleneck_s4: 64    # 2048 → 64 → 2048, ~0.53M params
+  backbone_lr_scale: 0.1       # backbone lr = 2e-6 once unfrozen
+
+  w_dino: 0.02
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

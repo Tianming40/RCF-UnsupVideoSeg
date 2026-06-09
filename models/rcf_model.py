@@ -56,6 +56,8 @@ class RCFModel(nn.Module):
                  mask_size=(48, 48),
                  log_interval=50,
                  freeze_backbone=False,
+                 freeze_backbone_stages=0,
+                 freeze_flow_head=False,
                  object_aware_sharpening=False,
                  separate_residual=False,
                  allow_mask_resize=False):
@@ -93,6 +95,23 @@ class RCFModel(nn.Module):
 
         if freeze_backbone:
             for _, param in self.backbone2.named_parameters():
+                param.requires_grad_(False)
+
+        if freeze_backbone_stages > 0:
+            # Freeze stem (conv1+bn1) and the first N ResNet stages (layer1..layerN).
+            # BN running stats (buffers) are NOT frozen — they adapt to new domain.
+            # freeze_backbone_stages=2 freezes stem + layer1 + layer2.
+            stem_modules = ['conv1', 'bn1']
+            stage_modules = [f'layer{i}' for i in range(1, freeze_backbone_stages + 1)]
+            for name, param in self.backbone2.named_parameters():
+                top = name.split('.')[0]
+                if top in stem_modules or top in stage_modules:
+                    param.requires_grad_(False)
+
+        if freeze_flow_head:
+            for _, param in self.decode_head.named_parameters():
+                param.requires_grad_(False)
+            for _, param in self.decode_head3.named_parameters():
                 param.requires_grad_(False)
 
         self.train_iter = train_iter

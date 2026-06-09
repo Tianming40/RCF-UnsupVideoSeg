@@ -899,21 +899,200 @@ class PLTransform(object):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
 
+class ResolutionAwareCrop:
+    """Resize + RandomCrop with per-resolution settings.
+
+    configs: list of dicts with keys:
+        max_short_side  (int)   — apply this entry if image short side <= value
+        resize_short    (int)   — target short side for Resize
+        crop_size       (list)  — [h, w] crop size
+        split_wide      (bool)  — optional; randomly split wide images (AR>1.5)
+                                  left/right before resize, making them portrait
+
+    Entries are matched in ascending max_short_side order; the last entry
+    acts as the default (largest / catch-all).
+
+    Example config (720p + 1080p with split):
+        - {max_short_side: 576,   resize_short: 400, crop_size: [384, 384]}
+        - {max_short_side: 99999, resize_short: 400, crop_size: [384, 384], split_wide: true}
+    """
+    def __init__(self, configs):
+        self.configs = sorted(configs, key=lambda c: c['max_short_side'])
+
+    @staticmethod
+    def _split_wide(results):
+        """Randomly take left or right half; updates img + all seg_fields."""
+        imgs = results['img']
+        h, w = imgs[0].shape[:2]
+        half_w = w // 2
+        start = 0 if random.random() < 0.5 else half_w
+        end = half_w if start == 0 else w
+
+        results['img'] = [img[:, start:end] for img in imgs]
+        for key in results.get('seg_fields', []):
+            results[key] = [arr[:, start:end] for arr in results[key]]
+        return results
+
+    @staticmethod
+    def _half_crop(results, crop_size):
+        """Crop from left or right half (50/50). Flow stays fully consistent
+        because we crop img and seg_fields from the same region of the full image."""
+        h, w = results['img'][0].shape[:2]
+        crop_h, crop_w = crop_size
+        half_w = w // 2
+
+        if random.random() < 0.5:
+            x_lo, x_hi = 0, half_w          # left half
+        else:
+            x_lo, x_hi = half_w, w          # right half
+
+        margin_y = max(h - crop_h, 0)
+        margin_x = max((x_hi - x_lo) - crop_w, 0)
+        y0 = np.random.randint(0, margin_y + 1)
+        x0 = x_lo + np.random.randint(0, margin_x + 1)
+
+        def crop(arr):
+            return arr[y0:y0 + crop_h, x0:x0 + crop_w]
+
+        results['img'] = [crop(img) for img in results['img']]
+        for key in results.get('seg_fields', []):
+            results[key] = [crop(arr) for arr in results[key]]
+        return results
+
+    def __call__(self, results):
+        h, w = results['img'][0].shape[:2]
+        short = min(h, w)
+        cfg = self.configs[-1]
+        for c in self.configs:
+            if short <= c['max_short_side']:
+                cfg = c
+                break
+        if cfg.get('split_wide', False) and w / h > 1.5:
+            results = self._split_wide(results)
+        results = Resize(img_scale=(9999, cfg['resize_short']), ratio_range=(0.96, 1.0))(results)
+        if cfg.get('half_crop', False):
+            results = self._half_crop(results, tuple(cfg['crop_size']))
+        else:
+            results = RandomCrop(crop_size=tuple(cfg['crop_size']), cat_max_ratio=1.0)(results)
+        return results
+
+    def __repr__(self):
+        return f"ResolutionAwareCrop(configs={self.configs})"
+
+
+class ResolutionGroupedBatchSampler(torch.utils.data.Sampler):
+    """Batch sampler that groups samples by resolution and interleaves batches.
+
+    Each batch contains only same-resolution samples → no padding needed.
+    Batches from different groups are shuffled together so the model sees
+    all resolutions throughout training without distribution shift.
+
+    Args:
+        dataset: VideoDataset instance (needs seq_frames_path_all, seq_len_cumsum, num_seq)
+        batch_size: samples per batch
+        resolution_configs: same list as ResolutionAwareCrop — each entry has max_short_side
+    """
+    def __init__(self, dataset, batch_size, resolution_configs):
+        from PIL import Image as _Image
+
+        configs = sorted(resolution_configs, key=lambda c: c['max_short_side'])
+        self.batch_size = batch_size
+        self.groups = [[] for _ in range(len(configs))]
+
+        for seq_idx in range(dataset.num_seq):
+            first_path = dataset.seq_frames_path_all[seq_idx][0]
+            w, h = _Image.open(first_path).size  # PIL: (width, height)
+            short = min(h, w)
+
+            group_idx = len(configs) - 1
+            for cfg_idx, cfg in enumerate(configs):
+                if short <= cfg['max_short_side']:
+                    group_idx = cfg_idx
+                    break
+
+            start = int(dataset.seq_len_cumsum[seq_idx])
+            end = int(dataset.seq_len_cumsum[seq_idx + 1])
+            self.groups[group_idx].extend(range(start, end))
+
+        sizes = [len(g) for g in self.groups]
+        print(f"[ResolutionGroupedBatchSampler] group sizes={sizes}, "
+              f"batches/epoch={sum(s // batch_size for s in sizes)}")
+
+    def __iter__(self):
+        import random
+        all_batches = []
+        for group in self.groups:
+            indices = list(group)
+            random.shuffle(indices)
+            for i in range(0, len(indices) - self.batch_size + 1, self.batch_size):
+                all_batches.append(indices[i:i + self.batch_size])
+        random.shuffle(all_batches)  # interleave across resolutions
+        yield from all_batches
+
+    def __len__(self):
+        return sum(len(g) // self.batch_size for g in self.groups)
+
+
+def pad_collate(batch):
+    """Collate that zero-pads all spatial tensors to the max (H, W) in the batch.
+
+    Required when resolution_crop_configs produces different crop sizes per item.
+    """
+    import torch
+    from torch.utils.data.dataloader import default_collate
+
+    max_h = max_w = 0
+    for item in batch:
+        for val in item.values():
+            if isinstance(val, list):
+                for v in val:
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                        max_h = max(max_h, v.shape[-2])
+                        max_w = max(max_w, v.shape[-1])
+
+    if max_h == 0:
+        return default_collate(batch)
+
+    def _pad(t):
+        if isinstance(t, torch.Tensor) and t.dim() >= 2:
+            h, w = t.shape[-2], t.shape[-1]
+            if h < max_h or w < max_w:
+                out = torch.zeros(*t.shape[:-2], max_h, max_w, dtype=t.dtype)
+                out[..., :h, :w] = t
+                return out
+        return t
+
+    padded = []
+    for item in batch:
+        padded.append({k: [_pad(v) for v in val] if isinstance(val, list) else val
+                       for k, val in item.items()})
+    return default_collate(padded)
+
+
 class Transform(object):
     """
     This is the transform used by v1 and v2 (v2.1).
     Training and evaluation have different shape (training is rectangular).
     """
-    def __init__(self, training, strong_aug=False, has_flow=True, has_attn=False, has_pl=False, scale_flow=False, test_crop_size=None):
+    def __init__(self, training, strong_aug=False, has_flow=True, has_attn=False, has_pl=False,
+                 scale_flow=False, test_crop_size=None, resolution_crop_configs=None,
+                 resize_short=400, crop_size=None):
         # v1 by default uses weak_aug
         self.training = training
         self.has_pl = has_pl
         normalize_kwargs = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
         if self.training:
+            if resolution_crop_configs:
+                resize_crop = [ResolutionAwareCrop(resolution_crop_configs)]
+            else:
+                _crop = tuple(crop_size) if crop_size else (384, 384)
+                resize_crop = [
+                    Resize(img_scale=(9999, resize_short), ratio_range=(0.96, 1.0)),
+                    RandomCrop(crop_size=_crop, cat_max_ratio=1.0),
+                ]
             self.group_transform = transforms.Compose([
                 *([AttnTransform()] if has_attn else []),
-                Resize(img_scale=(9999, 400), ratio_range=(0.96, 1.0)),
-                RandomCrop(crop_size=(384, 384), cat_max_ratio=1.0),
+                *resize_crop,
                 *([
                     RandomFlip(flip_ratio=0.5, direction='horizontal'),
                     PhotoMetricDistortion()
@@ -929,7 +1108,7 @@ class Transform(object):
             if test_crop_size is not None:
                 test_resize = Resize(img_scale=tuple(test_crop_size), keep_ratio=False)
             else:
-                test_resize = Resize(img_scale=(9999, 400), ratio_range=(0.98, 0.98))
+                test_resize = Resize(img_scale=(9999, resize_short), ratio_range=(0.98, 0.98))
             self.group_transform = transforms.Compose([
                 test_resize,
                 *([AnnResize(test_crop_size)] if test_crop_size is not None else []),

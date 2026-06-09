@@ -1,0 +1,192 @@
+# rcf_cmc_grasp10_ft_fcnonly.yaml
+#
+# Fine-tune on CMC_grasp10 with 4-fold CV — FCNHead only.
+#
+# Motivation:
+#   Phase 1 DINO model already achieves ~70%+ on grasp10.
+#   Previous fine-tuning with full model updates (lr=5e-5) caused negative
+#   transfer: the learned backbone/flow features were overwritten by the
+#   weak grasp10 signal (single optical flow gap, only 601 sequences).
+#
+# Strategy:
+#   - Freeze stem + layer1 + layer2 (low-level universal features, no need to adapt)
+#   - Unfreeze layer3 + layer4 (high-level semantic features, need domain adaptation)
+#   - Unfreeze FCNHead (decode_head2, mask prediction head)
+#   - Keep flow head + residual head frozen (Phase 1 flow features already good)
+#   - 4-fold CV: train on ~450 sequences, validate on ~150 (with annotations)
+#   - Low lr (5e-6), short schedule (10 epochs) to stay close to Phase 1
+#
+# 4-fold split (601 sequences sorted by seq_id):
+#   Fold 1: train=450  val=151
+#   Fold 2: train=451  val=150
+#   Fold 3: train=451  val=150
+#   Fold 4: train=451  val=150
+#
+# Usage (fold 1 example):
+#   python main_dino.py configs/instrument/rcf_cmc_grasp10_ft_fcnonly.yaml \
+#       --opts \
+#           checkpoints_dir saved/grasp10_fcnonly_fold1 \
+#           allow_overwriting_checkpoints_dir True \
+#           "train_dataset_kwargs.split" ImageSets/grasp10_fold1_train.txt \
+#           "test_dataset_kwargs.split"  ImageSets/grasp10_fold1_val.txt
+#
+# Or use script/run_grasp10_ft_fcnonly.sh [fold=all|1..4] [gpu]
+
+batch_size: 8
+val_batch_size: 1
+epochs: 15
+learning_rate: 1.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp10_fcnonly_fold1   # overridden via --opts
+pretrained_model: saved/cmc_dino_phase1_260605_143205/epoch=7-step=1800.ckpt
+model_cls: RCFDinoModel
+
+eval_pos_th: 0.35
+eval_save: true
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+
+test_transform_kwargs:
+  strong_aug: false
+  # no test_crop_size — full resolution, val_batch_size=1
+
+loss_log_interval: 10
+log_interval: 200
+
+object_channel: 1   # ch1=instrument confirmed in Phase 1
+set_object_channel_after_epoch: 0
+
+# ── Training: grasp10 fold-train (default fold 1, override via --opts) ───────
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"   # grasp10 has only gap=1 flow
+  flow_suffix3: "_NewCT"
+  split: ImageSets/grasp10_fold1_train.txt   # overridden via --opts
+  zero_ann: false
+
+# ── Validation: grasp10 fold-val with annotations ───────────────────────────
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/grasp10_fold1_val.txt   # overridden via --opts
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-7
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 200
+
+  # Partial freeze: stem + layer1 + layer2 locked; layer3 + layer4 + FCNHead adapt
+  freeze_backbone: false          # full freeze disabled
+  freeze_backbone_stages: 2       # freeze stem + layer1 + layer2 only
+  freeze_flow_head: true          # flow head + residual head stay frozen
+
+  w_dino: 0.02   # reduced from 0.08 — conservative for partial fine-tuning
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false   # BN running stats adapt to grasp10 domain even in frozen stages
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

@@ -1,0 +1,198 @@
+# rcf_cmc_grasp10_ft_v10.yaml
+#
+# Upgrade over v9: split 1080p wide images in half (left/right random) before resize + crop
+#
+# Actual dataset resolutions:
+#   720x576  (PAL, 5:4, 72.9%)  short side=576  AR=1.25 (near square)
+#   1920x1080 (16:9, 27.1%)     short side=1080 AR=1.78 (widescreen)
+#
+# Core idea (split_wide):
+#   1920x1080 -> randomly take left or right half -> 960x1080 (AR=0.89, near square)
+#   then resize_short=400 -> 400x450 -> crop 384x384
+#   coverage: h=96% w=96% <- far better than v9's h=67% w=38%
+#
+# Crop coverage comparison:
+#   720x576  : resize400 -> 400x500 -> crop384 -> h=96% w=77% ✓
+#   1080p v9 : resize576 -> 576x1024 -> crop384 -> h=67% w=38%
+#   1080p v10: split->960x1080 -> resize400->400x450 -> crop384 -> h=96% w=96%
+#
+# BN consistency:
+#   all crops are 384x384 (phase1, 720x576, 1080p fully unified) ✓
+#   val: resize_short=400, window=384 -> fully consistent with training scale ✓
+#
+# NOTE: failed experiment — precomputed flow is broken after split (vectors near centre
+#       point into the discarded half); also train/val domain gap (portrait vs landscape).
+#
+# Cold-start from phase1, lr=3e-5, 30ep
+
+batch_size: 8
+val_batch_size: 1
+epochs: 30
+learning_rate: 3.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp10_ft_v10_fold1   # overridden via --opts
+pretrained_model: saved/cmc_dino_phase1_260605_143205/epoch=7-step=1800.ckpt
+model_cls: RCFDinoModel
+
+eval_pos_th: 0.35
+eval_save: true
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+# Key: 1080p uses split_wide=true — split wide image in half before resize400+crop384
+#   720x576: resize400 -> 400x500 -> crop384 (96%x77% coverage)
+#   1080p  : split->960x1080 -> resize400->400x450 -> crop384 (96%x96% coverage)
+#   both resolutions use the same resize_short=400, BN unified
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576     # 720x576 (PAL): short side=576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999   # 1920x1080: short side=1080, after split short side=960
+      resize_short: 400
+      crop_size: [384, 384]
+      split_wide: true        # wide images (AR>1.5) split in half before resize
+
+# val uses default resize_short=400, fully consistent with training scale
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: 1
+set_object_channel_after_epoch: 0
+
+# ── Training: grasp10 stratified fold ────────────────────────────────────────
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/grasp10_stratified_fold1_train.txt   # overridden via --opts
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/grasp10_stratified_fold1_val.txt     # overridden via --opts
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.05
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

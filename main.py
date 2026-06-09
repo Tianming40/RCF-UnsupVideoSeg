@@ -35,6 +35,77 @@ import wandb
 logger = utils.get_logger()
 # test
 
+
+def _apply_progressive_unfreeze(model, stage: dict, epoch: int) -> None:
+    """Apply one step of a progressive-unfreeze schedule to `model`.
+
+    stage keys:
+      freeze_backbone_stages  int   0 = all backbone trainable; N = freeze stem+layer1..layerN
+      freeze_flow_head        bool  True = freeze decode_head + decode_head3
+      freeze_all_bn           bool  True = freeze ALL BN running stats globally (adapter excluded)
+
+    freeze_all_bn rationale
+    -----------------------
+    Calling .eval() only on frozen backbone stages creates a mode mismatch:
+    backbone uses Phase-1 running stats while FCNHead uses batch stats → worse
+    than leaving everything in train mode.  The correct fix is to freeze ALL
+    BN running_mean/var so the entire pipeline is consistent with Phase-1
+    statistics at both train and val time.  BN affine params (gamma/beta) keep
+    their requires_grad and still adapt via gradient.
+    """
+    freeze_backbone_stages = stage.get('freeze_backbone_stages', 0)
+    freeze_flow_head       = stage.get('freeze_flow_head', False)
+    freeze_all_bn          = stage.get('freeze_all_bn', False)
+
+    # DINO encoder is always frozen — collect its param ids
+    dino_ids: set = set()
+    if hasattr(model, 'dino') and model.dino is not None:
+        dino_ids = {id(p) for p in model.dino.parameters()}
+
+    # Step 1: unfreeze everything except DINO (PL has already called model.train())
+    for p in model.parameters():
+        if id(p) not in dino_ids:
+            p.requires_grad_(True)
+
+    # Step 2: re-apply backbone stage freeze (requires_grad only — no eval here)
+    if freeze_backbone_stages > 0 and hasattr(model, 'backbone2'):
+        stem_names = {'conv1', 'bn1'}
+        stage_names = {f'layer{i}' for i in range(1, freeze_backbone_stages + 1)}
+        freeze_names = stem_names | stage_names
+        for name, param in model.backbone2.named_parameters():
+            if name.split('.')[0] in freeze_names:
+                param.requires_grad_(False)
+
+    # Step 3: re-apply flow-head freeze (requires_grad only)
+    if freeze_flow_head:
+        for attr in ('decode_head', 'decode_head3'):
+            if hasattr(model, attr):
+                for p in getattr(model, attr).parameters():
+                    p.requires_grad_(False)
+
+    # Step 4: freeze ALL BN running stats globally (adapter BN excluded)
+    #   .eval() locks running_mean/var so the full pipeline is consistent with
+    #   Phase-1 statistics at train AND val — no crop-vs-full-res drift.
+    #   BN weight/bias (affine) still have requires_grad=True and keep updating.
+    if freeze_all_bn:
+        adapter_mod_ids: set = set()
+        for name, m in model.named_modules():
+            if 'adapter' in name:
+                adapter_mod_ids.add(id(m))
+        for m in model.modules():
+            if isinstance(m, torch.nn.BatchNorm2d) and id(m) not in adapter_mod_ids:
+                m.eval()
+
+    trainable_m = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    frozen_m    = sum(p.numel() for p in model.parameters() if not p.requires_grad) / 1e6
+    logger.info(
+        f"[ProgressiveUnfreeze] Epoch {epoch}: "
+        f"freeze_backbone_stages={freeze_backbone_stages}, "
+        f"freeze_flow_head={freeze_flow_head}, "
+        f"freeze_all_bn={freeze_all_bn} → "
+        f"trainable={trainable_m:.2f}M  frozen={frozen_m:.2f}M"
+    )
+
 class Model(pl.LightningModule):
     def __init__(self, args, trainer):
         super().__init__()
@@ -184,6 +255,49 @@ class Model(pl.LightningModule):
     def on_validation_start(self):
         self.on_test_start()
 
+    @torch.no_grad()
+    def _sliding_window_eval(self, x, window_size=384, stride=192):
+        """Forward eval via sliding window so BN always sees window_size crops."""
+        imgs = torch.stack(x['imgs'], dim=1)   # [B, im_num, C, H, W]
+        B, im_num, C, H, W = imgs.shape
+
+        mask_layer = self.args.model_kwargs['mask_layer']
+        pred_accum = torch.zeros(B, mask_layer, H, W, device=imgs.device)
+        count_map  = torch.zeros(1, 1, H, W, device=imgs.device)
+
+        # Window positions — always include right/bottom edge for full coverage
+        def _positions(length):
+            if length <= window_size:
+                return [0]
+            pts = list(range(0, length - window_size, stride))
+            if not pts or pts[-1] + window_size < length:
+                pts.append(length - window_size)
+            return sorted(set(pts))
+
+        eval_on_ema = getattr(self.model, 'eval_on_ema', False)
+        backbone = self.model.backbone2_ema if eval_on_ema else self.model.backbone2
+        head     = self.model.decode_head2_ema if eval_on_ema else self.model.decode_head2
+
+        for y in _positions(H):
+            for xp in _positions(W):
+                y2, x2 = min(y + window_size, H), min(xp + window_size, W)
+                crop = imgs[:, :, :, y:y2, xp:x2]
+                ch, cw = crop.shape[-2], crop.shape[-1]
+                if ch < window_size or cw < window_size:
+                    crop = F.pad(crop, (0, window_size - cw, 0, window_size - ch))
+
+                img3 = crop.view(B * im_num, C, window_size, window_size)
+                feat = self.model.extract_feat(img3, backbone)
+                pred = self.model._decode_head_forward(feat, head)
+                pred = pred.view(B, im_num, mask_layer, *pred.shape[-2:])
+                pred = F.softmax(pred, dim=2)[:, 0]   # [B, C, fH, fW]
+                pred = F.interpolate(pred, size=(window_size, window_size),
+                                     mode='bilinear', align_corners=False)
+                pred_accum[:, :, y:y2, xp:x2] += pred[:, :, :ch, :cw]
+                count_map[:, :, y:y2, xp:x2] += 1
+
+        return pred_accum / count_map.clamp(min=1)
+
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
         # We use max IoU channel in validation to be fast.
@@ -203,11 +317,36 @@ class Model(pl.LightningModule):
     @rank_zero_only
     def test_step(self, batch, batch_idx, always_use_max_iou_channel=False):
         x = batch
-        pred_masks_current_batch = self.forward(x)
+        if getattr(self.args, 'use_sliding_window', False):
+            sw_size   = getattr(self.args, 'sliding_window_size', 384)
+            sw_stride = getattr(self.args, 'sliding_window_stride', sw_size // 2)
+            pred_masks_current_batch = self._sliding_window_eval(x, sw_size, sw_stride)
+            # forward_eval was not called → no pending viz; disable eval_save for this step
+            if hasattr(self.model, '_pending_eval_viz'):
+                self.model._pending_eval_viz = None
+        else:
+            pred_masks_current_batch = self.forward(x)
         assert len(pred_masks_current_batch) == len(
             batch['ann']), f"{len(pred_masks_current_batch)} != {len(batch['ann'])}"
         pred_masks_current_batch_resize = utils.eval_utils._resize(
             pred_masks_current_batch, batch['ann'].shape[1:3])
+
+        # Export mask when using sliding window (forward_eval is bypassed so we do it here)
+        if getattr(self.args, 'use_sliding_window', False) and self.args.eval_export:
+            if getattr(self.args, 'export_all_seg', False):
+                pred_vis_list = [
+                    pred_masks_current_batch_resize[:, i:i+1, :, :].repeat(1, 3, 1, 1)
+                    for i in range(pred_masks_current_batch_resize.shape[1])
+                ]
+                self.model.export_all_seg(pred_vis_list, batch['paths'], batch['seq_ids'],
+                                          batch['seq_names'], name='pred_seg', train_iter=0)
+            else:
+                ch = self.object_channel if self.object_channel is not None else 1
+                export_tensor = (pred_masks_current_batch_resize[:, ch:ch+1] > self.args.eval_pos_th
+                                 ).float().repeat(1, 3, 1, 1)
+                self.model.export_seg(export_tensor, batch['paths'], batch['seq_ids'],
+                                      batch['seq_names'], name='pred_seg', train_iter=0)
+
         # -1 means use hard max (turn masks into one hot)
         num_channels = pred_masks_current_batch_resize.shape[1]
         if self.args.eval_pos_th != -1:
@@ -280,7 +419,7 @@ class Model(pl.LightningModule):
             iou_current_sequence.append(frame_iou)
 
         # Call finalize_eval_save once after the loop with full-batch arrays
-        if self.args.eval_save:
+        if self.args.eval_save and not getattr(self.args, 'use_sliding_window', False):
             if _in_oracle_mode:
                 self.model.finalize_eval_save([])
             elif _eval_gt_list:
@@ -349,8 +488,8 @@ class Model(pl.LightningModule):
             # This is only computed and logged on rank 0, so do not sync.
             self.log(f'{name}_{seq_name}', miou, sync_dist=False)
 
-        # We should not get NaN here unless some videos are empty or have all NaNs
-        mean_miou_all_sequences = np.mean(list(miou_each_sequence.values())).astype(np.float32)
+        # Use nanmean: sequences with all-zero GT + all-zero pred produce IoU=0/0=NaN, skip them
+        mean_miou_all_sequences = np.nanmean(list(miou_each_sequence.values())).astype(np.float32)
 
         logger.info(f"{name}: {mean_miou_all_sequences * 100.:.2f}")
         self.log(name, mean_miou_all_sequences, sync_dist=True, reduce_fx="sum")
@@ -365,11 +504,16 @@ class Model(pl.LightningModule):
         return lr / base_lr
 
     def configure_optimizers(self):
-        params = list(self.model.parameters())
-        params_require_grad = [param for param in params if param.requires_grad]
-        logger.info(f"Number of param tensors: {len(params)}. Number of param tensors (require grad): {len(params_require_grad)}.")
+        if hasattr(self.model, 'get_param_groups'):
+            param_groups = self.model.get_param_groups(self.args.learning_rate)
+            logger.info(f"Using model-defined param groups ({len(param_groups)} groups)")
+        else:
+            params = list(self.model.parameters())
+            params_require_grad = [param for param in params if param.requires_grad]
+            logger.info(f"Number of param tensors: {len(params)}. Number of param tensors (require grad): {len(params_require_grad)}.")
+            param_groups = [{'params': params_require_grad, 'lr': self.args.learning_rate}]
         optimizer = torch.optim.__dict__[self.args.optimizer](
-            params_require_grad,
+            param_groups,
             lr=self.args.learning_rate,
             weight_decay=self.hparams.weight_decay
         )
@@ -378,6 +522,16 @@ class Model(pl.LightningModule):
         return [optimizer], [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)]
 
     def on_train_epoch_start(self):
+        schedule = getattr(self.args, 'progressive_unfreeze', None)
+        if schedule:
+            epoch = self.current_epoch
+            current_stage = None
+            for stage in sorted(schedule, key=lambda s: s['epoch']):
+                if epoch >= stage['epoch']:
+                    current_stage = stage
+            if current_stage is not None:
+                _apply_progressive_unfreeze(self.model, current_stage, epoch)
+
         current_lr = self.optimizers(False).param_groups[0]['lr']
 
         logger.info(f"LR: {current_lr}")
@@ -406,13 +560,30 @@ class Model(pl.LightningModule):
         else:
             shuffle = sampler is None
         
+        resolution_crop_configs = getattr(self.args, 'train_transform_kwargs', {}).get('resolution_crop_configs')
+        if resolution_crop_configs and not self.args.multi_gpu:
+            # Group same-resolution samples into each batch; interleave across batches.
+            # Avoids zero-padding when ResolutionAwareCrop produces different crop sizes.
+            batch_sampler = dataset.ResolutionGroupedBatchSampler(
+                train_dataset,
+                batch_size=self.hparams.batch_size,
+                resolution_configs=resolution_crop_configs,
+            )
+            return torch.utils.data.DataLoader(
+                train_dataset,
+                num_workers=self.args.workers,
+                pin_memory=True,
+                batch_sampler=batch_sampler,
+            )
+        collate_fn = dataset.pad_collate if resolution_crop_configs else None
         return torch.utils.data.DataLoader(
             train_dataset,
             batch_size=self.hparams.batch_size,
             num_workers=self.args.workers,
             pin_memory=True,
             sampler=sampler,
-            shuffle=shuffle
+            shuffle=shuffle,
+            collate_fn=collate_fn
         )
 
     def val_dataloader(self, subsample_frame_interval=5):
@@ -424,9 +595,10 @@ class Model(pl.LightningModule):
             subsample_frame_interval=subsample_frame_interval,
             **self.args.dataset_kwargs, **self.args.test_dataset_kwargs)
         
+        val_batch_size = getattr(self.hparams, 'val_batch_size', self.hparams.batch_size)
         return torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=val_batch_size,
             num_workers=self.args.workers,
             pin_memory=True,
             sampler=torch.utils.data.SequentialSampler(val_dataset),
@@ -439,9 +611,10 @@ class Model(pl.LightningModule):
             test_data_path, training=False,
             transform=dataset.get_transform(self.args, training=False),
             **self.args.dataset_kwargs, **self.args.test_dataset_kwargs)
+        val_batch_size = getattr(self.hparams, 'val_batch_size', self.hparams.batch_size)
         return torch.utils.data.DataLoader(
             test_dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=val_batch_size,
             num_workers=self.args.workers,
             pin_memory=True,
             sampler=torch.utils.data.SequentialSampler(test_dataset),

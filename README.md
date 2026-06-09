@@ -281,3 +281,80 @@ bash script/run_grasp10_eval_full.sh 0
 # Evaluate a single checkpoint on a specific fold val split
 bash script/run_grasp10_eval_fold.sh 1 saved/grasp10_ft_fold1_<timestamp>/last.ckpt 0
 ```
+
+---
+
+## Grasp10 Fine-tuning Configs: v4 / v9 / v11
+
+These three configs represent successive attempts to improve fine-tuning on `CMC_grasp10_deinterlaced`.
+All use **4-fold stratified cross-validation** (each fold val set contains ~27% 1080p + ~73% 720p,
+matching the overall dataset ratio) and **full-resolution sliding-window evaluation**
+(window 384×384, stride 192) — the val metric is therefore directly comparable to real inference.
+
+### Dataset resolution breakdown
+
+| Resolution | Format | Short side | Share |
+|---|---|---|---|
+| 720×576 | PAL 5:4 | 576 px | 72.9% |
+| 1920×1080 | 16:9 | 1080 px | 27.1% |
+
+### Config comparison
+
+| Config | 720×576 crop | 1080p crop | BN consistency | 4-fold avg best mIoU |
+|---|---|---|---|---|
+| **v4** | resize400 → crop384 | resize576 → crop**512** | ✗ train512/val384 mismatch | 66.89% |
+| **v9** | resize400 → crop384 | resize576 → crop**384** | ✓ always 384×384 | **67.10%** |
+| **v11** | resize400 → crop384 | resize576 → half\_crop384 | ✓ always 384×384 | 63.67% |
+
+**v4** introduced resolution-aware cropping so 1080p images are less compressed (1.88× vs 2.7×),
+but the model sees 512×512 patches during training and 384×384 windows at val — BatchNorm
+running statistics diverge between the two sizes, causing instability on 1080p sequences.
+
+**v9** fixes this by using crop=384 for 1080p as well, so BatchNorm always sees 384×384 inputs
+(matching both the phase-1 pre-training and the sliding-window val). Width crop coverage for 1080p
+drops from 50% to 38%, but the BN consistency gain outweighs the loss, especially for fold 2
+(63.03% → 69.09%).
+
+**v11** additionally restricts the 1080p random-crop x-offset to either the left half or right half
+of the resized image (50/50). Each crop then covers 75% of its assigned half instead of 37.5% of the
+full width. Flow vectors are unaffected because both image frames and all flow fields are cropped
+from the same bbox. In practice the reduced x-offset diversity hurt training stability, so v9 remains
+the recommended config.
+
+### How to run
+
+```shell
+# v4 — all 4 folds sequentially on GPU 0
+bash script/run_grasp10_ft_v4.sh all 0
+
+# v9 — all 4 folds sequentially on GPU 0  (recommended)
+bash script/run_grasp10_ft_v9.sh all 0
+
+# v11 — all 4 folds sequentially on GPU 1
+bash script/run_grasp10_ft_v11.sh all 1
+
+# Run a single fold (e.g. fold 2 on GPU 1)
+bash script/run_grasp10_ft_v9.sh 2 1
+```
+
+All scripts cold-start from the phase-1 checkpoint
+(`saved/cmc_dino_phase1_260605_143205/epoch=7-step=1800.ckpt`),
+train for 30 epochs at lr=3e-5, and save per-epoch checkpoints plus tensorboard logs under
+`saved/grasp10_ft_<version>_fold<N>_<timestamp>/`.
+
+### Key implementation details
+
+**ResolutionAwareCrop** (`dataset/transforms.py`) — dispatches each image to the matching
+`resolution_crop_configs` entry based on the original short side, then applies Resize + RandomCrop
+(or half-constrained crop for v11). Supported per-entry options:
+
+| Option | Type | Effect |
+|---|---|---|
+| `max_short_side` | int | upper bound of short side for this entry (ascending order) |
+| `resize_short` | int | target short side passed to Resize |
+| `crop_size` | [h, w] | RandomCrop output size |
+| `split_wide` | bool | split landscape images (AR>1.5) into left/right halves before resize (v10 only — **not recommended**, breaks precomputed flow) |
+| `half_crop` | bool | restrict x-offset to left or right half after resize (v11) |
+
+Val always uses a plain `Resize(resize_short=400)` followed by sliding-window inference —
+no crop options apply at evaluation time.

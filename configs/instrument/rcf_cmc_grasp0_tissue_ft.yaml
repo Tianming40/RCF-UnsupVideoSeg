@@ -1,0 +1,219 @@
+# rcf_cmc_grasp0_tissue_ft.yaml
+#
+# Fine-tune the grasp10 model on grasp0 for soft-tissue segmentation.
+#
+# Model: RCFSoftTissueModel (inherits RCFDinoModel)
+#
+# Loss set (enable by setting weight > 0):
+#   L_dino         : DINO visual coherence                   (w_dino=0.05)
+#   L_rigid        : instrument channels rigid-body motion   (w_rigid)
+#   L_grasp_conv   : grasping-ch aligns with flow divergence (w_grasp_conv)
+#   L_deform       : tissue residual > bg residual           (w_deform)
+#   L_align        : tissue flow aligns with grasping-ch mean(w_align)
+#   L_motion       : tissue motion > bg motion               (w_motion)
+#   L_grasp_flow   : annotation-driven flow alignment ch2    (w_grasp_flow=0.1)
+#   L_dissect_prox : activation near dissection point ch2   (w_dissect=0.05)
+#   L_distill      : BCE distillation to protect ch1         (w_distill=0.1)
+#
+# Channel convention:
+#   ch1 = existing instrument detector (pretrained grasp10, protected by L_distill)
+#   ch2 = new soft-tissue channel to train
+
+batch_size: 8
+val_batch_size: 1
+epochs: 30
+learning_rate: 1.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft
+pretrained_model: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: true
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+# Val uses grasp10 (has instrument annotation) to monitor that ch1 does not degrade.
+# object_channel: 1 = instrument channel (grasp10 annotation target).
+object_channel: 1
+set_object_channel_after_epoch: 0
+
+# Train on grasp0 (annotation-driven losses), val on grasp10 (mIoU annotation)
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/trainval.txt
+  zero_ann: false
+  grasp_ann_dir: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/grasping_points/grasp_dissect_annotations
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/trainval_single.txt
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.05
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  # ── DINO (keep from base model) ────────────────────────────────────────────
+  w_dino: 0.05
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  # ── Channel assignments ────────────────────────────────────────────────────
+  instrument_channels: [1]   # ch1 = existing instrument (for L_rigid)
+  instrument_channel: 1      # excluded region in L_grasp_flow
+  tissue_channel: 2          # new soft-tissue channel
+  grasping_channel: 1        # for L_align, L_grasp_conv
+  bg_channels: [0, 3, 4]
+  distill_channel: 1         # protect ch1 via L_distill
+
+  # ── V2 unsupervised losses (start disabled, tune as needed) ───────────────
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  # ── V3 annotation-driven losses ────────────────────────────────────────────
+  w_grasp_flow: 0.1
+  w_dissect:    0.05
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  # ── KL distillation ────────────────────────────────────────────────────────
+  w_distill:   0.1
+  teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

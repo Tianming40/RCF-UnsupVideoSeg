@@ -1,3 +1,4 @@
+import json
 import torch
 import torch.utils.data
 import numpy as np
@@ -6,7 +7,7 @@ from PIL import Image
 import random
 
 class VideoDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None):
+    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None, grasp_ann_dir=None):
         super().__init__()
 
         file_path = os.path.join(root, split)
@@ -54,6 +55,21 @@ class VideoDataset(torch.utils.data.Dataset):
         self.pl_root2 = pl_root2
 
         self.zero_ann = zero_ann
+
+        # Grasping / dissection point annotations {seq_name: (dissect_xy, grasp_xy)}
+        # Coordinates are normalised [0, 1].  (-1, -1) means no annotation.
+        self.grasp_annotations = {}
+        if grasp_ann_dir is not None:
+            for fname in os.listdir(grasp_ann_dir):
+                if fname.startswith('_') or not fname.endswith('.json'):
+                    continue
+                seq = fname[:-5]
+                try:
+                    d = json.load(open(os.path.join(grasp_ann_dir, fname)))
+                    pts = list(d['annotations'][0].values())[0]  # first annotation
+                    self.grasp_annotations[seq] = (pts[0], pts[1])  # (dissect, grasp)
+                except Exception:
+                    pass
 
         if self.load_pl:
             assert self.transform.has_pl, "load_pl needs to match with has_pl in transform"
@@ -115,13 +131,23 @@ class VideoDataset(torch.utils.data.Dataset):
 
         seq_name = self.seq_names[seq_ind_within_subset]
 
+        ann_entry = self.grasp_annotations.get(seq_name, None)
+        if ann_entry is not None:
+            dissect_xy = torch.tensor(ann_entry[0], dtype=torch.float32)  # [2]  (x,y) normalised
+            grasp_xy   = torch.tensor(ann_entry[1], dtype=torch.float32)  # [2]
+        else:
+            dissect_xy = torch.tensor([-1.0, -1.0], dtype=torch.float32)
+            grasp_xy   = torch.tensor([-1.0, -1.0], dtype=torch.float32)
+
         ret = {
-            'imgs': images, 
+            'imgs': images,
             'seq_ids': seq_ind_within_subset,
-            'seq_names': seq_name, 
-            'paths': current_seq[frame_ind:frame_ind+self.frame_num], 
-            'frame_ind_start': frame_ind, 
-            'seg_fields': []
+            'seq_names': seq_name,
+            'paths': current_seq[frame_ind:frame_ind+self.frame_num],
+            'frame_ind_start': frame_ind,
+            'seg_fields': [],
+            'grasp_xy':   grasp_xy,    # normalised (x,y), (-1,-1) if unavailable
+            'dissect_xy': dissect_xy,  # normalised (x,y), (-1,-1) if unavailable
         }
 
         if not self.training:

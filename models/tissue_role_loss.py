@@ -1,6 +1,12 @@
 """
 tissue_role_loss.py — auxiliary losses for channel role specialisation.
 
+Added in V3:
+  L_grasp_flow  : tissue channel aligns with flow at annotated grasp point
+                  (excluding instrument region to avoid reinforcing ch1)
+  L_dissect_prox: tissue channel activates near annotated dissection point
+                  (Gaussian spatial prior from annotation)
+
 V2 loss set:
   L_rigid       : instrument channels have consistent internal flow (rigid body)
   L_grasp_conv  : grasping-point channel aligns with flow convergence (divergence prior)
@@ -207,3 +213,101 @@ def tissue_motion_loss(
 
     active = (flow_mag.view(B, -1).mean(dim=1) > min_global_flow).float()
     return (F.relu(flow_bg + margin - flow_tissue) * active).mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Grasp-point flow alignment  (annotation-driven, V3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def grasp_flow_alignment_loss(
+        masks: torch.Tensor,
+        flow: torch.Tensor,
+        tissue_channel: int,
+        instrument_channel: int,
+        grasp_xy: torch.Tensor,
+        min_flow_mag: float = 0.5,
+) -> torch.Tensor:
+    """
+    Tissue channel should activate where flow aligns with the displacement at
+    the annotated grasp point — tissue being dragged moves like the instrument tip.
+    Instrument region is excluded to prevent reinforcing ch1.
+
+    masks             : [B, C, H, W]
+    flow              : [B, 2, H, W]  (pixel units)
+    grasp_xy          : [B, 2]  normalised (x, y) in [0,1]; (-1,-1) = no annotation
+    instrument_channel: excluded from tissue weight (detached)
+    min_flow_mag      : skip samples where grasp-point flow is too small
+    """
+    B, _, H, W = masks.shape
+    losses = []
+
+    for b in range(B):
+        gx, gy = grasp_xy[b]
+        if gx < 0:           # no annotation
+            continue
+        px = int((gx * W).clamp(0, W - 1).item())
+        py = int((gy * H).clamp(0, H - 1).item())
+
+        v = flow[b, :, py, px]                              # [2] reference vector
+        v_mag = v.norm() + 1e-6
+        if v_mag.item() < min_flow_mag:
+            continue
+
+        v_dir = v / v_mag                                   # unit vector [2]
+        f_mag = flow[b].norm(dim=0, keepdim=True) + 1e-6   # [1, H, W]
+        f_dir = flow[b] / f_mag                             # [2, H, W]
+        cos   = (f_dir * v_dir[:, None, None]).sum(dim=0)   # [H, W]
+
+        m_tissue     = masks[b, tissue_channel]
+        m_instrument = masks[b, instrument_channel].detach()
+        weight = m_tissue * (1.0 - m_instrument)
+        w_sum  = weight.sum() + 1e-6
+
+        losses.append(-(weight * cos.clamp(min=0)).sum() / w_sum)
+
+    if not losses:
+        return masks.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Dissection-point proximity  (annotation-driven, V3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dissect_proximity_loss(
+        masks: torch.Tensor,
+        tissue_channel: int,
+        dissect_xy: torch.Tensor,
+        sigma: float = 0.12,
+) -> torch.Tensor:
+    """
+    Tissue channel should activate near the annotated dissection point.
+    A Gaussian heatmap centred on the annotation acts as a soft spatial label.
+
+    masks       : [B, C, H, W]
+    dissect_xy  : [B, 2]  normalised (x, y); (-1,-1) = no annotation
+    sigma       : Gaussian width in normalised units (default 0.12 ≈ 12% of image)
+    """
+    B, _, H, W = masks.shape
+    device = masks.device
+    losses = []
+
+    ys = torch.linspace(0, 1, H, device=device)
+    xs = torch.linspace(0, 1, W, device=device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # [H, W]
+
+    for b in range(B):
+        dx, dy = dissect_xy[b]
+        if dx < 0:           # no annotation
+            continue
+
+        dist2 = (grid_x - dx).pow(2) + (grid_y - dy).pow(2)
+        heatmap = torch.exp(-dist2 / (2 * sigma ** 2))
+        heatmap = heatmap / (heatmap.sum() + 1e-6)
+
+        m_tissue = masks[b, tissue_channel]
+        losses.append(-(m_tissue * heatmap).sum())
+
+    if not losses:
+        return masks.sum() * 0.0
+    return torch.stack(losses).mean()

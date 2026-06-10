@@ -3,7 +3,8 @@ main_tissue.py — entry point for tissue-role-aware fine-tuning.
 
 Steps (in order):
   1. Register FlowAggregationHeadWithResidualV2 into rcf_model namespace.
-  2. Register RCFTissueModel into models namespace.
+  2. Register RCFDinoModel + RCFSoftTissueModel into models namespace.
+     Also registers RCFTissueModel as an alias so old configs still work.
   3. Subclass main.py's Model (PL LightningModule) to track per-epoch train
      loss and log 'epoch_train_loss' — used by checkpoint callback.
   4. Replace ModelCheckpoint: monitor='epoch_train_loss', mode='min',
@@ -14,20 +15,24 @@ Steps (in order):
 
 Usage:
   python main_tissue.py configs/instrument/rcf_cmc_tissue_v2.yaml
+  python main_tissue.py configs/instrument/rcf_cmc_grasp0_tissue_ft.yaml
 """
 
 import logging
-import torch
 
 # ── 1. Register V2 flow head ──────────────────────────────────────────────────
 import models.rcf_model as _rcf_mod
 from models.flow_aggregation_head_with_residual_v2 import FlowAggregationHeadWithResidualV2
 _rcf_mod.FlowAggregationHeadWithResidualV2 = FlowAggregationHeadWithResidualV2
 
-# ── 2. Register RCFTissueModel ────────────────────────────────────────────────
+# ── 2. Register RCFDinoModel + RCFSoftTissueModel ─────────────────────────────
 import models as _models_pkg
-from models.rcf_tissue_model import RCFTissueModel
-_models_pkg.RCFTissueModel = RCFTissueModel
+from models.rcf_dino_model import RCFDinoModel
+from models.rcf_soft_tissue_model import RCFSoftTissueModel
+
+_models_pkg.RCFDinoModel       = RCFDinoModel        # type: ignore[attr-defined]
+_models_pkg.RCFSoftTissueModel = RCFSoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFTissueModel     = RCFSoftTissueModel  # type: ignore[attr-defined]
 
 # ── 3. Subclass Model to track epoch-level train loss ─────────────────────────
 import main as _main_module

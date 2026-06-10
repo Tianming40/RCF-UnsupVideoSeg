@@ -15,14 +15,18 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools" / "SemanticConstraintsAndMAA"))
 
-# ── Register V2 and RCFTissueModel ────────────────────────────────────────────
+# ── Register V2 and RCFSoftTissueModel ───────────────────────────────────────
 import models.rcf_model as _rcf_mod
 from models.flow_aggregation_head_with_residual_v2 import FlowAggregationHeadWithResidualV2
 _rcf_mod.FlowAggregationHeadWithResidualV2 = FlowAggregationHeadWithResidualV2
 
 import models as _models_pkg
-from models.rcf_tissue_model import RCFTissueModel
-_models_pkg.RCFTissueModel = RCFTissueModel
+from models.rcf_dino_model import RCFDinoModel
+from models.rcf_soft_tissue_model import RCFSoftTissueModel
+_models_pkg.RCFDinoModel       = RCFDinoModel        # type: ignore[attr-defined]
+_models_pkg.RCFSoftTissueModel = RCFSoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFTissueModel     = RCFSoftTissueModel  # type: ignore[attr-defined]
+RCFTissueModel = RCFSoftTissueModel                  # local alias for type hints below
 
 from tools.maa_union_inference import load_config, load_checkpoint, build_dataset, to_device
 

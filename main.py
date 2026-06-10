@@ -36,6 +36,34 @@ logger = utils.get_logger()
 # test
 
 
+def _guided_filter(guide_rgb, src, r=16, eps=1e-2):
+    """Guided filter using grayscale version of guide_rgb.
+
+    guide_rgb : [B, 3, H, W]  normalised image (same range as training)
+    src       : [B, C, H, W]  soft probability maps to be filtered
+    r         : box filter radius (window = 2r+1)
+    eps       : edge threshold — smaller keeps harder edges, larger blurs more
+    Returns   : [B, C, H, W]  smoothed probability maps, clamped to [0, 1]
+    """
+    I = (0.299 * guide_rgb[:, 0:1] + 0.587 * guide_rgb[:, 1:2]
+         + 0.114 * guide_rgb[:, 2:3])  # [B, 1, H, W]
+    k = 2 * r + 1
+
+    def mean_f(x):
+        return F.avg_pool2d(F.pad(x, (r, r, r, r), mode='reflect'), k, stride=1, padding=0)
+
+    mean_I  = mean_f(I)
+    mean_p  = mean_f(src)
+    mean_Ip = mean_f(I * src)
+    cov_Ip  = mean_Ip - mean_I * mean_p
+    var_I   = mean_f(I * I) - mean_I * mean_I
+
+    a       = cov_Ip / (var_I + eps)
+    b       = mean_p - a * mean_I
+
+    return (mean_f(a) * I + mean_f(b)).clamp(0, 1)
+
+
 def _apply_progressive_unfreeze(model, stage: dict, epoch: int) -> None:
     """Apply one step of a progressive-unfreeze schedule to `model`.
 
@@ -419,14 +447,58 @@ class Model(pl.LightningModule):
             iou_current_sequence.append(frame_iou)
 
         # Call finalize_eval_save once after the loop with full-batch arrays
-        if self.args.eval_save and not getattr(self.args, 'use_sliding_window', False):
-            if _in_oracle_mode:
-                self.model.finalize_eval_save([])
-            elif _eval_gt_list:
-                self.model.finalize_eval_save([
-                    np.stack(_eval_gt_list, axis=0),    # [B, H, W]
-                    np.stack(_eval_union_list, axis=0), # [B, H, W]
-                ])
+        if self.args.eval_save:
+            if not getattr(self.args, 'use_sliding_window', False):
+                if _in_oracle_mode:
+                    self.model.finalize_eval_save([])
+                elif _eval_gt_list:
+                    self.model.finalize_eval_save([
+                        np.stack(_eval_gt_list, axis=0),    # [B, H, W]
+                        np.stack(_eval_union_list, axis=0), # [B, H, W]
+                    ])
+            elif not _in_oracle_mode and _eval_gt_list:
+                # Sliding window: forward_eval bypassed → build 2-column visualization.
+                # Left column : raw soft probability (no post-processing)
+                # Right column: Guided Filter → binary threshold
+                # Last row    : GT mask (left) | union mask (right)
+                imgs = torch.stack(x['imgs'], dim=1)
+                orig = imgs[:, 0]                                # [B, 3, H, W]
+                B, C, H_img, W_img = pred_masks_current_batch.shape
+                orig_d = ((orig + 2.0) / 4.0).clamp(0, 1)      # [0,1], full resolution
+                gf_r   = getattr(self.args, 'sw_vis_gf_r',   16)
+                gf_eps = getattr(self.args, 'sw_vis_gf_eps', 1e-2)
+                pred_smooth = _guided_filter(orig_d, pred_masks_current_batch,
+                                             r=gf_r, eps=gf_eps)
+                th = self.args.eval_pos_th
+                # Row 0: orig | orig
+                rows = [torch.cat([orig_d, orig_d], dim=3)]
+                # Rows 1…C: raw soft prob (left) | GF binary (right)
+                for i in range(C):
+                    raw = pred_masks_current_batch[:, i:i+1].clamp(0, 1).repeat(1, 3, 1, 1)
+                    gf  = (pred_smooth[:, i:i+1] > th).float().repeat(1, 3, 1, 1)
+                    rows.append(torch.cat([raw, gf], dim=3))
+                # Row 6: GT | GT  (ground truth is the same for both columns)
+                # Row 7: raw union (left) | GF union (right)
+                def _np_to_row(masks_np):
+                    t = torch.from_numpy(masks_np.astype('float32'))[:, None].repeat(1, 3, 1, 1)
+                    return F.interpolate(t, (H_img, W_img), mode='nearest').to(orig.device)
+                gt_t  = _np_to_row(np.stack(_eval_gt_list,    axis=0))
+                uni_t = _np_to_row(np.stack(_eval_union_list,  axis=0))
+                # GF union: re-derive from smoothed probs using same channel selection
+                obj_chs = self.seq_object_channels.get(
+                    x['seq_names'][0],
+                    [self.object_channel] if self.object_channel is not None else [1])
+                if len(obj_chs) == 1:
+                    gf_uni = (pred_smooth[:, obj_chs[0]:obj_chs[0]+1] > th).float()
+                else:
+                    gf_uni = torch.stack(
+                        [(pred_smooth[:, ch:ch+1] > th) for ch in obj_chs], dim=0
+                    ).any(dim=0).float()
+                rows.append(torch.cat([gt_t,  gt_t        ], dim=3))  # Row 6
+                rows.append(torch.cat([uni_t, gf_uni.repeat(1, 3, 1, 1)], dim=3))  # Row 7
+                tosave = torch.cat(rows, dim=2)                  # [B, 3, (C+2)*H, 2W]
+                self.model.save_eval_visualizations(
+                    tosave, x['paths'], x['seq_ids'], x['seq_names'])
 
     def test_epoch_end(self, outputs, name="test_miou", display_all=True):
         if (self.object_channel is None) and (not self.trainer.sanity_checking) and ((self.current_epoch >= getattr(self.args, "set_object_channel_after_epoch", 1) - 1) or self.trainer.testing):

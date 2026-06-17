@@ -64,6 +64,22 @@ def _guided_filter(guide_rgb, src, r=16, eps=1e-2):
     return (mean_f(a) * I + mean_f(b)).clamp(0, 1)
 
 
+_CHANNEL_COLORS = [
+    (0.2, 0.8, 0.2),  # ch0  green
+    (1.0, 0.2, 0.2),  # ch1  red   — instrument
+    (1.0, 0.9, 0.1),  # ch2  yellow — soft tissue
+    (0.2, 0.4, 1.0),  # ch3  blue
+    (0.8, 0.2, 0.8),  # ch4  purple
+]
+
+
+def _color_overlay(img_01, mask, color):
+    """img_01: [3,H,W] float, mask: [H,W] in [0,1], color: (R,G,B) in [0,1]."""
+    m = mask.unsqueeze(0)
+    c = torch.tensor(color, device=img_01.device).view(3, 1, 1)
+    return (img_01 * (1 - m * 0.6) + c * (m * 0.6)).clamp(0, 1)
+
+
 def _apply_progressive_unfreeze(model, stage: dict, epoch: int) -> None:
     """Apply one step of a progressive-unfreeze schedule to `model`.
 
@@ -270,10 +286,15 @@ class Model(pl.LightningModule):
             if 'loss' not in loss_key:
                 continue
             self.accumulate_training_loss[loss_key] = self.accumulate_training_loss.get(loss_key, 0.) + loss_value.item()
-            if (batch_idx + 1) % self.args.loss_log_interval == 0:
-                self.log(f"train_{loss_key}", self.accumulate_training_loss[loss_key] /
-                        self.args.loss_log_interval, sync_dist=True, reduce_fx="mean")
+
+        if (batch_idx + 1) % self.args.loss_log_interval == 0:
+            log_parts = []
+            for loss_key in sorted(self.accumulate_training_loss):
+                avg = self.accumulate_training_loss[loss_key] / self.args.loss_log_interval
+                self.log(f"train_{loss_key}", avg, sync_dist=True, reduce_fx="mean")
+                log_parts.append(f"{loss_key}={avg:.4f}")
                 self.accumulate_training_loss[loss_key] = 0.
+            logger.info("step=%d  %s", batch_idx + 1, "  ".join(log_parts))
 
         if torch.isnan(loss):
             raise Exception("loss is NaN")
@@ -359,6 +380,18 @@ class Model(pl.LightningModule):
         pred_masks_current_batch_resize = utils.eval_utils._resize(
             pred_masks_current_batch, batch['ann'].shape[1:3])
 
+        # Pre-compute GF once for sliding-window viz/export (shared by eval_export and eval_save)
+        _sw_orig_01 = None      # [B, 3, H, W]  denorm image
+        _sw_pred_smooth = None  # [B, C, H, W]  GF-smoothed probs
+        if getattr(self.args, 'use_sliding_window', False) and (
+                self.args.eval_export or self.args.eval_save):
+            _sw_imgs = torch.stack(x['imgs'], dim=1)           # [B, im_num, 3, H, W]
+            _sw_orig_01 = ((_sw_imgs[:, 0] + 2.0) / 4.0).clamp(0, 1)  # [B, 3, H, W]
+            _gf_r   = getattr(self.args, 'sw_vis_gf_r',   16)
+            _gf_eps = getattr(self.args, 'sw_vis_gf_eps', 1e-2)
+            _sw_pred_smooth = _guided_filter(_sw_orig_01, pred_masks_current_batch,
+                                             r=_gf_r, eps=_gf_eps)     # [B, C, H, W]
+
         # Export mask when using sliding window (forward_eval is bypassed so we do it here)
         if getattr(self.args, 'use_sliding_window', False) and self.args.eval_export:
             if getattr(self.args, 'export_all_seg', False):
@@ -369,11 +402,46 @@ class Model(pl.LightningModule):
                 self.model.export_all_seg(pred_vis_list, batch['paths'], batch['seq_ids'],
                                           batch['seq_names'], name='pred_seg', train_iter=0)
             else:
-                ch = self.object_channel if self.object_channel is not None else 1
-                export_tensor = (pred_masks_current_batch_resize[:, ch:ch+1] > self.args.eval_pos_th
-                                 ).float().repeat(1, 3, 1, 1)
-                self.model.export_seg(export_tensor, batch['paths'], batch['seq_ids'],
-                                      batch['seq_names'], name='pred_seg', train_iter=0)
+                # Rich multi-format export: npy / per-channel PNG / GF / colour overlay
+                import torchvision
+                raw    = pred_masks_current_batch[0]   # [C, H, W] full-res
+                orig_01 = _sw_orig_01[0]               # [3, H, W]  shared, no re-compute
+                gf      = _sw_pred_smooth[0]           # [C, H, W]  shared GF
+                seq_name = batch['seq_names'][0]
+                num_ch   = raw.shape[0]
+                out_root = self.args.checkpoints_dir
+
+                th_gf = getattr(self.args, 'sw_vis_gf_th', self.args.eval_pos_th)
+
+                # npy (float16): raw = left column, gf = GF soft prob for offline use
+                npy_dir = os.path.join(out_root, 'npy')
+                os.makedirs(npy_dir, exist_ok=True)
+                np.save(os.path.join(npy_dir, f'{seq_name}.npy'),
+                        raw.cpu().numpy().astype(np.float16))
+                np.save(os.path.join(npy_dir, f'{seq_name}_gf.npy'),
+                        gf.cpu().numpy().astype(np.float16))
+
+                # ch/ = left column (raw soft prob grayscale)
+                # ch_gf/ = right column (GF binary > th_gf, same as saved_eval right column)
+                for c in range(num_ch):
+                    ch_dir    = os.path.join(out_root, 'ch',    str(c))
+                    ch_gf_dir = os.path.join(out_root, 'ch_gf', str(c))
+                    os.makedirs(ch_dir,    exist_ok=True)
+                    os.makedirs(ch_gf_dir, exist_ok=True)
+                    torchvision.utils.save_image(raw[c:c+1].clamp(0, 1),
+                                                 os.path.join(ch_dir,    f'{seq_name}.png'))
+                    torchvision.utils.save_image((gf[c:c+1] > th_gf).float(),
+                                                 os.path.join(ch_gf_dir, f'{seq_name}.png'))
+
+                # overlay: argmax channel colour, only where gf.max > th_gf (background kept)
+                max_gf, argmax_ch = gf.max(dim=0)                         # [H, W] each
+                ovl = orig_01.clone()
+                for c in range(min(num_ch, len(_CHANNEL_COLORS))):
+                    active = ((argmax_ch == c) & (max_gf > th_gf)).float()
+                    ovl = _color_overlay(ovl, active, _CHANNEL_COLORS[c])
+                ovl_dir = os.path.join(out_root, 'overlay')
+                os.makedirs(ovl_dir, exist_ok=True)
+                torchvision.utils.save_image(ovl, os.path.join(ovl_dir, f'{seq_name}.png'))
 
         # -1 means use hard max (turn masks into one hot)
         num_channels = pred_masks_current_batch_resize.shape[1]
@@ -461,15 +529,10 @@ class Model(pl.LightningModule):
                 # Left column : raw soft probability (no post-processing)
                 # Right column: Guided Filter → binary threshold
                 # Last row    : GT mask (left) | union mask (right)
-                imgs = torch.stack(x['imgs'], dim=1)
-                orig = imgs[:, 0]                                # [B, 3, H, W]
                 B, C, H_img, W_img = pred_masks_current_batch.shape
-                orig_d = ((orig + 2.0) / 4.0).clamp(0, 1)      # [0,1], full resolution
-                gf_r   = getattr(self.args, 'sw_vis_gf_r',   16)
-                gf_eps = getattr(self.args, 'sw_vis_gf_eps', 1e-2)
-                pred_smooth = _guided_filter(orig_d, pred_masks_current_batch,
-                                             r=gf_r, eps=gf_eps)
-                th = self.args.eval_pos_th
+                orig_d      = _sw_orig_01       # [B, 3, H, W]  shared, no re-compute
+                pred_smooth = _sw_pred_smooth   # [B, C, H, W]  shared GF
+                th = getattr(self.args, 'sw_vis_gf_th', self.args.eval_pos_th)
                 # Row 0: orig | orig
                 rows = [torch.cat([orig_d, orig_d], dim=3)]
                 # Rows 1…C: raw soft prob (left) | GF binary (right)
@@ -481,7 +544,7 @@ class Model(pl.LightningModule):
                 # Row 7: raw union (left) | GF union (right)
                 def _np_to_row(masks_np):
                     t = torch.from_numpy(masks_np.astype('float32'))[:, None].repeat(1, 3, 1, 1)
-                    return F.interpolate(t, (H_img, W_img), mode='nearest').to(orig.device)
+                    return F.interpolate(t, (H_img, W_img), mode='nearest').to(orig_d.device)
                 gt_t  = _np_to_row(np.stack(_eval_gt_list,    axis=0))
                 uni_t = _np_to_row(np.stack(_eval_union_list,  axis=0))
                 # GF union: re-derive from smoothed probs using same channel selection

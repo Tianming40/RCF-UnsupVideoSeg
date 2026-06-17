@@ -1,34 +1,35 @@
-# rcf_cmc_grasp0_tissue_ft.yaml
+# rcf_cmc_grasp0_tissue_ft_v15.yaml
 #
-# Fine-tune the grasp10 model on grasp0 for soft-tissue segmentation.
+# v15 vs v14: fix ch1 collapse + fix flow clustering.
 #
-# Model: RCFSoftTissueModel (inherits RCFDinoModel)
+#   Problem 1 — ch1 collapse: flow_cluster_tv_loss from epoch 0 competes with
+#   symmetric distill (w=5.0) via softmax cross-channel gradients, causing
+#   ch1 (instrument) to collapse to ~0 (val_miou 0.71/1.04 vs 64.60 in v13).
+#   Fix: flow_tv_start_epoch=5 mirrors distill_warmup_epochs; TV loss only
+#   activates from epoch 5 onward, after ch1 has recovered.
 #
-# Loss set (enable by setting weight > 0):
-#   L_dino         : DINO visual coherence                   (w_dino=0.05)
-#   L_rigid        : instrument channels rigid-body motion   (w_rigid)
-#   L_grasp_conv   : grasping-ch aligns with flow divergence (w_grasp_conv)
-#   L_deform       : tissue residual > bg residual           (w_deform)
-#   L_align        : tissue flow aligns with grasping-ch mean(w_align)
-#   L_motion       : tissue motion > bg motion               (w_motion)
-#   L_grasp_flow   : annotation-driven flow alignment ch2    (w_grasp_flow=0.1)
-#   L_dissect_prox : activation near dissection point ch2   (w_dissect=0.05)
-#   L_distill      : BCE distillation to protect ch1         (w_distill=0.1)
+#   Problem 2 — noisy clustering: previous code did per-pixel unit-normalise
+#   (flow / |flow|) before K-means, discarding magnitude. Near-zero background
+#   pixels get random unit directions → noisy clusters that don't match the
+#   RAFT color patches in the visualisation.
+#   Fix: global-max normalise (flow / max|flow|), mirrors flow_to_color().
+#   K-means now uses L2 Euclidean distance: background stays near (0,0) and
+#   forms its own cluster; tissue and instrument separate by direction+magnitude.
 #
-# Channel convention:
-#   ch1 = existing instrument detector (pretrained grasp10, protected by L_distill)
-#   ch2 = new soft-tissue channel to train
+#   All other settings identical to v14.
+#
+# Start: grasp10_ft_v9 checkpoint (same as v8–v14)
 
 batch_size: 8
 val_batch_size: 1
-epochs: 30
+epochs: 50
 learning_rate: 1.e-5
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft
+checkpoints_dir: saved/grasp0_tissue_ft_v15
 pretrained_model: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
 model_cls: RCFSoftTissueModel
 
@@ -59,12 +60,9 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-# Val uses grasp10 (has instrument annotation) to monitor that ch1 does not degrade.
-# object_channel: 1 = instrument channel (grasp10 annotation target).
 object_channel: 1
 set_object_channel_after_epoch: 0
 
-# Train on grasp0 (annotation-driven losses), val on grasp10 (mIoU annotation)
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
 dataset_kwargs: {}
@@ -111,44 +109,67 @@ model_kwargs:
   freeze_backbone_stages: 0
   freeze_flow_head: false
 
-  # ── DINO (keep from base model) ────────────────────────────────────────────
-  w_dino: 0.05
+  # ── DINO (disabled) ───────────────────────────────────────────────────────
+  w_dino: 0.0
   dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
   dino_arch: vit_small
   dino_patch_size: 8
   dino_input_size: 128
 
   # ── Channel assignments ────────────────────────────────────────────────────
-  instrument_channels: [1]   # ch1 = existing instrument (for L_rigid)
-  instrument_channel: 1      # excluded region in L_grasp_flow
-  tissue_channel: 2          # new soft-tissue channel
-  grasping_channel: 1        # for L_align, L_grasp_conv
+  instrument_channels: [1]
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
   bg_channels: [0, 3, 4]
-  distill_channel: 1         # protect ch1 via L_distill
+  distill_channel: 1
 
-  # ── V2 unsupervised losses (disabled: all assume tissue_channel=2) ──────────
+  # ── V2 unsupervised losses ─────────────────────────────────────────────────
   w_rigid:      0.0
   w_grasp_conv: 0.0
-  w_deform:     0.05
+  w_deform:     0.5
   w_align:      0.0
   w_motion:     0.0
   motion_margin: 1.0
   deform_margin: 0.5
   min_grasp_frac: 0.005
 
-  # ── V3 annotation-driven losses (disabled: unreliable annotations) ─────────
+  # ── V3 annotation-driven losses (disabled) ─────────────────────────────────
   w_grasp_flow: 0.0
   w_dissect:    0.0
   grasp_flow_min_mag: 0.5
   dissect_sigma: 0.12
 
-  # ── V4 unsupervised spatial / divergence losses (channel-agnostic) ──────────
+  # ── V4 divergence loss (disabled) ─────────────────────────────────────────
   w_contact: 0.0
   contact_dilation_r: 10
-  w_div_tissue: 0.05
+  w_div_tissue: 0.0
 
-  # ── KL distillation ────────────────────────────────────────────────────────
-  w_distill:   0.1
+  # ── V5 flow-variance tissue loss (disabled) ───────────────────────────────
+  w_rigid_tissue: 0.0
+
+  # ── V8/V9 flow-cosine assignment loss ─────────────────────────────────────
+  w_flow_cosine: 0.5
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.2
+
+  # ── V15 flow-cluster TV loss (delayed start) ──────────────────────────────
+  w_flow_tv: 0.5              # 0.1 was ~0.01% of total loss (noise); 0.5 ≈ half distill_cool
+  flow_tv_K: 5               # cluster all pixels into 5 motion groups
+  flow_tv_n_iter: 10          # k-means iterations
+  flow_tv_start_epoch: 5      # don't start until ch1 has recovered (mirrors distill_warmup_epochs)
+  flow_tv_push_margin: 0.3    # hinge margin: cross-cluster pairs encouraged to have diff > 0.3
+
+  # ── V11 full decode_head2 reset ───────────────────────────────────────────
+  reset_non_instrument_heads: false
+  reset_full_decode_head: true
+
+  # ── KL distillation with annealing (v13) ──────────────────────────────────
+  w_distill:    5.0              # epoch 0: symmetric MSE, ch1 recovery
+  distill_mode: symmetric        # epoch 0 mode
+  distill_warmup_epochs: 5       # switch at start of epoch 5 (after channel reorganisation)
+  distill_cool_mode: one_sided   # epoch 1+: relu lower-bound only
+  w_distill_cool: 0.5            # epoch 1+: weak protection, ch1 can adapt
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
 
   backbone2:

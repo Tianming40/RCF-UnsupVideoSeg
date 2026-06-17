@@ -1,6 +1,12 @@
 """
 tissue_role_loss.py — auxiliary losses for channel role specialisation.
 
+Added in V4 (disabled by default, w=0):
+  L_contact     : tissue channel activates in the zone adjacent to instrument mask
+                  (utilises known instrument channel via spatial dilation)
+  L_div_tissue  : tissue channel activates where |div(RAFT_flow)| is large
+                  (RAFT divergence = direct deformation signal, no network prediction)
+
 Added in V3:
   L_grasp_flow  : tissue channel aligns with flow at annotated grasp point
                   (excluding instrument region to avoid reinforcing ch1)
@@ -109,40 +115,45 @@ def grasping_convergence_loss(
 def deformation_loss(
         masks: torch.Tensor,
         residual_fw: torch.Tensor,
-        tissue_channel: int,
-        bg_channels: tuple,
+        instrument_channels: list,
         n_classes: int,
         pred_div_coeff: float = 10.,
         residual_scale: float = 10.,
+        # legacy kwargs kept for backward compat (ignored in agnostic mode)
+        tissue_channel: int = 2,
+        bg_channels: tuple = (0, 3, 4),
         margin: float = 0.5,
 ) -> torch.Tensor:
     """
-    Tissue is non-rigid — its intra-segment residual flow R̂ should exceed
-    the background residual by at least `margin`.
+    Channel-agnostic residual-magnitude loss.
 
-    residual_fw : [B, 2*n_classes, H, W]  raw decode_head3 output (fw direction)
-    masks       : [B, C, H, W]
+    Rigid objects (instrument) have small R because P̂ already fits their
+    motion well.  Deformable tissue needs large R to absorb the intra-segment
+    shape change.
 
-    Returns scalar (to minimise).
+    Encourages every non-instrument channel to have a high mask-weighted
+    mean ||R_c||.  Softmax competition then naturally lets the most
+    deformation-consistent channel "win" the tissue region.
+
+    residual_fw        : [B, 2*n_classes, H, W]  raw decode_head3 output
+    masks              : [B, C, H, W]
+    instrument_channels: list of instrument channel indices (excluded)
     """
-    # Per-channel residual magnitude after tanh scaling
-    # residual_fw → [B, 2, C, H, W] → ||·|| → [B, C, H, W]
+    # Per-channel residual magnitude after tanh + scale
+    # residual_fw → [B, 2, C, H, W] → ||·||₂ over dim=1 → [B, C, H, W]
     res = torch.tanh(residual_fw.unflatten(1, (2, n_classes)) / pred_div_coeff) \
           * residual_scale                                       # [B, 2, C, H, W]
     res_mag = res.norm(dim=1)                                    # [B, C, H, W]
 
-    # Weighted mean residual in tissue
-    mt = masks[:, tissue_channel]
-    wt = mt.sum(dim=(1, 2)) + 1e-6
-    res_tissue = (res_mag[:, tissue_channel] * mt).sum(dim=(1, 2)) / wt  # [B]
+    non_inst = [c for c in range(n_classes) if c not in instrument_channels]
+    scores = []
+    for c in non_inst:
+        m_c = masks[:, c]
+        w = m_c.sum(dim=(1, 2)) + 1e-6
+        scores.append((res_mag[:, c] * m_c).sum(dim=(1, 2)) / w)  # [B]
 
-    # Weighted mean residual in background (average over bg channels)
-    mb = sum(masks[:, c] for c in bg_channels) / max(len(bg_channels), 1)
-    wb = mb.sum(dim=(1, 2)) + 1e-6
-    # Use first bg channel's residual map
-    res_bg = (res_mag[:, bg_channels[0]] * mb).sum(dim=(1, 2)) / wb      # [B]
-
-    return F.relu(res_bg + margin - res_tissue).mean()
+    # Maximise average mask-weighted ||R|| over non-instrument channels
+    return -torch.stack(scores, dim=1).mean(dim=1).mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,3 +322,262 @@ def dissect_proximity_loss(
     if not losses:
         return masks.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Contact-zone activation  (V4, instrument-guided)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def contact_zone_loss(
+        masks: torch.Tensor,
+        instrument_channel: int,
+        tissue_channels,
+        dilation_r: int = 10,
+) -> torch.Tensor:
+    """
+    Candidate tissue channels should activate in the ring-shaped zone adjacent
+    to the instrument mask.  Channel-agnostic: averages over all tissue_channels
+    so the network decides which channel(s) cover the contact zone.
+
+    masks              : [B, C, H, W]
+    instrument_channel : known instrument channel (detached — no gradient)
+    tissue_channels    : int or list[int] — candidate non-instrument channels
+    dilation_r         : dilation radius in pixels (mask-resolution pixels)
+
+    Returns scalar (to minimise).
+    """
+    if isinstance(tissue_channels, int):
+        tissue_channels = [tissue_channels]
+
+    m_inst = masks[:, instrument_channel].detach().unsqueeze(1)  # [B, 1, H, W]
+
+    k = 2 * dilation_r + 1
+    m_dilated = F.max_pool2d(m_inst, kernel_size=k, stride=1, padding=dilation_r)
+
+    contact_zone = (m_dilated - m_inst).clamp(min=0).squeeze(1)  # [B, H, W]
+    B = contact_zone.shape[0]
+    contact_zone = contact_zone / (
+        contact_zone.view(B, -1).max(dim=1).values.view(B, 1, 1) + 1e-6
+    )
+
+    scores = []
+    for c in tissue_channels:
+        m_c = masks[:, c]
+        w = m_c.sum(dim=(1, 2)) + 1e-6
+        scores.append((m_c * contact_zone).sum(dim=(1, 2)) / w)  # [B]
+
+    # Average over candidate channels: softmax competition decides the winner
+    return -torch.stack(scores, dim=1).mean(dim=1).mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Flow-divergence tissue activation  (V4, RAFT-based deformation signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9a. Flow-cosine assignment loss  (V8, direct RAFT-guided channel clustering)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def flow_cosine_assignment_loss(
+        masks: torch.Tensor,
+        flow: torch.Tensor,
+        instrument_channels: list,
+        temperature: float = 0.5,
+        instrument_mask: torch.Tensor = None,
+        diversity_weight: float = 0.0,
+) -> torch.Tensor:
+    """
+    Non-instrument channels should group pixels with similar RAFT flow directions.
+    Instrument pixels are excluded so their dominant motion doesn't bias the signal.
+
+    For each non-instrument channel, compute the mask-weighted mean RAFT flow
+    direction (detached, used as a fixed pseudo-label).  Then push the channel
+    mask to assign high weight to pixels most cosine-similar to that mean.
+
+    masks               : [B, C, H, W]
+    flow                : [B, 2, H, W]  RAFT pre-computed flow at mask resolution
+    instrument_channels : list[int]  — excluded from both channel pool and pixels
+    temperature         : softmax temperature for soft-label sharpness (lower = harder)
+    instrument_mask     : [B, H, W] optional — teacher's instrument prob used instead
+                          of student masks; breaks feedback loop if student ch1 drifts
+    diversity_weight    : weight for push-apart loss on channel mean flow directions;
+                          uses non-detached mu so gradient flows back through masks
+    """
+    B, C, H, W = masks.shape
+    non_inst = [c for c in range(C) if c not in instrument_channels]
+
+    # suppress instrument pixels — prefer teacher mask to avoid feedback loop
+    if instrument_mask is not None:
+        inst_mask = instrument_mask.detach().clamp(0, 1)
+    else:
+        inst_mask = sum(masks[:, c] for c in instrument_channels).clamp(0, 1).detach()
+    non_inst_weight = 1.0 - inst_mask                          # [B, H, W]
+
+    # normalised flow direction + magnitude
+    flow_mag = flow.norm(dim=1)                                # [B, H, W]
+    flow_dir = flow / (flow_mag.unsqueeze(1) + 1e-6)          # [B, 2, H, W]
+
+    # pixel weight: non-instrument AND moving (static pixels carry no info)
+    pixel_w = non_inst_weight * flow_mag                       # [B, H, W]
+
+    # ── mean flow direction per non-instrument channel (detached pseudo-label) ──
+    mu_list = []
+    for c in non_inst:
+        m = (masks[:, c] * pixel_w).detach()                  # [B, H, W]
+        w = m.sum(dim=(1, 2)) + 1e-6                          # [B]
+        mu_x = (flow_dir[:, 0] * m).sum(dim=(1, 2)) / w      # [B]
+        mu_y = (flow_dir[:, 1] * m).sum(dim=(1, 2)) / w      # [B]
+        mu = torch.stack([mu_x, mu_y], dim=1)                 # [B, 2]
+        mu = mu / (mu.norm(dim=1, keepdim=True) + 1e-6)       # unit vector
+        mu_list.append(mu)
+
+    # ── cosine similarity: each pixel vs each channel's mean flow ──────────────
+    cos_sims = []
+    for mu in mu_list:
+        cos = (flow_dir[:, 0] * mu[:, 0, None, None] +
+               flow_dir[:, 1] * mu[:, 1, None, None])         # [B, H, W]
+        cos_sims.append(cos)
+    cos_sims = torch.stack(cos_sims, dim=1)                   # [B, K, H, W]
+
+    # soft assignment from cosine similarity (fixed target — detached)
+    target = F.softmax(cos_sims / temperature, dim=1).detach()  # [B, K, H, W]
+
+    # student: non-instrument masks renormalised to sum=1 among themselves
+    student = torch.stack([masks[:, c] for c in non_inst], dim=1)  # [B, K, H, W]
+    student = student / (student.sum(dim=1, keepdim=True) + 1e-6)
+
+    # cross-entropy, weighted by moving non-instrument pixels
+    loss = -(target * torch.log(student + 1e-6)).sum(dim=1)   # [B, H, W]
+    w_sum = pixel_w.view(B, -1).sum(dim=1).view(B, 1, 1) + 1e-6
+    assignment_loss = (loss * pixel_w / w_sum).sum(dim=(1, 2)).mean()
+
+    if diversity_weight <= 0 or len(non_inst) < 2:
+        return assignment_loss
+
+    # ── channel diversity: push mean flow directions apart ───────────────────
+    # recompute mu WITHOUT detach so gradient flows back through masks
+    mu_grad = []
+    for c in non_inst:
+        m = masks[:, c] * pixel_w                             # [B, H, W], no detach
+        w = m.sum(dim=(1, 2)) + 1e-6                          # [B]
+        mu_x = (flow_dir[:, 0] * m).sum(dim=(1, 2)) / w      # [B]
+        mu_y = (flow_dir[:, 1] * m).sum(dim=(1, 2)) / w      # [B]
+        mu = torch.stack([mu_x, mu_y], dim=1)                 # [B, 2]
+        mu = mu / (mu.norm(dim=1, keepdim=True) + 1e-6)
+        mu_grad.append(mu)
+
+    div_loss = torch.tensor(0.0, device=masks.device)
+    n_pairs = 0
+    for i in range(len(mu_grad)):
+        for j in range(i + 1, len(mu_grad)):
+            # cosine similarity between channel i and j mean flow (unit vectors)
+            cos_ij = (mu_grad[i] * mu_grad[j]).sum(dim=1).mean()  # scalar
+            div_loss = div_loss + cos_ij
+            n_pairs += 1
+    div_loss = div_loss / n_pairs   # mean pairwise cosine sim; minimize → push apart
+
+    return assignment_loss + diversity_weight * div_loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9b. Flow-variance tissue activation  (V5, area signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tissue_flow_variance_loss(
+        masks: torch.Tensor,
+        flow: torch.Tensor,
+        tissue_channels,
+) -> torch.Tensor:
+    """
+    Non-instrument channels should have HIGH internal flow variance (non-rigid).
+
+    This is a true AREA signal: measures the heterogeneity of motion WITHIN each
+    mask region, NOT spatial gradients → signal is not concentrated at boundaries.
+
+    Rigid objects (instrument) have spatially uniform flow inside their mask
+    → low mask-weighted variance.  Deformable tissue has spatially varying
+    flow inside its mask → high variance.
+
+    masks          : [B, C, H, W]
+    flow           : [B, 2, H, W]  RAFT pre-computed flow at mask resolution
+    tissue_channels: int or list[int]  non-instrument channel indices
+
+    Returns scalar (to minimise, i.e. maximises variance).
+    """
+    if isinstance(tissue_channels, int):
+        tissue_channels = [tissue_channels]
+
+    scores = []
+    for c in tissue_channels:
+        m = masks[:, c]                                          # [B, H, W]
+        w = m.sum(dim=(1, 2)) + 1e-6                             # [B]
+
+        mu_x = (flow[:, 0] * m).sum(dim=(1, 2)) / w             # [B]
+        mu_y = (flow[:, 1] * m).sum(dim=(1, 2)) / w             # [B]
+
+        var_x = ((flow[:, 0] - mu_x[:, None, None]).pow(2) * m).sum(dim=(1, 2)) / w
+        var_y = ((flow[:, 1] - mu_y[:, None, None]).pow(2) * m).sum(dim=(1, 2)) / w
+
+        scores.append((var_x + var_y).mean())
+
+    return -torch.stack(scores).mean()   # negative → minimise = maximise variance
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9c. Flow-divergence tissue activation  (V4, RAFT-based deformation signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tissue_divergence_loss(
+        masks: torch.Tensor,
+        flow: torch.Tensor,
+        tissue_channels,
+        instrument_channels=None,
+) -> torch.Tensor:
+    """
+    Tissue channels should capture regions with high |div(RAFT_flow)|.
+
+    Key design: normalise by total div energy (not by mask area).
+    Score = "what fraction of the total div signal does this channel capture?"
+    Gradient ∝ div²_pixel / total_div → strong, proportional to deformation.
+
+    Also adds contrastive pressure: instrument channels should cover LOW-div
+    regions, tissue channels should cover HIGH-div regions.
+
+    masks               : [B, C, H, W]
+    flow                : [B, 2, H, W]  pre-computed RAFT flow at mask resolution
+    tissue_channels     : list[int] — non-instrument candidate channels
+    instrument_channels : list[int] or None — if given, add contrastive term
+    """
+    if isinstance(tissue_channels, int):
+        tissue_channels = [tissue_channels]
+
+    fx_p = F.pad(flow[:, 0:1], (1, 1, 1, 1), mode='replicate').squeeze(1)
+    fy_p = F.pad(flow[:, 1:2], (1, 1, 1, 1), mode='replicate').squeeze(1)
+    dfx_dx = (fx_p[:, 1:-1, 2:] - fx_p[:, 1:-1, :-2]) / 2.0
+    dfy_dy = (fy_p[:, 2:, 1:-1] - fy_p[:, :-2, 1:-1]) / 2.0
+    abs_div = (dfx_dx + dfy_dy).abs()                              # [B, H, W]
+
+    B = abs_div.shape[0]
+
+    # Square to amplify peaks and suppress low-div noise; normalise so spatial
+    # sum = 1 per image → score is "fraction of total div energy captured".
+    div_sq = abs_div ** 2
+    total_div = div_sq.view(B, -1).sum(dim=1).view(B, 1, 1) + 1e-6
+    div_weight = div_sq / total_div                                 # [B, H, W]
+
+    tissue_scores = []
+    for c in tissue_channels:
+        tissue_scores.append((masks[:, c] * div_weight).sum(dim=(1, 2)))  # [B]
+    tissue_score = torch.stack(tissue_scores, dim=1).mean(dim=1).mean()
+
+    if instrument_channels is not None:
+        if isinstance(instrument_channels, int):
+            instrument_channels = [instrument_channels]
+        instr_scores = []
+        for c in instrument_channels:
+            instr_scores.append((masks[:, c] * div_weight).sum(dim=(1, 2)))
+        instr_score = torch.stack(instr_scores, dim=1).mean(dim=1).mean()
+        # minimise: push tissue toward div, instrument away from div
+        return instr_score - tissue_score
+
+    return -tissue_score

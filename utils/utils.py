@@ -39,8 +39,26 @@ def merge_cli_opt(config, key, value):
     for hierarchy in key_hierarchy[:-1]:
         item_container = item_container[hierarchy]
     
+    if key_hierarchy[-1] not in item_container:
+        # New key not in config: infer type from value string and insert it
+        if value in ("True", "true", "1"):
+            value = True
+        elif value in ("False", "false", "0"):
+            value = False
+        else:
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass  # keep as string
+        logger.info(f"Adding new key {key} = {value}")
+        item_container[key_hierarchy[-1]] = value
+        return
+
     original_value = item_container[key_hierarchy[-1]]
-    
+
     if isinstance(original_value, bool):
         # bool is a type of int so should be processed first
         if value == "True" or value == "true" or value == "1":

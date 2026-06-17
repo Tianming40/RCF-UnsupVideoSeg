@@ -52,6 +52,26 @@ class TissueModel(_BaseModel):
     def __init__(self, args, trainer):
         super().__init__(args, trainer)
 
+    def on_train_start(self) -> None:
+        super().on_train_start()
+        if getattr(self.model, 'reset_full_decode_head', False):
+            self.model._reset_full_decode_head2()
+        elif getattr(self.model, 'reset_non_instrument_heads', False):
+            self.model._reset_non_instrument_mask_heads()
+
+    def on_train_epoch_start(self) -> None:
+        super().on_train_epoch_start()
+        warmup = getattr(self.model, 'distill_warmup_epochs', 0)
+        if warmup > 0 and self.current_epoch >= warmup:
+            if hasattr(self.model, 'set_distill_cool'):
+                self.model.set_distill_cool()
+        tv_start = getattr(self.model, 'flow_tv_start_epoch', 0)
+        if tv_start > 0 and self.current_epoch >= tv_start:
+            self.model._flow_tv_active = True
+        ce_start = getattr(self.model, 'flow_cluster_ce_start_epoch', 0)
+        if ce_start > 0 and self.current_epoch >= ce_start:
+            self.model._flow_cluster_ce_active = True
+
     def training_step(self, batch, batch_idx):
         loss = super().training_step(batch, batch_idx)
         # on_epoch=True → PL aggregates mean across all steps in the epoch;

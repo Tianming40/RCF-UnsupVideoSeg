@@ -1,34 +1,38 @@
-# rcf_cmc_grasp0_tissue_ft.yaml
+# rcf_cmc_grasp0_tissue_ft_v11.yaml
 #
-# Fine-tune the grasp10 model on grasp0 for soft-tissue segmentation.
+# v11 vs v10: replaces reset_non_instrument_heads with reset_full_decode_head.
 #
-# Model: RCFSoftTissueModel (inherits RCFDinoModel)
+#   reset_full_decode_head: true
+#     — at on_train_start, ALL parameters of decode_head2 are re-initialised
+#       (convs.0, convs.1, conv_seg) via each module's reset_parameters().
 #
-# Loss set (enable by setting weight > 0):
-#   L_dino         : DINO visual coherence                   (w_dino=0.05)
-#   L_rigid        : instrument channels rigid-body motion   (w_rigid)
-#   L_grasp_conv   : grasping-ch aligns with flow divergence (w_grasp_conv)
-#   L_deform       : tissue residual > bg residual           (w_deform)
-#   L_align        : tissue flow aligns with grasping-ch mean(w_align)
-#   L_motion       : tissue motion > bg motion               (w_motion)
-#   L_grasp_flow   : annotation-driven flow alignment ch2    (w_grasp_flow=0.1)
-#   L_dissect_prox : activation near dissection point ch2   (w_dissect=0.05)
-#   L_distill      : BCE distillation to protect ch1         (w_distill=0.1)
+#   Why: v10 only reset conv_seg (the final 1x1 conv).  The two intermediate
+#   ConvModule layers (convs.0: 2304→256, convs.1: 256→256) carry the grasp10
+#   tissue-partition prior in their feature-extraction weights.  After a few
+#   gradient steps, these layers quickly teach the randomly-initialised conv_seg
+#   to reproduce the original grasp10 partition — making the reset ineffective.
+#   Resetting the entire decode_head2 removes this shortcut.
 #
-# Channel convention:
-#   ch1 = existing instrument detector (pretrained grasp10, protected by L_distill)
-#   ch2 = new soft-tissue channel to train
+#   Trade-off: ch1 (instrument) also loses its decode_head2 weights.  However
+#   L_distill (w=1.0, one-sided relu) provides a strong pixel-level target from
+#   the frozen teacher at every step and recovers ch1 within the first epoch.
+#
+# All other weights identical to v10/v9:
+#   w_dino: 0.0  w_deform: 0.5  w_flow_cosine: 0.5  w_distill: 1.0
+#   w_entropy: 0.05  flow_cosine_diversity: 0.1
+#
+# Start: grasp10_ft_v9 checkpoint (same as v8/v9/v10)
 
 batch_size: 8
 val_batch_size: 1
-epochs: 30
+epochs: 50
 learning_rate: 1.e-5
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft
+checkpoints_dir: saved/grasp0_tissue_ft_v11
 pretrained_model: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
 model_cls: RCFSoftTissueModel
 
@@ -59,12 +63,9 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-# Val uses grasp10 (has instrument annotation) to monitor that ch1 does not degrade.
-# object_channel: 1 = instrument channel (grasp10 annotation target).
 object_channel: 1
 set_object_channel_after_epoch: 0
 
-# Train on grasp0 (annotation-driven losses), val on grasp10 (mIoU annotation)
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
 dataset_kwargs: {}
@@ -111,44 +112,56 @@ model_kwargs:
   freeze_backbone_stages: 0
   freeze_flow_head: false
 
-  # ── DINO (keep from base model) ────────────────────────────────────────────
-  w_dino: 0.05
+  # ── DINO (disabled) ───────────────────────────────────────────────────────
+  w_dino: 0.0
   dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
   dino_arch: vit_small
   dino_patch_size: 8
   dino_input_size: 128
 
   # ── Channel assignments ────────────────────────────────────────────────────
-  instrument_channels: [1]   # ch1 = existing instrument (for L_rigid)
-  instrument_channel: 1      # excluded region in L_grasp_flow
-  tissue_channel: 2          # new soft-tissue channel
-  grasping_channel: 1        # for L_align, L_grasp_conv
+  instrument_channels: [1]
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
   bg_channels: [0, 3, 4]
-  distill_channel: 1         # protect ch1 via L_distill
+  distill_channel: 1
 
-  # ── V2 unsupervised losses (disabled: all assume tissue_channel=2) ──────────
+  # ── V2 unsupervised losses ─────────────────────────────────────────────────
   w_rigid:      0.0
   w_grasp_conv: 0.0
-  w_deform:     0.05
+  w_deform:     0.5
   w_align:      0.0
   w_motion:     0.0
   motion_margin: 1.0
   deform_margin: 0.5
   min_grasp_frac: 0.005
 
-  # ── V3 annotation-driven losses (disabled: unreliable annotations) ─────────
+  # ── V3 annotation-driven losses (disabled) ─────────────────────────────────
   w_grasp_flow: 0.0
   w_dissect:    0.0
   grasp_flow_min_mag: 0.5
   dissect_sigma: 0.12
 
-  # ── V4 unsupervised spatial / divergence losses (channel-agnostic) ──────────
+  # ── V4 divergence loss (disabled) ─────────────────────────────────────────
   w_contact: 0.0
   contact_dilation_r: 10
-  w_div_tissue: 0.05
+  w_div_tissue: 0.0
+
+  # ── V5 flow-variance tissue loss (disabled) ───────────────────────────────
+  w_rigid_tissue: 0.0
+
+  # ── V8/V9 flow-cosine assignment loss ─────────────────────────────────────
+  w_flow_cosine: 0.5
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.1
+
+  # ── V11 full decode_head2 reset ───────────────────────────────────────────
+  reset_non_instrument_heads: false  # v10 partial reset — disabled in v11
+  reset_full_decode_head: true       # reset ALL of decode_head2 at on_train_start
 
   # ── KL distillation ────────────────────────────────────────────────────────
-  w_distill:   0.1
+  w_distill:   1.0
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
 
   backbone2:

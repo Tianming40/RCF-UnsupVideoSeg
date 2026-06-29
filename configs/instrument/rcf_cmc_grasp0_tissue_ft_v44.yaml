@@ -1,19 +1,19 @@
 # rcf_cmc_grasp0_tissue_ft_v44.yaml
 #
-# v44 = v43 + 两项调整：
+# v44 = v43 + two adjustments:
 #
-# 1. DINO loss 只作用在 ch1（instrument）上（dino_channels: [1]，w_dino: 0.5）
-#    - instrument 外观独特（金属），DINO 特征空间极易聚类
-#    - 用外观相似性作为额外的 ch1 锚点，补充 distill 的运动方向保护
-#    - 不对 ch2-ch4 施加（避免 quadrant bias，bilateral_ce 已做外观引导）
+# 1. DINO loss applied to ch1 (instrument) only (dino_channels: [1], w_dino: 0.5)
+#    - instrument has distinctive appearance (metal); easily clustered in DINO feature space
+#    - appearance similarity used as an extra ch1 anchor, supplementing distill's motion-direction protection
+#    - not applied to ch2-ch4 (avoids quadrant bias; bilateral_ce already provides appearance guidance)
 #
-# 2. distill_mode symmetric → one_sided，w_distill 2.0 → 5.0
-#    - one_sided = relu(teacher-student)：只防 ch1 dropout，不限 ch1 扩展
-#    - 允许学生在 teacher 覆盖区域之外再学到新的 instrument 像素（超越 teacher）
-#    - w 提高到 5.0 补偿 one_sided 梯度量级小（≈ symmetric 的 1/10）
-#    - DINO ch1（外观） + one_sided distill（运动）双重锚点
+# 2. distill_mode symmetric → one_sided, w_distill 2.0 → 5.0
+#    - one_sided = relu(teacher-student): prevents ch1 dropout only; does not restrict ch1 expansion
+#    - allows student to learn new instrument pixels beyond teacher coverage (exceed teacher)
+#    - w raised to 5.0 to compensate for smaller one_sided gradient magnitude (≈ 1/10 of symmetric)
+#    - DINO ch1 (appearance) + one_sided distill (motion) as dual anchors
 #
-# 从 v9 checkpoint 出发。
+# Starting from v9 checkpoint.
 
 batch_size: 8
 val_batch_size: 1
@@ -56,12 +56,13 @@ loss_log_interval: 10
 log_interval: 100
 
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch1 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [1]
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
@@ -82,7 +83,7 @@ test_dataset_kwargs:
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取；tissue val 自动排除 instrument ch1）──
+# ── Per-epoch dual val (read by main_tissue.py; tissue val auto-excludes instrument ch1) ──
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -152,7 +153,7 @@ model_kwargs:
 
   w_rigid_tissue: 0.0
 
-  # ── 借鉴 v18：flow_cosine 做 channel 分化 + 边界粗对齐 ─────────────────────
+  # ── From v18: flow_cosine for channel differentiation + coarse boundary alignment ─────────────────────
   w_flow_cosine: 0.5
   flow_cosine_temperature: 0.5
   flow_cosine_diversity: 0.5
@@ -178,7 +179,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（边界精修，微调更锐更远）─────────
+  # ── Core: flow-guided bilateral self-training CE (boundary refinement, sharper and farther) ─────────
   w_flow_bilateral_ce: 2.0
   flow_bilateral_window: 15
   flow_bilateral_sigma: 0.3
@@ -186,7 +187,7 @@ model_kwargs:
   reset_non_instrument_heads: false
   reset_full_decode_head: false
 
-  # ── v44：one_sided distill（只防 dropout，允许超越 teacher）+ DINO ch1 锚点 ──
+  # ── v44: one_sided distill (prevent dropout only, allow exceeding teacher) + DINO ch1 anchor ──
   w_distill:    5.0
   distill_mode: one_sided
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt

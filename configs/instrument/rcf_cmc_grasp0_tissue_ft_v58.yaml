@@ -1,10 +1,10 @@
 # rcf_cmc_grasp0_tissue_ft_v58.yaml
 #
-# v58 = v55（边缘增强）+ clamp_flow_t 10→20 + topk 4→6
+# v58 = v55 (edge enhancement) + clamp_flow_t 10→20 + topk 4→6
 #
-# 改动（相对 v55）：
-#   decode_head.clamp_flow_t: 20   （高运动序列截断比从 50%→~15%，器械信号更完整）
-#   decode_head.topk:         6    （从 8 条序列选 6 条，减少对高运动序列的排除）
+# Changes (vs v55):
+#   decode_head.clamp_flow_t: 20   (high-motion sequence clamp ratio drops from ~50% to ~15%; instrument signal more complete)
+#   decode_head.topk:         6    (select 6 from 8 sequences; reduces exclusion of high-motion sequences)
 
 batch_size: 8
 val_batch_size: 1
@@ -217,7 +217,7 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_edge_feat: true         # ← v55 新增：Sobel 边缘增强
+    use_edge_feat: true         # ← v55 new: Sobel edge enhancement
 
   decode_head3:
     concat_input: false

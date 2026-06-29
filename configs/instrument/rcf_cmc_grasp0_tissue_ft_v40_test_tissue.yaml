@@ -1,14 +1,14 @@
 # rcf_cmc_grasp0_tissue_ft_v40_test_tissue.yaml
 #
 # TEST-ONLY config for tissue (ch2) IoU on the new grasp0 annotations.
-# 复用 v40 训练配置，只改 test 相关项：
-#   test_data_path -> eval_tissue (Annotations/<id>/<id>.jpg, 白=tissue)
-#   test split     -> ImageSets/val.txt (209 帧)
-#   object_channel -> 2  (tissue, 非 oracle，直接用 ch2 算 IoU)
-#   val_batch_size -> 1  (batch=1，方便看每帧生成图)
-#   eval_save      -> true (保存含 GT 行的可视化图)
+# Reuses v40 training config, only test-related items changed:
+#   test_data_path -> eval_tissue (Annotations/<id>/<id>.jpg, white=tissue)
+#   test split     -> ImageSets/val.txt (209 frames)
+#   object_channel -> 2  (tissue, not oracle; compute IoU directly using ch2)
+#   val_batch_size -> 1  (batch=1 for easier per-frame visualization)
+#   eval_save      -> true (save visualizations with GT row)
 #
-# 运行：
+# Run:
 #   python main_tissue.py \
 #     configs/instrument/rcf_cmc_grasp0_tissue_ft_v40_test_tissue.yaml \
 #     --test \
@@ -47,12 +47,13 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch1 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [1]
 
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced

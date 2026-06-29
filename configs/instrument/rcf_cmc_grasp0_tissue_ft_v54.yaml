@@ -1,12 +1,12 @@
 # rcf_cmc_grasp0_tissue_ft_v54.yaml
 #
-# v54 = v53 基础上两处改动：
-#   1. resize_short: 400 → 576（720×576 图不再缩小，crop 余量从 16px 增大到 192px）
-#   2. w_dino: 0.1 → 0.08（与 kfold 对齐，避免 warp_seg loss 小后 DINO 比例过高）
+# v54 = v53 with two changes:
+#   1. resize_short: 400 → 576 (720×576 images no longer scaled down; crop margin grows from 16px to 192px)
+#   2. w_dino: 0.1 → 0.08 (aligned with kfold; avoids DINO proportion becoming too high when warp_seg loss is small)
 #
-# 其余与 v53 完全相同：grasp0(379)+grasp10(601)，MultiScaleSegHead，mask_size=96×96
+# Everything else identical to v53: grasp0(379)+grasp10(601), MultiScaleSegHead, mask_size=96×96
 #
-# 动机：grasp10 器械运动更剧烈，提供更强的 warp_seg 训练信号，有助于改善器械分割
+# Motivation: grasp10 has more vigorous instrument motion, providing stronger warp_seg training signal to improve instrument segmentation
 
 batch_size: 8
 val_batch_size: 1
@@ -97,7 +97,7 @@ model_kwargs:
   separate_residual: true
   mask_layer: 5
   align_corners: false
-  mask_size: [96, 96]       # ← 与 MultiScaleSegHead 输出分辨率一致，不再插值
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
   log_interval: 100
 
@@ -198,7 +198,7 @@ model_kwargs:
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
-    mask_size: [96, 96]     # ← 与 mask_size 对齐
+    mask_size: [96, 96]     # ← aligned with mask_size
     norm_flow: false
     clamp_flow_t: 10.
     free_residual: false
@@ -211,7 +211,7 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
-  # ── 新分割头 ──────────────────────────────────────────────────────────────
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5

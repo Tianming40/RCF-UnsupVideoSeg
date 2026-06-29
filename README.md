@@ -1345,3 +1345,41 @@ Evaluated on:
 - **Late-epoch instrument collapse persists in both:** instrument mIoU declines at last checkpoints (v53_last=52.98%, v54_last=44.64%), consistent with the grasp0 dataset issue of weak instrument supervision — channels drift away from instrument as tissue representation matures
 - **v54 tissue is the new record:** v54_last achieves tissue=75.66%, surpassing v52_last (73.60%) and v51's best (73.58%), at the cost of instrument quality (44.64%)
 - **Best overall checkpoint: v53 ep43** — tissue=72.82%, instrument=63.95%, sum=136.77%; represents the best instrument/tissue balance achieved by unsupervised training on this dataset
+---
+
+## Grasp0 Segmentation — Version Summary
+
+Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); tissue mIoU = two-pass oracle excluding the instrument channel. Numbers are the best checkpoint per version.
+
+### Phase 1 — Baseline
+
+| Version | Description | Inst mIoU | Tissue mIoU | Sum |
+|---------|-------------|:---------:|:-----------:|:---:|
+| **v9** | FCNHead decoder; pretrained on grasp10, fine-tuned on grasp0; DINO distillation | 68.82 | 67.65 | 136.47 |
+
+### Phase 2 — Loss tuning (FCNHead / MultiScaleSegHead, grasp0 data only)
+
+| Version | Key change | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:---------:|:-----------:|:---:|
+| v40 | + Flow bilateral-CE loss (w=2.0) | 55.27 | 73.09 | 128.36 |
+| v42 | FCNHead → **MultiScaleSegHead** | 60.47 | 72.15 | 132.62 |
+| v43 | Loss rebalancing | 66.03 | 71.69 | 137.72 |
+| v46 | Stronger bilateral (w=4) + DINO (w=2) | 65.71 | 70.80 | 136.51 |
+| v47 | w_dino = 3 | **67.80** | 70.48 | **138.28** |
+| v51 | DINO only (w=1), no bilateral | 61.30 | **73.58** | 134.88 |
+
+### Phase 3 — Architecture & training tuning (MultiScaleSegHead baseline, grasp0+grasp10 merged data)
+
+| Version | Key change | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:---------:|:-----------:|:---:|
+| v52 | New pipeline: merged grasp0+grasp10 data; mask_size 128→96 | 61.64 | 71.33 | 132.97 |
+| v53 | w_dino 1.0→0.1 (calibrated for merged data) | **63.95** | 72.82 | **136.77** |
+| v54 | Higher crop res (resize_short 400→576) | 58.80 | **74.45** | 133.25 |
+| v55 | + Sobel edge feat in decoder | 63.83 | 70.17 | 134.00 |
+| v56 | + Flow guidance feat (dropout aug) | 59.30 | 70.03 | 129.33 |
+| v57 | Edge feat + flow guidance | 61.11 | 72.50 | 133.61 |
+| v58 | clamp_flow_t 10→20, topk 4→6 | 64.48 | 69.96 | 134.44 |
+| v59 | Flow guidance + clamp=20 + topk=6 | 62.54 | 64.18 | 126.72 |
+| v60 | topk 4→2 (easy-example mining) | 63.86 | 68.51 | 132.37 |
+| <span style="color:red">**v61**</span> | <span style="color:red">**UNetSegHead** (top-down coarse-to-fine) + edge feat</span> | <span style="color:red">64.01</span> | <span style="color:red">72.51</span> | <span style="color:red">**136.52**</span> |
+| v62 | **UNetSegHeadV2** (true FPN, standard backbone strides) | 62.83 | 72.65 | 135.48 |

@@ -1,10 +1,10 @@
 # rcf_cmc_grasp0_tissue_ft_v60.yaml
 #
-# v60 = v55（边缘增强）+ topk 4→2 + clamp_flow_t 保持 10
+# v60 = v55 (edge enhancement) + topk 4→2 + clamp_flow_t kept at 10
 #
-# 改动（相对 v55）：
-#   decode_head.topk: 2    （只选 loss 最小的 2 条，极端 easy mining，信号最干净）
-#   clamp_flow_t 保持 10   （不放大高运动噪声）
+# Changes (vs v55):
+#   decode_head.topk: 2    (select only the 2 lowest-loss sequences; extreme easy mining, cleanest signal)
+#   clamp_flow_t kept at 10   (does not amplify high-motion noise)
 
 batch_size: 8
 val_batch_size: 1
@@ -217,7 +217,7 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_edge_feat: true         # ← v55 新增：Sobel 边缘增强
+    use_edge_feat: true         # ← v55 new: Sobel edge enhancement
 
   decode_head3:
     concat_input: false

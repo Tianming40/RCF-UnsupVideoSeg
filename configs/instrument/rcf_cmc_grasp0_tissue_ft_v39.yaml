@@ -1,15 +1,17 @@
 # rcf_cmc_grasp0_tissue_ft_v39.yaml
 #
-# 边界对齐新思路：flow-guided bilateral 自训练 CE（不变灰）
-#   区域身份 = 当前 mask argmax（稳定，不重新分配 channel → 不变灰）
-#   边界位置 = 光流相似度双边投票，把伪标签边界吸附到光流边界
+# New boundary alignment approach: flow-guided bilateral self-training CE (no graying)
+#   Region identity = current mask argmax (stable, no channel re-assignment → no graying)
+#   Boundary position = bilateral voting based on optical flow similarity, snapping pseudo-label
+#     boundaries to optical flow boundaries
 #
-# 对比历史：
-#   flow_cluster_ce 每帧重新 k-means + canonical sort 分配 channel
-#     → target 帧间抖动 → mask 变灰
-#   本 loss 永不重新分配，只用光流修正边界位置 → 防灰 + 主动对齐
+# Compared to history:
+#   flow_cluster_ce re-runs k-means + canonical sort per frame to assign channels
+#     → target jitters across frames → mask grays out
+#   This loss never re-assigns channels, only uses optical flow to correct boundary positions
+#     → prevents graying + actively aligns boundaries
 #
-# 从 v9 checkpoint 出发（mask 已分化）
+# Starting from v9 checkpoint (mask already differentiated)
 
 batch_size: 8
 val_batch_size: 1
@@ -158,7 +160,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE ─────────────────────────────────
+  # ── Core: flow-guided bilateral self-training CE ─────────────────────────────────
   w_flow_bilateral_ce: 1.0
   flow_bilateral_window: 7
   flow_bilateral_sigma: 0.5

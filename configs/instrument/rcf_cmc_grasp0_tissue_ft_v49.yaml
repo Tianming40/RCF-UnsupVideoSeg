@@ -1,21 +1,21 @@
 # rcf_cmc_grasp0_tissue_ft_v49.yaml
 #
-# v49 = 从零开始（DenseCL 起点）直接在 grasp0 上训练
+# v49 = train from scratch (DenseCL starting point) directly on grasp0
 #
-# 动机：
-#   v46/v47/v48 从 v9（grasp10 微调）出发，ch1 继承了 grasp10 的通道分配。
-#   训练目标（tissue 精修）和继承结构之间存在摩擦，distill/entropy/deform
-#   等保护手段均未能有效维持 ch1。
+# Motivation:
+#   v46/v47/v48 start from v9 (grasp10 fine-tune), so ch1 inherits grasp10's channel assignment.
+#   Friction exists between the training objective (tissue refinement) and the inherited structure;
+#   distill/entropy/deform protection mechanisms all fail to maintain ch1.
 #
-#   从 DenseCL（ImageNet 对比学习，无 flow 头）出发，模型在 grasp0 数据上
-#   完全自由地学习通道分配。DINO（w=3.0，dino_channels=[1]）从 epoch 0
-#   起将 ch1 锚定在 ViT 特征空间的器械语义，bilateral_ce（w=4.0）同步
-#   推动非器械通道学习 tissue 边界。
+#   Starting from DenseCL (ImageNet contrastive pretraining, no flow head), the model is
+#   completely free to learn channel assignments on grasp0 data. DINO (w=3.0, dino_channels=[1])
+#   anchors ch1 to instrument semantics in ViT feature space from epoch 0; bilateral_ce (w=4.0)
+#   simultaneously drives non-instrument channels to learn tissue boundaries.
 #
-# Loss：warp_seg（w=1.0）+ DINO（w=3.0，ch1）+ bilateral_ce（w=4.0，非 ch1）
-# 关掉：entropy=0、flow_cosine=0、deform=0、distill=0
+# Loss: warp_seg (w=1.0) + DINO (w=3.0, ch1) + bilateral_ce (w=4.0, non-ch1)
+# Disabled: entropy=0, flow_cosine=0, deform=0, distill=0
 #
-# lr=1e-4（高于微调的 3e-5，因为 flow/mask head 全随机初始化）
+# lr=1e-4 (higher than fine-tune 3e-5 because flow/mask head is randomly initialized)
 # epochs=80
 
 batch_size: 8

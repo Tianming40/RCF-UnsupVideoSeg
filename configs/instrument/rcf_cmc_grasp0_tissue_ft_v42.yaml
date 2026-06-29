@@ -1,14 +1,14 @@
 # rcf_cmc_grasp0_tissue_ft_v42.yaml
 #
-# v42 = v41 + 借鉴 v18 流派 + bilateral 微调。在无泄漏(379) + 双 val 基础上：
-#   1. flow_bilateral_window: 11 → 15   边界能搬更远（慢 + 跨区域风险）
-#   2. flow_bilateral_sigma:  0.5 → 0.3 光流边界切得更锐
-#   3. distill: symmetric 3.0 → one_sided 1.0   放任 tissue 自由优化边界
-#   4. + flow_cosine 0.5 + diversity 0.5   channel 分化 + 把边界粗拉到光流附近
-#      （cosine 粗对齐 → bilateral 精修最后一公里，互补）
+# v42 = v41 + v18-style improvements + bilateral fine-tuning. On top of leak-free(379) + dual val:
+#   1. flow_bilateral_window: 11 → 15   boundary can move further (slower + cross-region risk)
+#   2. flow_bilateral_sigma:  0.5 → 0.3 optical flow boundary cut more sharply
+#   3. distill: symmetric 3.0 → one_sided 1.0   let tissue freely optimize its boundary
+#   4. + flow_cosine 0.5 + diversity 0.5   channel differentiation + coarse boundary pull toward flow
+#      (cosine coarse alignment → bilateral fine-tunes the last mile; complementary)
 #
-# entropy 保持 5.0：bilateral 依赖 argmax 伪标签，需要 mask 够 one-hot（防灰）。
-# 从 v9 checkpoint 出发。
+# entropy stays at 5.0: bilateral depends on argmax pseudo-labels; mask must be one-hot enough (prevent graying).
+# Starting from v9 checkpoint.
 
 batch_size: 8
 val_batch_size: 1
@@ -72,7 +72,7 @@ test_dataset_kwargs:
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取；tissue val 自动排除 instrument ch1）──
+# ── Per-epoch dual val (read by main_tissue.py; tissue val auto-excludes instrument ch1) ──
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -141,7 +141,7 @@ model_kwargs:
 
   w_rigid_tissue: 0.0
 
-  # ── 借鉴 v18：flow_cosine 做 channel 分化 + 边界粗对齐 ─────────────────────
+  # ── From v18: flow_cosine for channel differentiation + coarse boundary alignment ─────────────────────
   w_flow_cosine: 0.5
   flow_cosine_temperature: 0.5
   flow_cosine_diversity: 0.5
@@ -167,7 +167,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（边界精修，微调更锐更远）─────────
+  # ── Core: flow-guided bilateral self-training CE (boundary refinement, sharper and farther) ─────────
   w_flow_bilateral_ce: 2.0
   flow_bilateral_window: 15
   flow_bilateral_sigma: 0.3
@@ -175,7 +175,7 @@ model_kwargs:
   reset_non_instrument_heads: false
   reset_full_decode_head: false
 
-  # ── 借鉴 v18：one_sided distill（只保护 instrument，放任 tissue）──────────
+  # ── From v18: one_sided distill (protect instrument only, let tissue move freely) ──────────
   w_distill:    1.0
   distill_mode: one_sided
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt

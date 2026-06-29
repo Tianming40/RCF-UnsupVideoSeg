@@ -227,7 +227,7 @@ model_kwargs:
     feat_channels: [256, 512, 1024, 2048]
     dropout_ratio: 0.1
     align_corners: false
-    use_edge_feat: true         # ← v55 新增：Sobel 边缘增强
+    use_edge_feat: true         # ← v55 new: Sobel edge enhancement
 
   decode_head3:
     concat_input: false

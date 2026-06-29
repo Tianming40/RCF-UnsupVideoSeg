@@ -1,10 +1,10 @@
 # rcf_cmc_grasp0_tissue_ft_v59.yaml
 #
-# v59 = v56（光流指导）+ clamp_flow_t 10→20 + topk 4→6
+# v59 = v56 (optical flow guidance) + clamp_flow_t 10→20 + topk 4→6
 #
-# 改动（相对 v56）：
-#   decode_head.clamp_flow_t: 20   （高运动序列截断比从 50%→~15%，器械信号更完整）
-#   decode_head.topk:         6    （从 8 条序列选 6 条，减少对高运动序列的排除）
+# Changes (vs v56):
+#   decode_head.clamp_flow_t: 20   (high-motion sequence clamp ratio drops from ~50% to ~15%; instrument signal more complete)
+#   decode_head.topk:         6    (select 6 from 8 sequences; reduces exclusion of high-motion sequences)
 
 batch_size: 8
 val_batch_size: 1
@@ -217,9 +217,9 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_flow_feat: true          # ← v56 新增：光流指导分割头
-    flow_in_channels: 64         # 与 num_flow_feat_channels 对齐
-    flow_drop_p: 0.5             # 训练时 50% 概率 drop，消除 train/val gap
+    use_flow_feat: true          # ← v56 new: optical flow guidance for segmentation head
+    flow_in_channels: 64         # aligned with num_flow_feat_channels
+    flow_drop_p: 0.5             # 50% drop probability during training to eliminate train/val gap
 
   decode_head3:
     concat_input: false

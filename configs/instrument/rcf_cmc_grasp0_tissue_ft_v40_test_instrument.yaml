@@ -1,14 +1,14 @@
 # rcf_cmc_grasp0_tissue_ft_v40_test_instrument.yaml
 #
 # TEST-ONLY config for instrument (ch1) IoU on the new grasp0 annotations.
-# 复用 v40 训练配置，只改 test 相关项：
-#   test_data_path -> eval_instrument (Annotations/<id>/<id>.jpg, 白=instrument)
-#   test split     -> ImageSets/val.txt (213 帧)
-#   object_channel -> 1  (instrument 固定 ch1，不需要 oracle)
+# Reuses v40 training config, only test-related items changed:
+#   test_data_path -> eval_instrument (Annotations/<id>/<id>.jpg, white=instrument)
+#   test split     -> ImageSets/val.txt (213 frames)
+#   object_channel -> 1  (instrument fixed at ch1, no oracle needed)
 #   val_batch_size -> 1
 #   eval_save      -> true
 #
-# 运行：
+# Run:
 #   python main_tissue.py \
 #     configs/instrument/rcf_cmc_grasp0_tissue_ft_v40_test_instrument.yaml \
 #     --test \

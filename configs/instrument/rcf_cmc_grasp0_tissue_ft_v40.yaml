@@ -1,14 +1,14 @@
 # rcf_cmc_grasp0_tissue_ft_v40.yaml
 #
-# v39 加强版：flow-guided bilateral 自训练 CE，加大边界拉力
-#   v39 诊断结果：防灰完美(max_prob 0.93→0.96)，但 relabelled 仅 ~0.8% 不累积
-#   → 边界没真正迁移，力被 sharpening 主导 / 被 warp_seg 拉回
+# Strengthened v39: flow-guided bilateral self-training CE with increased boundary pull
+#   v39 diagnosis: no graying (max_prob 0.93→0.96), but relabelled only ~0.8% without accumulation
+#   → boundary has not truly migrated; pull dominated by sharpening / pulled back by warp_seg
 #
-# 两个旋钮加大拉力（sigma 不动，0.93+ 说明切断良好）：
-#   flow_bilateral_window: 7 → 11   让边界能搬更远的距离
-#   w_flow_bilateral_ce:   1 → 2    mask 更快跟上 target，对抗 warp_seg
+# Two knobs to increase pull (sigma unchanged; 0.93+ indicates good cut-off):
+#   flow_bilateral_window: 7 → 11   allows boundary to move further
+#   w_flow_bilateral_ce:   1 → 2    mask catches up to target faster, countering warp_seg
 #
-# 从 v9 checkpoint 出发（mask 已分化）
+# Starting from v9 checkpoint (mask already differentiated)
 
 batch_size: 8
 val_batch_size: 1
@@ -157,7 +157,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（加大拉力）─────────────────────
+  # ── Core: flow-guided bilateral self-training CE (increased boundary pull) ─────────────────────
   w_flow_bilateral_ce: 2.0
   flow_bilateral_window: 11
   flow_bilateral_sigma: 0.5

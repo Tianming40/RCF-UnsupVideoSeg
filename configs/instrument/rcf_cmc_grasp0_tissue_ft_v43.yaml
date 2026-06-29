@@ -1,17 +1,17 @@
 # rcf_cmc_grasp0_tissue_ft_v43.yaml
 #
-# v43 = v42，只改 distill 把 instrument 拉住。
-# 诊断(job 296)：v42 的 one_sided distill weighted≈0.008 形同虚设，
-#   instrument 从 0.637 一路掉到 0.57。one_sided 是线性 relu(teacher-student)，
-#   惩罚温柔且有天花板，靠加 w 到 10 都低效。
-# 改法：distill_mode one_sided → symmetric(BCE)，w 1.0 → 2.0。
-#   BCE 梯度 ∝ teacher/student，student 一掉就爆炸式放大 = 自适应弹簧，
-#   w 不用很大就能把 ch1 钉住（v12/v13 当年保 instrument 的机制）。
-#   代价：ch1 双向约束、自由度降低，但本就想保 instrument，正合适。
-# 其余(bilateral window15/sigma0.3、flow_cosine 0.5)全部沿用 v42。
-# ckpt 监控 val_miou_sum：instrument 钉住后 sum 能真实反映 tissue 进步。
+# v43 = v42, only distill changed to anchor instrument.
+# Diagnosis (job 296): v42's one_sided distill weighted≈0.008 is effectively zero;
+#   instrument drops steadily from 0.637 to 0.57. one_sided is linear relu(teacher-student),
+#   soft penalty with a ceiling; scaling w to 10 still ineffective.
+# Fix: distill_mode one_sided → symmetric (BCE), w 1.0 → 2.0.
+#   BCE gradient ∝ teacher/student; any drop triggers exponential amplification = adaptive spring;
+#   small w is enough to pin ch1 (same mechanism used in v12/v13 to protect instrument).
+#   Trade-off: ch1 is bidirectionally constrained and has less freedom, but that is the intent.
+# Everything else (bilateral window15/sigma0.3, flow_cosine 0.5) carried over from v42.
+# Monitor ckpt by val_miou_sum: once instrument is pinned, sum faithfully reflects tissue progress.
 #
-# 从 v9 checkpoint 出发。
+# Starting from v9 checkpoint.
 
 batch_size: 8
 val_batch_size: 1
@@ -54,12 +54,13 @@ loss_log_interval: 10
 log_interval: 100
 
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch1 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [1]
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
@@ -80,7 +81,7 @@ test_dataset_kwargs:
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取；tissue val 自动排除 instrument ch1）──
+# ── Per-epoch dual val (read by main_tissue.py; tissue val auto-excludes instrument ch1) ──
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -149,7 +150,7 @@ model_kwargs:
 
   w_rigid_tissue: 0.0
 
-  # ── 借鉴 v18：flow_cosine 做 channel 分化 + 边界粗对齐 ─────────────────────
+  # ── From v18: flow_cosine for channel differentiation + coarse boundary alignment ─────────────────────
   w_flow_cosine: 0.5
   flow_cosine_temperature: 0.5
   flow_cosine_diversity: 0.5
@@ -175,7 +176,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（边界精修，微调更锐更远）─────────
+  # ── Core: flow-guided bilateral self-training CE (boundary refinement, sharper and farther) ─────────
   w_flow_bilateral_ce: 2.0
   flow_bilateral_window: 15
   flow_bilateral_sigma: 0.3
@@ -183,7 +184,7 @@ model_kwargs:
   reset_non_instrument_heads: false
   reset_full_decode_head: false
 
-  # ── v43：symmetric distill（BCE 自适应弹簧，钉住 instrument ch1）──────────
+  # ── v43: symmetric distill (BCE adaptive spring, pins instrument ch1) ──────────
   w_distill:    2.0
   distill_mode: symmetric
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt

@@ -1,12 +1,12 @@
 # rcf_cmc_grasp0_tissue_ft_v57.yaml
 #
-# v57 = v53 + 边缘增强（use_edge_feat）+ 光流指导（use_flow_feat）
+# v57 = v53 + edge enhancement (use_edge_feat) + optical flow guidance (use_flow_feat)
 #
-# 改动（相对 v53）：
-#   decode_head2.use_edge_feat: true  （Sobel 边缘）
-#   decode_head2.use_flow_feat: true  （光流指导，flow_drop_p=0.5）
+# Changes (vs v53):
+#   decode_head2.use_edge_feat: true  (Sobel edge)
+#   decode_head2.use_flow_feat: true  (optical flow guidance, flow_drop_p=0.5)
 #
-# 其余与 v53 完全相同：clamp_flow_t=10, topk=4
+# Everything else identical to v53: clamp_flow_t=10, topk=4
 
 batch_size: 8
 val_batch_size: 1
@@ -219,8 +219,8 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_edge_feat: true          # ← Sobel 边缘增强
-    use_flow_feat: true          # ← 光流指导（flow_drop_p=0.5）
+    use_edge_feat: true          # ← Sobel edge enhancement
+    use_flow_feat: true          # ← optical flow guidance (flow_drop_p=0.5)
     flow_in_channels: 64
     flow_drop_p: 0.5
 

@@ -1,11 +1,11 @@
 # rcf_cmc_grasp0_tissue_ft_v51_test_instrument.yaml
 #
 # TEST-ONLY config for instrument eval for v51.
-# v51 从零训练，instrument 跑到 ch4（而非 ch1）。
-#   object_channel -> 4  (instrument 固定 ch4)
-#   instrument_channels: []  (与 v51 训练 config 一致)
+# v51 trained from scratch; instrument ended up in ch4 (not ch1).
+#   object_channel -> 4  (instrument fixed at ch4)
+#   instrument_channels: []  (consistent with v51 training config)
 #
-# 运行：
+# Run:
 #   python main_tissue.py \
 #     configs/instrument/rcf_cmc_grasp0_tissue_ft_v51_test_instrument.yaml \
 #     --test \

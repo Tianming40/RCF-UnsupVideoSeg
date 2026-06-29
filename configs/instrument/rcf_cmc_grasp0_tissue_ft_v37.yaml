@@ -1,10 +1,10 @@
 # rcf_cmc_grasp0_tissue_ft_v37.yaml
 #
-# 直接从 v9 checkpoint 出发（mask 已分化），加入 flow_boundary_tv loss：
-#   mask 边界必须对齐光流边界（local variance k=13 作为 boundary signal）
+# Starting from v9 checkpoint (mask already differentiated), add flow_boundary_tv loss:
+#   mask boundary must align with optical flow boundary (local variance k=13 as boundary signal)
 #
-# 不做 Phase 1 角度扇区强制，不做 flow_cosine EM
-# 只靠 flow_boundary_tv 引导 mask 边界落在光流边界处
+# No Phase 1 angular sector enforcement, no flow_cosine EM
+# Rely solely on flow_boundary_tv to guide mask boundaries to align with optical flow boundaries
 
 batch_size: 8
 val_batch_size: 1
@@ -149,7 +149,7 @@ model_kwargs:
   flow_angle_ce_diversity: 0.0
   w_flow_angle_outside: 0.0
 
-  # ── 核心新 loss：mask 边界对齐光流边界 ────────────────────────────────────
+  # ── Core new loss: mask boundary alignment with optical flow boundary ────────────────────────────────────
   w_flow_boundary_tv: 5.0
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0

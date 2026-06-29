@@ -1,12 +1,12 @@
 # rcf_cmc_grasp0_tissue_ft_v41.yaml
 #
-# 无泄漏训练 + 双 val checkpoint：
-#   - 训练只用 379 对「无标注」帧 (train_unlabeled_379.txt)，不再见测试帧
-#   - 每个 epoch 跑两个 val：instrument(213) + tissue(209)，各自 oracle
-#   - val_miou_sum = val_miou_instrument + val_miou_tissue，按它存 top-3 ckpt
-#   - 方法沿用 v40：flow-guided bilateral 自训练 CE
+# Leak-free training + dual val checkpointing:
+#   - Training uses only 379 unlabeled frame pairs (train_unlabeled_379.txt); test frames never seen
+#   - Each epoch runs two val passes: instrument(213) + tissue(209), each with its own oracle
+#   - val_miou_sum = val_miou_instrument + val_miou_tissue; top-3 checkpoints saved by this sum
+#   - Method same as v40: flow-guided bilateral self-training CE
 #
-# 从 v9 checkpoint 出发（所有 grasp0_tissue_ft 的起点）
+# Starting from v9 checkpoint (starting point for all grasp0_tissue_ft runs)
 
 batch_size: 8
 val_batch_size: 1
@@ -48,7 +48,7 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-# 训练后 test（trainer.test）用 oracle；val 流程在 main_tissue 里自管 object_channel
+# Post-training test (trainer.test) uses oracle; val flow manages object_channel internally in main_tissue
 object_channel: null
 set_object_channel_after_epoch: 0
 
@@ -65,14 +65,14 @@ train_dataset_kwargs:
   split: ImageSets/train_unlabeled_379.txt
   zero_ann: false
 
-# 训练后最终 test 用 tissue（单 test_data_path）；逐 epoch 的双 val 见下方 val_dataset_list
+# Final post-training test uses tissue (single test_data_path); per-epoch dual val defined in val_dataset_list below
 test_dataset_kwargs:
   frame_num: 1
   load_flow: false
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取）────────────────────────────────────
+# ── Per-epoch dual val (read by main_tissue.py) ────────────────────────────────────
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -166,7 +166,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE ─────────────────────────────────
+  # ── Core: flow-guided bilateral self-training CE ─────────────────────────────────
   w_flow_bilateral_ce: 2.0
   flow_bilateral_window: 11
   flow_bilateral_sigma: 0.5

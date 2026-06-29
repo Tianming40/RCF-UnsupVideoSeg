@@ -1,11 +1,11 @@
 # rcf_cmc_grasp0_tissue_ft_v38.yaml
 #
-# 基于 v37，改进 flow_boundary_tv loss：
-#   边界权重在全分辨率光流上计算，再 downsample 到 128×128
-#   避免先降采样光流再求梯度导致边界模糊（参考 "Devil in the Edges" 思路）
+# Based on v37, improved flow_boundary_tv loss:
+#   boundary weights computed on full-resolution optical flow, then downsampled to 128×128
+#   avoids blurring boundaries by downsampling flow before computing gradients (cf. "Devil in the Edges")
 #
-# 公式：loss = mean_c[ (exp(-α|∇flow_full|_↓) × |∇mask|).sum() / (|∇mask|.sum() + ε) ]
-# 值域 ∈ [0, 2]，边界越对齐光流边缘越往 0 降
+# Formula: loss = mean_c[ (exp(-α|∇flow_full|_↓) × |∇mask|).sum() / (|∇mask|.sum() + ε) ]
+# Range ∈ [0, 2]; better boundary-flow alignment drives the value toward 0
 
 batch_size: 8
 val_batch_size: 1
@@ -150,7 +150,7 @@ model_kwargs:
   flow_angle_ce_diversity: 0.0
   w_flow_angle_outside: 0.0
 
-  # ── 核心新 loss：mask 边界对齐光流边界（全分辨率边界权重）────────────────
+  # ── Core new loss: mask boundary alignment with optical flow boundary (full-resolution boundary weights) ────────────────
   w_flow_boundary_tv: 5.0
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0

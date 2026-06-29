@@ -1,23 +1,23 @@
 # rcf_cmc_grasp0_tissue_ft_v47.yaml
 #
-# v47 = v46 + 两项调整（修复 ch1 保护 + 加强 DINO 锚点）：
+# v47 = v46 + two adjustments (fix ch1 protection + strengthen DINO anchor):
 #
-# v46 诊断（ep0-5 val）：
-#   tissue 涨至 70.5%（超 baseline 67.65%），但 instrument 持续下滑至 59.1%
-#   原因：one_sided distill raw≈0.008，weighted≈0.04（几乎为 0），ch1 无保护
+# v46 diagnosis (ep0-5 val):
+#   tissue rises to 70.5% (above baseline 67.65%), but instrument keeps dropping to 59.1%
+#   Cause: one_sided distill raw≈0.008, weighted≈0.04 (nearly zero), ch1 has no protection
 #
-# 调整：
+# Adjustments:
 #   1. distill_mode: one_sided → symmetric
-#      - 双向 BCE，真正给 ch1 梯度；v43 时 symmetric raw≈0.07 → 贡献≈0.35（2%）
-#      - 防止 tissue 通道"侵占"ch1 空间
+#      - bidirectional BCE, gives real gradients to ch1; v43 symmetric raw≈0.07 → contribution≈0.35 (2%)
+#      - prevents tissue channels from "encroaching" on ch1 space
 #   2. w_dino: 2.0 → 3.0
-#      - ch1 外观锚点加强，配合 symmetric distill 双重保护 instrument
-#      - tissue 已经在从 bilateral_ce/flow_cosine 受益，不需要削弱 DINO
+#      - stronger ch1 appearance anchor; combined with symmetric distill for dual instrument protection
+#      - tissue already benefits from bilateral_ce/flow_cosine, no need to weaken DINO
 #
-# 保持不变（v46 水平）：
-#   w_deform=1.0、w_flow_bilateral_ce=4.0
-#   w_distill: 5.0 → 2.0（symmetric BCE 自适应梯度，raw≈0.07，w=2 贡献≈0.14，与 v43 一致）
-# 从 v9 checkpoint 出发。
+# Unchanged (v46 level):
+#   w_deform=1.0, w_flow_bilateral_ce=4.0
+#   w_distill: 5.0 → 2.0 (symmetric BCE adaptive gradient, raw≈0.07, w=2 contribution≈0.14, consistent with v43)
+# Starting from v9 checkpoint.
 
 batch_size: 8
 val_batch_size: 1
@@ -60,12 +60,13 @@ loss_log_interval: 10
 log_interval: 100
 
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch1 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [1]
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
@@ -86,7 +87,7 @@ test_dataset_kwargs:
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取；tissue val 自动排除 instrument ch1）──
+# ── Per-epoch dual val (read by main_tissue.py; tissue val auto-excludes instrument ch1) ──
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -156,7 +157,7 @@ model_kwargs:
 
   w_rigid_tissue: 0.0
 
-  # ── 借鉴 v18：flow_cosine 做 channel 分化 + 边界粗对齐 ─────────────────────
+  # ── From v18: flow_cosine for channel differentiation + coarse boundary alignment ─────────────────────
   w_flow_cosine: 0.5
   flow_cosine_temperature: 0.5
   flow_cosine_diversity: 0.5
@@ -182,7 +183,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（边界精修，微调更锐更远）─────────
+  # ── Core: flow-guided bilateral self-training CE (boundary refinement, sharper and farther) ─────────
   w_flow_bilateral_ce: 4.0
   flow_bilateral_window: 15
   flow_bilateral_sigma: 0.3
@@ -190,7 +191,7 @@ model_kwargs:
   reset_non_instrument_heads: false
   reset_full_decode_head: false
 
-  # ── v44：one_sided distill（只防 dropout，允许超越 teacher）+ DINO ch1 锚点 ──
+  # ── v44: one_sided distill (prevent dropout only, allow exceeding teacher) + DINO ch1 anchor ──
   w_distill:    2.0
   distill_mode: symmetric
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt

@@ -1,16 +1,17 @@
 # rcf_cmc_grasp0_tissue_ft_v50.yaml
 #
-# v50 = v48，但 DINO 权重减小（3.0 → 1.0）
+# v50 = v48 with reduced DINO weight (3.0 → 1.0)
 #
-# v48 诊断：
-#   DINO loss = 遮罩加权质心一致性损失（非 K-means）
-#   质心随 ch1 当前内容动态漂移：ch1 稳定时是正锚点，ch1 一旦开始流失，
-#   质心也随之漂移，DINO 反而加速把流失的器械推出 ch1（正反馈）
-#   w_dino=3.0 时该放大效应较强
+# v48 diagnosis:
+#   DINO loss = mask-weighted centroid consistency loss (not K-means)
+#   Centroid drifts dynamically with ch1 content: when ch1 is stable it is a positive anchor,
+#   but once ch1 starts leaking, the centroid also drifts and DINO accelerates pushing leaking
+#   instrument pixels out of ch1 (positive feedback).
+#   This amplification effect is strong at w_dino=3.0.
 #
-# v50 策略：降低 DINO 权重减弱质心漂移放大效应，其余与 v48 完全相同
+# v50 strategy: lower DINO weight to weaken centroid-drift amplification; everything else same as v48
 #
-# 调整：
+# Adjustment:
 #   w_dino: 3.0 → 1.0
 
 batch_size: 8

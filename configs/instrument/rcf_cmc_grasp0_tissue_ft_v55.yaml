@@ -1,15 +1,15 @@
 # rcf_cmc_grasp0_tissue_ft_v55.yaml
 #
-# v55 = v53 基础上加入边缘特征增强（use_edge_feat）
+# v55 = v53 with edge feature enhancement (use_edge_feat)
 #
-# 改动（相对 v53）：
+# Changes (vs v53):
 #   decode_head2.use_edge_feat: true
-#     → Sobel on feat0 L2 norm → edge_proj(1→256) → 加到 fused（上采样后）
-#     → 让分割头在高分辨率特征图上直接看到 feat0 的梯度突变位置
-#     → 器械金属边缘强梯度 → 帮助 channel 稳定分配给器械
+#     → Sobel on feat0 L2 norm → edge_proj(1→256) → added to fused (after upsampling)
+#     → lets the segmentation head directly see gradient-change locations in feat0 at high resolution
+#     → strong gradients at instrument metal edges → helps stabilize channel assignment to instrument
 #
-# 其余与 v53 完全相同：
-#   grasp0(379)+grasp10(601)，MultiScaleSegHead，mask_size=96×96，w_dino=0.1
+# Everything else identical to v53:
+#   grasp0(379)+grasp10(601), MultiScaleSegHead, mask_size=96×96, w_dino=0.1
 
 batch_size: 8
 val_batch_size: 1
@@ -222,7 +222,7 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_edge_feat: true         # ← v55 新增：Sobel 边缘增强
+    use_edge_feat: true         # ← v55 new: Sobel edge enhancement
 
   decode_head3:
     concat_input: false

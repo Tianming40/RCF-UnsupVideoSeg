@@ -1,19 +1,20 @@
 # rcf_cmc_grasp0_tissue_ft_v51.yaml
 #
-# v51 = DenseCL 从零 + 仅 warp_seg + 小 DINO（全通道）
+# v51 = DenseCL from scratch + warp_seg only + small DINO (all channels)
 #
-# 动机：
-#   v49（308）显示 ep15 达到峰值 inst=60.5% tissue=60.6%，之后随 loss 继续下降
-#   而通道分配越来越乱。根本矛盾：warp_seg 最优解和语义 channel 分配冲突。
-#   bilateral_ce（v49 w=4.0）在 v49 里对所有非 ch1 通道额外推动，可能加剧这一矛盾。
+# Motivation:
+#   v49 (job 308) shows peak at ep15: inst=60.5%, tissue=60.6%; afterwards as loss continues to
+#   decrease, channel assignments become increasingly disordered. Root conflict: warp_seg optimal
+#   solution conflicts with semantic channel assignment.
+#   bilateral_ce (v49 w=4.0) provides extra push to all non-ch1 channels, potentially worsening this.
 #
-#   v51 目的：关掉 bilateral_ce，只留 warp_seg + 小 DINO（全通道 w=1.0）
-#   观察纯粹的 warp_seg + DINO 组合在从零出发时能否得到更稳定的通道分配。
+#   v51 goal: disable bilateral_ce, keep only warp_seg + small DINO (all channels, w=1.0).
+#   Observe whether pure warp_seg + DINO from scratch yields more stable channel assignment.
 #
-# Loss：warp_seg（w=1.0）+ DINO（w=1.0，dino_channels=null 全通道）
-# 关掉：bilateral_ce=0、entropy=0、flow_cosine=0、deform=0、distill=0
+# Loss: warp_seg (w=1.0) + DINO (w=1.0, dino_channels=null all channels)
+# Disabled: bilateral_ce=0, entropy=0, flow_cosine=0, deform=0, distill=0
 #
-# lr=1e-4，DenseCL 起点，epochs=80
+# lr=1e-4, DenseCL starting point, epochs=80
 
 batch_size: 8
 val_batch_size: 1

@@ -1,20 +1,20 @@
 # rcf_cmc_grasp0_tissue_ft_v52.yaml
 #
-# v52 = v51 基础上换用 MultiScaleSegHead + mask_size=96×96
+# v52 = v51 with MultiScaleSegHead + mask_size=96×96
 #
-# 改动：
+# Changes:
 #   decode_head2: FCNHead → MultiScaleSegHead
-#     - feat1 / feat2 / feat3 各自 1×1 投影到 256ch，element-wise sum
-#     - fuse_conv: 3×3 dilation=6（在 48×48）
+#     - feat1 / feat2 / feat3 each projected to 256ch via 1×1, element-wise sum
+#     - fuse_conv: 3×3 dilation=6 (at 48×48)
 #     - 2× bilinear upsample → 96×96
-#     - concat feat0 [256, 96×96]，两层 3×3 精修
+#     - concat feat0 [256, 96×96], two-layer 3×3 refinement
 #     - conv_seg → [5, 96×96]
 #   mask_size: [128, 128] → [96, 96]
-#     - 分割头原生 96×96 输出，不需要再 upsample/downsample
-#     - warp_seg 在真实的 96×96 上计算，比原来 48×48 插值到 128 信息更真实
+#     - segmentation head native 96×96 output, no further upsample/downsample needed
+#     - warp_seg computed at true 96×96, more faithful than interpolating from 48×48 to 128
 #
-# 其余与 v51 完全相同：
-#   DenseCL 从零出发，warp_seg + DINO（全通道 w=1.0），bilateral_ce=0
+# Everything else identical to v51:
+#   DenseCL from scratch, warp_seg + DINO (all channels, w=1.0), bilateral_ce=0
 
 batch_size: 8
 val_batch_size: 1
@@ -105,7 +105,7 @@ model_kwargs:
   separate_residual: true
   mask_layer: 5
   align_corners: false
-  mask_size: [96, 96]       # ← 与 MultiScaleSegHead 输出分辨率一致，不再插值
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
   log_interval: 100
 
@@ -206,7 +206,7 @@ model_kwargs:
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
-    mask_size: [96, 96]     # ← 与 mask_size 对齐
+    mask_size: [96, 96]     # ← aligned with mask_size
     norm_flow: false
     clamp_flow_t: 10.
     free_residual: false
@@ -219,7 +219,7 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
-  # ── 新分割头 ──────────────────────────────────────────────────────────────
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5

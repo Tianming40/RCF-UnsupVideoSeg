@@ -1,18 +1,18 @@
 # rcf_cmc_grasp0_tissue_ft_v45.yaml
 #
-# v45 = v44 + 三项权重调整（均衡各 loss 量级）：
+# v45 = v44 + three loss weight adjustments (balance loss magnitudes):
 #
-# v44 各 loss 加权贡献（ep0 step 10-50）：
-#   warp_seg 54%、entropy 28%、flow_cosine 16%、
-#   bilateral_ce 2.2%、dino 1.3%、distill 0.1%
+# v44 weighted loss contributions (ep0 steps 10-50):
+#   warp_seg 54%, entropy 28%, flow_cosine 16%,
+#   bilateral_ce 2.2%, dino 1.3%, distill 0.1%
 #
-# 调整（三项 loss 权重 ×10）：
-#   1. w_flow_bilateral_ce: 2.0 → 5.0（~2.2% → ~5.5%）
-#   2. w_dino:              0.5 → 5.0（~1.3% → ~13%）
-#   3. w_deform:            0.5 → 5.0（deform 奖励 ~-0.6% → ~-6%）
+# Adjustments (three loss weights ×10):
+#   1. w_flow_bilateral_ce: 2.0 → 5.0 (~2.2% → ~5.5%)
+#   2. w_dino:              0.5 → 5.0 (~1.3% → ~13%)
+#   3. w_deform:            0.5 → 5.0 (deform reward ~-0.6% → ~-6%)
 #
-# 其余设置与 v44 完全相同（dino_channels=[1]、one_sided distill w=5.0 等）。
-# 从 v9 checkpoint 出发。
+# All other settings identical to v44 (dino_channels=[1], one_sided distill w=5.0, etc.).
+# Starting from v9 checkpoint.
 
 batch_size: 8
 val_batch_size: 1
@@ -55,12 +55,13 @@ loss_log_interval: 10
 log_interval: 100
 
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch1 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [1]
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
 test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
@@ -81,7 +82,7 @@ test_dataset_kwargs:
   split: ImageSets/val.txt
   zero_ann: false
 
-# ── 逐 epoch 双 val（main_tissue.py 读取；tissue val 自动排除 instrument ch1）──
+# ── Per-epoch dual val (read by main_tissue.py; tissue val auto-excludes instrument ch1) ──
 val_dataset_list:
   - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
     split: ImageSets/val.txt
@@ -151,7 +152,7 @@ model_kwargs:
 
   w_rigid_tissue: 0.0
 
-  # ── 借鉴 v18：flow_cosine 做 channel 分化 + 边界粗对齐 ─────────────────────
+  # ── From v18: flow_cosine for channel differentiation + coarse boundary alignment ─────────────────────
   w_flow_cosine: 0.5
   flow_cosine_temperature: 0.5
   flow_cosine_diversity: 0.5
@@ -177,7 +178,7 @@ model_kwargs:
   flow_boundary_tv_var_window: 13
   flow_boundary_tv_alpha: 1.0
 
-  # ── 核心：flow-guided bilateral 自训练 CE（边界精修，微调更锐更远）─────────
+  # ── Core: flow-guided bilateral self-training CE (boundary refinement, sharper and farther) ─────────
   w_flow_bilateral_ce: 5.0
   flow_bilateral_window: 15
   flow_bilateral_sigma: 0.3
@@ -185,7 +186,7 @@ model_kwargs:
   reset_non_instrument_heads: false
   reset_full_decode_head: false
 
-  # ── v44：one_sided distill（只防 dropout，允许超越 teacher）+ DINO ch1 锚点 ──
+  # ── v44: one_sided distill (prevent dropout only, allow exceeding teacher) + DINO ch1 anchor ──
   w_distill:    5.0
   distill_mode: one_sided
   teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt

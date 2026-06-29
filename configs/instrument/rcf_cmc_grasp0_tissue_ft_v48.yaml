@@ -1,19 +1,19 @@
 # rcf_cmc_grasp0_tissue_ft_v48.yaml
 #
-# v48 = v47 - 四项 loss 全关（极简对照组）：
+# v48 = v47 with four losses disabled (minimal ablation):
 #
-# 诊断 v46/v47：
-#   - bilateral_ce 对 ch1 梯度为零（sub-softmax 抵消），不是元凶
-#   - deform(w=1.0)：奖励非器械通道形变，softmax 竞争下主动压低 ch1
-#   - entropy(w=5.0)：ch1 一旦下滑即加速放大（正反馈）
-#   - flow_cosine：main term sub-softmax 零梯度，diversity term 有小量间接梯度
-#   - distill：两版都未能对抗 deform+entropy 的合力
+# Diagnosis of v46/v47:
+#   - bilateral_ce has zero gradient on ch1 (sub-softmax cancellation), not the culprit
+#   - deform (w=1.0): rewards non-instrument channel deformation; under softmax competition actively suppresses ch1
+#   - entropy (w=5.0): once ch1 drops, amplifies the drop (positive feedback)
+#   - flow_cosine: main term has zero gradient via sub-softmax; diversity term has small indirect gradient
+#   - distill: neither version can counteract the combined effect of deform+entropy
 #
-# v48 策略：关掉所有对 ch1 有负面梯度或无效保护的 loss，
-#   只保留 warp_seg（重建）+ DINO（ch1外观锚点）+ bilateral_ce（tissue精修）
-#   观察 ch1 是否能靠 warp_seg 的流场信号自然维持。
+# v48 strategy: disable all losses with negative gradients on ch1 or ineffective protection;
+#   keep only warp_seg (reconstruction) + DINO (ch1 appearance anchor) + bilateral_ce (tissue refinement)
+#   Observe whether ch1 can be naturally maintained by warp_seg's flow signal.
 #
-# 关掉：
+# Disabled:
 #   w_entropy:      5.0 → 0.0
 #   w_flow_cosine:  0.5 → 0.0
 #   w_deform:       1.0 → 0.0

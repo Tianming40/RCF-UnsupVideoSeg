@@ -1,20 +1,20 @@
 # rcf_cmc_grasp0_tissue_ft_v56.yaml
 #
-# v56 = v53 基础上加入光流特征指导分割头（use_flow_feat）
+# v56 = v53 with optical flow feature guidance for the segmentation head (use_flow_feat)
 #
-# 改动（相对 v53）：
+# Changes (vs v53):
 #   decode_head2.use_flow_feat: true
-#     训练时：从 gt 前向光流提取 flow_feat [B*I, 64, 96, 96]（.detach()）
-#             以 flow_drop_p=0.5 随机指导 fused += flow_proj(flow_feat)
-#     验证/测试：flow_feat=None，此分支直接跳过，与 v53 推理完全相同
+#     Training: extract flow_feat [B*I, 64, 96, 96] from GT forward flow (.detach())
+#               with flow_drop_p=0.5, randomly guide fused += flow_proj(flow_feat)
+#     Val/test: flow_feat=None, this branch is skipped; inference identical to v53
 #
 #   decode_head2.flow_drop_p: 0.5
-#     50% 的训练步骤随机 drop 光流指导，消除 train/val gap
+#     randomly drops flow guidance in 50% of training steps to eliminate train/val gap
 #
-# 其余与 v53 完全相同：
-#   grasp0(379)+grasp10(601)，MultiScaleSegHead，mask_size=96×96，w_dino=0.1
+# Everything else identical to v53:
+#   grasp0(379)+grasp10(601), MultiScaleSegHead, mask_size=96×96, w_dino=0.1
 #
-# 新增参数量：+16.9K（flow_proj: 1×1 conv 64→256 + BN）
+# Added parameters: +16.9K (flow_proj: 1×1 conv 64→256 + BN)
 
 batch_size: 8
 val_batch_size: 1
@@ -227,9 +227,9 @@ model_kwargs:
     fuse_dilation: 6
     dropout_ratio: 0.1
     align_corners: false
-    use_flow_feat: true          # ← v56 新增：光流指导分割头
-    flow_in_channels: 64         # 与 num_flow_feat_channels 对齐
-    flow_drop_p: 0.5             # 训练时 50% 概率 drop，消除 train/val gap
+    use_flow_feat: true          # ← v56 new: optical flow guidance for segmentation head
+    flow_in_channels: 64         # aligned with num_flow_feat_channels
+    flow_drop_p: 0.5             # 50% drop probability during training to eliminate train/val gap
 
   decode_head3:
     concat_input: false

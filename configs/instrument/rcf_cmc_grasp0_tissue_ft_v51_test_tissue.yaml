@@ -1,11 +1,11 @@
 # rcf_cmc_grasp0_tissue_ft_v51_test_tissue.yaml
 #
 # TEST-ONLY config for tissue eval for v51.
-# v51 instrument 在 ch4，所以 oracle 排除 ch4（而非 ch1）。
+# v51 instrument is in ch4, so oracle excludes ch4 (not ch1).
 #   oracle_exclude_channels: [4]
-#   instrument_channels: []  (与 v51 训练 config 一致)
+#   instrument_channels: []  (consistent with v51 training config)
 #
-# 运行：
+# Run:
 #   python main_tissue.py \
 #     configs/instrument/rcf_cmc_grasp0_tissue_ft_v51_test_tissue.yaml \
 #     --test \
@@ -44,12 +44,13 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-# object_channel: null → 触发 per-frame greedy union oracle (main.py 467-505)
-# 模型非语义：tissue 可能落在 ch2 / ch3 / ch3+4，每帧贪婪搜索哪些 channel 是
-# tissue 并合并，用合并 mask 算 IoU。每帧独立 seq → per-seq oracle = per-frame。
+# object_channel: null → triggers per-frame greedy union oracle (main.py 467-505)
+# Model is non-semantic: tissue may fall in ch2 / ch3 / ch3+4; greedily search each frame for
+# tissue channels and merge them; compute IoU on merged mask. Each frame is an independent seq
+# → per-seq oracle = per-frame.
 object_channel: null
 set_object_channel_after_epoch: 0
-# tissue 评估：贪心 union 排除 instrument ch1，避免器械区域被并进 tissue
+# Tissue eval: greedy union excludes instrument ch4 to avoid instrument region being merged into tissue
 oracle_exclude_channels: [4]
 
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced

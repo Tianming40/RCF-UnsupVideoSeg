@@ -1,8 +1,8 @@
 # rcf_cmc_grasp0_tissue_ft_v52_test_instrument.yaml
 #
-# TEST-ONLY config for instrument (ch1) IoU — v52 架构（MultiScaleSegHead, mask_size=96）
+# TEST-ONLY config for instrument (ch1) IoU — v52 architecture (MultiScaleSegHead, mask_size=96)
 #   test_data_path -> eval_instrument
-#   object_channel -> 1（固定 ch1，不用 oracle）
+#   object_channel -> 1 (fixed ch1, no oracle)
 #   eval_save      -> true
 
 batch_size: 1

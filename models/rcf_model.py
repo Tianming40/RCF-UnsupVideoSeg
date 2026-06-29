@@ -17,6 +17,9 @@ from .flow_aggregation_head_with_residual import FlowAggregationHeadWithResidual
 from .fcn_head import FCNHead
 from .compactness_head import CompactnessHead
 from .crf_head import CRFHead
+from .multi_scale_seg_head import MultiScaleSegHead
+from .unet_seg_head import UNetSegHead
+from .unet_seg_head_v2 import UNetSegHeadV2
 
 from copy import deepcopy
 
@@ -218,11 +221,30 @@ class RCFModel(nn.Module):
     def init_weights(self):
         self.backbone2.init_weights()
 
-    def _decode_head_forward(self, x, decode_head):
+    def _decode_head_forward(self, x, decode_head, flow_feat=None):
         """Run forward function and calculate loss for decode head in
         training."""
-        pred = decode_head.forward(x)
+        if flow_feat is not None:
+            pred = decode_head.forward(x, flow_feat=flow_feat)
+        else:
+            pred = decode_head.forward(x)
         return pred
+
+    def _get_flow_feat_for_seg(self, gt_fw_flows, feat0_size, batch_size, im_num):
+        """从 gt 前向光流提取 flow_feat 用于指导分割头（训练专用）。
+
+        返回 [B*I, 64, H/4, W/4]，.detach() 切断梯度，
+        避免与 FlowAggHead 内部的 flow_feat_before_agg 梯度路径相互干扰。
+        """
+        # gt_fw_flows: [B, flow_num=1, 2, _h, _w]
+        gt_fw_flow = gt_fw_flows[:, 0]                       # [B, 2, _h, _w]
+        gt_fw_flow_small = self.resize(gt_fw_flow, feat0_size)  # [B, 2, H/4, W/4]
+        flow_feat = self.decode_head.flow_feat_before_agg(gt_fw_flow_small).detach()
+        # [B, 64, H/4, W/4] → [B*I, 64, H/4, W/4]（每帧复用同一对帧的光流特征）
+        flow_feat = (flow_feat.unsqueeze(1)
+                     .expand(-1, im_num, -1, -1, -1)
+                     .reshape(batch_size * im_num, *flow_feat.shape[1:]))
+        return flow_feat
 
     def numpy_to_tensor(self, flowrgb):
         output = torch.from_numpy(flowrgb).cuda()
@@ -475,8 +497,14 @@ class RCFModel(nn.Module):
         img_3 = imgs.view(batch_size * im_num, num_channels, _h, _w)
         # [B * I, 256, 96, 96], [B * I, 512, 48, 48], [B * I, 1024, 48, 48], [B * I, 2048, 48, 48]
         all_feat = self.extract_feat(img_3, self.backbone2)
+        # 光流指导分割头（仅当 decode_head2 开启 use_flow_feat 时生效）
+        _flow_feat = None
+        if getattr(self.decode_head2, 'use_flow_feat', False):
+            _flow_feat = self._get_flow_feat_for_seg(
+                gt_fw_flows, all_feat[0].shape[-2:], batch_size, im_num)
+
         # [B * I, C=5, 48, 48]
-        all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2)
+        all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2, flow_feat=_flow_feat)
         if self.allow_mask_resize and (all_pred_mask.shape[-2:] != self.mask_size):
             all_pred_mask = self.resize(all_pred_mask, self.mask_size)
         # Change view in the feature: pass in the last feature map only

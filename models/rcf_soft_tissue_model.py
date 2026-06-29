@@ -36,6 +36,7 @@ import math
 from typing import Optional
 
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -58,72 +59,98 @@ from .tissue_role_loss import (
 import utils
 logger = utils.get_logger()
 
+_cluster_ce_call_count = 0  # for periodic debug logging
 
-def _gpu_kmeans(pts: torch.Tensor, K: int, n_iter: int = 10) -> torch.Tensor:
-    """Euclidean K-means on globally-normalised flow vectors, fully on GPU.
 
-    pts are in [-1,1]^2 (flow / scene_max_magnitude), matching the 2-D space
-    that flow_to_color uses to assign colours.  Clusters in this space therefore
-    correspond directly to the colour blocks visible in the RAFT visualisation.
+def _gpu_kmeans(pts: torch.Tensor, K: int, max_iter: int = 300) -> torch.Tensor:
+    """K-means++ init + EM until convergence on GPU.
 
-    Data-adaptive init (deterministic):
-      centroid 0  — mean of near-zero pixels (background, appears white in viz)
-      centroids 1..K-1 — mean of pixels inside each of K-1 equal angular sectors,
-                         covering the full 360° direction wheel.  This places
-                         each initial centroid where the actual data lives in that
-                         directional band rather than at a fixed radius of 0.5.
+    pts can be any D-dimensional feature vector (e.g. 2-D normalised flow,
+    or 5-D joint flow+HSV).  K-means++ seeding gives better initialisation
+    than a fixed ring and typically converges in <50 iterations.
 
     Args:
-        pts    : (M, 2) globally-normalised flow vectors
-        K      : number of clusters
-        n_iter : EM iterations
+        pts      : (M, D) feature vectors
+        K        : number of clusters
+        max_iter : maximum EM steps (stops early if labels stop changing)
 
     Returns:
         labels (M,) int64, values in [0, K-1]
     """
-    M, _  = pts.shape
+    M, _   = pts.shape
     device = pts.device
-    eps    = 1e-6
 
-    r     = pts.norm(dim=1)                              # [M] per-pixel magnitude
-    r_max = r.max().clamp(min=eps)
+    # ── k-means++ init ────────────────────────────────────────────────────────
+    first = torch.randint(M, (1,), device=device).item()
+    centroids = [pts[first]]
+    for _ in range(K - 1):
+        c   = torch.stack(centroids)                               # [k, D]
+        d2  = (pts.unsqueeze(1) - c.unsqueeze(0)).norm(dim=2).min(dim=1).values ** 2
+        idx = torch.multinomial(d2 / d2.sum(), 1).item()
+        centroids.append(pts[idx])
+    centroids = torch.stack(centroids)                             # [K, D]
 
-    # centroid 0: background (near-zero flow → white/grey in flow_to_color)
-    bg_mask = r < 0.05 * r_max
-    c0 = pts[bg_mask].mean(0) if bg_mask.any() else pts.new_zeros(2)
-
-    # centroids 1..K-1: one per equal angular sector of the direction wheel
-    n_dir  = max(K - 1, 1)
-    sector = 2.0 * math.pi / n_dir
-    theta  = torch.atan2(pts[:, 1], pts[:, 0])          # [M], range [-π, π]
-    rest_c = []
-    for k in range(n_dir):
-        angle_k = -math.pi + (k + 0.5) * sector
-        diff    = theta - angle_k
-        # wrap angular distance to [-π, π]
-        diff    = diff - (2.0 * math.pi) * torch.round(diff / (2.0 * math.pi))
-        in_sec  = diff.abs() < sector * 0.5
-        if in_sec.any():
-            rest_c.append(pts[in_sec].mean(0))
-        else:
-            # no data in this sector: place at median radius along sector centre
-            med_r = r.median()
-            rest_c.append(pts.new_tensor([
-                med_r.item() * math.cos(angle_k),
-                med_r.item() * math.sin(angle_k),
-            ]))
-    centroids = torch.stack([c0] + rest_c)               # [K, 2]
-
-    # EM iterations
+    # ── EM until convergence ──────────────────────────────────────────────────
     labels = pts.new_zeros(M, dtype=torch.long)
-    for _ in range(n_iter):
-        dists     = (pts.unsqueeze(1) - centroids.unsqueeze(0)).norm(dim=2)  # [M, K]
-        labels    = dists.argmin(dim=1)                                       # [M]
+    for _ in range(max_iter):
+        dists      = (pts.unsqueeze(1) - centroids.unsqueeze(0)).norm(dim=2)  # [M, K]
+        new_labels = dists.argmin(dim=1)                                       # [M]
+        if (new_labels == labels).all():
+            break
+        labels    = new_labels
         one_hot   = pts.new_zeros(M, K).scatter_(1, labels.unsqueeze(1), 1.0)
         counts    = one_hot.sum(0).clamp(min=1)
         centroids = (one_hot.T @ pts) / counts.unsqueeze(1)
 
     return labels
+
+
+def _rgb_to_hsv_features(img_bchw: torch.Tensor) -> torch.Tensor:
+    """RGB image → circular-hue + saturation features.
+
+    Args:
+        img_bchw : [B, 3, H, W] float in [0, 1] or [0, 255]
+
+    Returns:
+        [B, H*W, 3] — (cos(2π·h), sin(2π·h), s), all in [-1, 1]
+    """
+    img = img_bchw.float()
+    if img.max() > 2.0:
+        img = img / 255.0
+    eps = 1e-6
+    r, g, b = img[:, 0], img[:, 1], img[:, 2]
+    max_c = img.max(dim=1).values
+    delta = (max_c - img.min(dim=1).values).clamp(min=eps)
+
+    h = torch.zeros_like(r)
+    mask_r = (max_c == r)
+    mask_g = (max_c == g) & ~mask_r
+    mask_b = ~mask_r & ~mask_g
+    h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6
+    h[mask_g] =  (b[mask_g] - r[mask_g]) / delta[mask_g] + 2
+    h[mask_b] =  (r[mask_b] - g[mask_b]) / delta[mask_b] + 4
+    h = h / 6.0 * 2.0 * math.pi                                   # [0, 2π]
+    s = delta / max_c.clamp(min=eps) * (max_c > eps).float()
+
+    B, H, W = h.shape
+    feats = torch.stack([torch.cos(h), torch.sin(h), s], dim=1)   # [B, 3, H, W]
+    return feats.reshape(B, 3, H * W).permute(0, 2, 1)            # [B, N, 3]
+
+
+def _sinkhorn(log_alpha: torch.Tensor, n_iter: int = 20) -> torch.Tensor:
+    """Sinkhorn row/column normalisation in log space → doubly-stochastic matrix.
+
+    Args:
+        log_alpha : [R, C] unnormalised log assignment matrix (e.g. P / temperature)
+        n_iter    : alternating normalisation steps (20 is enough for sharp results)
+
+    Returns:
+        [R, C] doubly-stochastic matrix (row sums ≈ 1, col sums ≈ 1)
+    """
+    for _ in range(n_iter):
+        log_alpha = log_alpha - log_alpha.logsumexp(dim=1, keepdim=True)
+        log_alpha = log_alpha - log_alpha.logsumexp(dim=0, keepdim=True)
+    return log_alpha.exp()
 
 
 def flow_cluster_tv_loss(
@@ -200,10 +227,12 @@ def flow_cluster_ce_loss(
     flow: torch.Tensor,
     instrument_channels: list,
     K: int = 5,
-    n_iter: int = 10,
+    max_iter: int = 300,
     temperature: float = 0.5,
     instrument_mask: torch.Tensor | None = None,
     diversity_weight: float = 0.0,
+    image: torch.Tensor | None = None,
+    color_weight: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """K-means color-block CE loss for non-instrument channels.
@@ -233,6 +262,10 @@ def flow_cluster_ce_loss(
                             space (same role as flow_cosine_diversity)
         eps               : numerical stability
     """
+    global _cluster_ce_call_count
+    _cluster_ce_call_count += 1
+    do_debug = (_cluster_ce_call_count % 150 == 1)  # print once every ~150 batches
+
     B, C, H, W = masks.shape
     non_inst = [c for c in range(C) if c not in instrument_channels]
     K_ch     = len(non_inst)
@@ -255,38 +288,93 @@ def flow_cluster_ce_loss(
     total_ce  = torch.tensor(0.0, device=masks.device)
     total_div = torch.tensor(0.0, device=masks.device)
     n_pairs   = K_ch * (K_ch - 1) // 2
+    lmap_vis  = None  # cluster label map for b=0, returned for visualization
 
     for b in range(B):
-        flow_b  = flow[b]                                    # [2, H, W]
-        rad_max = flow_b.norm(dim=0).max().clamp(min=eps)
-        pts     = (flow_b / rad_max).permute(1, 2, 0).reshape(H * W, 2)
+        flow_b     = flow[b]                                 # [2, H, W]
+        flow_mag_px = flow_b.norm(dim=0, keepdim=True).clamp(min=eps)
+        # Unit-direction vectors: cluster boundaries align with RAFT hue blocks
+        pts = (flow_b / flow_mag_px).permute(1, 2, 0).reshape(H * W, 2)
 
         with torch.no_grad():
-            labels = _gpu_kmeans(pts, K=K, n_iter=n_iter)   # [H*W]
+            # Color features removed: they introduce image-texture bias and
+            # break alignment with the RAFT flow visualization.
+            pts_joint = pts
+            labels = _gpu_kmeans(pts_joint, K=K, max_iter=max_iter)  # [H*W]
+            # Re-label clusters by ascending flow magnitude so that cluster 0
+            # always = most-static (background) and cluster K-1 = most-moving
+            # (instrument).  Without this, k-means++ random init permutes the
+            # cluster IDs per image → Sinkhorn assigns the same channel to
+            # opposite motion types across batches → gradients cancel → gray mask.
+            oh_s   = pts.new_zeros(H * W, K).scatter_(1, labels.unsqueeze(1), 1.0)
+            flow_c = (oh_s.T @ pts) / oh_s.sum(0).clamp(min=1).unsqueeze(1)  # [K, 2]
+            norms  = flow_c.norm(dim=1)                                        # [K]
+            order  = norms.argsort()                                           # ascending
+            remap  = torch.zeros(K, dtype=torch.long, device=pts.device)
+            remap[order] = torch.arange(K, device=pts.device)
+            labels = remap[labels]
+            if do_debug and b == 0:
+                sizes = oh_s.sum(0)[order].long()                              # sorted sizes
+                logger.info(
+                    f"[cluster_ce #{_cluster_ce_call_count}] "
+                    f"flow norms (sorted): {norms[order].tolist()} "
+                    f"cluster sizes: {sizes.tolist()} "
+                    f"assign: cluster0(static)->dummy, "
+                    + ", ".join(f"cluster{k+1}->ch{non_inst[k]}" for k in range(K_ch))
+                )
         lmap = labels.reshape(H, W)                          # [H, W]
+        if b == 0:
+            lmap_vis = lmap.detach().cpu()
 
         pw      = pixel_w[b]                                 # [H, W]
         w_total = pw.sum() + eps
 
         # ── affinity matrix P[K_ch, K] ───────────────────────────────────────
-        # For each (channel, cluster): weighted mean of channel mask in cluster.
-        # one-hot cluster labels → [K, H*W]
+        # P[ci, k] = weighted-mean of channel ci's mask over cluster-k pixels.
         oh_flat = F.one_hot(labels, K).float().T             # [K, H*W]
-        # cluster-weighted pixel weights → [K, H*W]
         cw_flat = oh_flat * pw.reshape(1, H * W)             # [K, H*W]
         denom   = cw_flat.sum(dim=1).clamp(min=eps)          # [K]
-        # P[K_ch, K] = student_flat @ cw_flat.T / denom  (detached for target)
         s_flat  = student[b].detach().reshape(K_ch, H * W)
         P       = (s_flat @ cw_flat.T) / denom.unsqueeze(0)  # [K_ch, K]
 
-        # ── soft assignment: channels compete per cluster (softmax over K_ch) ─
-        A = F.softmax(P / temperature, dim=0).detach()       # [K_ch, K]
+        # ── Fixed direct assignment (canonical sort → direct map) ────────────
+        # After sorting clusters by flow magnitude (cluster 0 = most static,
+        # cluster K-1 = most moving), assign each non-instrument channel to
+        # the cluster with the matching rank, skipping cluster 0 (static):
+        #
+        #   cluster 0 (static) → dummy   (pixel_w ≈ 0 anyway; no signal lost)
+        #   cluster 1          → non_inst[0]
+        #   cluster 2          → non_inst[1]
+        #   ...
+        #   cluster K_ch       → non_inst[K_ch-1]
+        #
+        # This is completely independent of the current mask state (no P
+        # needed), so the CE target is stable from the very first batch and
+        # gradients accumulate consistently instead of cancelling.
+        with torch.no_grad():
+            A_noi = P.new_zeros(K_ch, K)
+            for k in range(K_ch):
+                A_noi[k, k + 1] = 1.0                            # [K_ch, K]
 
-        # ── pixel-level CE targets from cluster assignment ───────────────────
-        target   = A[:, lmap]                                 # [K_ch, H, W]
-        log_s    = torch.log(student[b] + eps)                # [K_ch, H, W]
-        ce       = -(target * log_s).sum(dim=0)               # [H, W]
-        total_ce = total_ce + (ce * pw / w_total).sum()
+        # ── pixel-level CE with one-hot targets ──────────────────────────────
+        target   = A_noi[:, lmap]                                # [K_ch, H, W]
+        log_s    = torch.log(student[b] + eps)                   # [K_ch, H, W]
+        ce       = -(target * log_s).sum(dim=0)                  # [H, W]
+        batch_ce = (ce * pw / w_total).sum()
+        total_ce = total_ce + batch_ce
+        if do_debug and b == 0:
+            with torch.no_grad():
+                # per-channel: what is the student probability at assigned pixels?
+                ch_probs = []
+                for k in range(K_ch):
+                    mask_k = (lmap == k + 1)                     # pixels for cluster k+1
+                    if mask_k.sum() > 0:
+                        ch_probs.append(f"ch{non_inst[k]}@cl{k+1}={student[b,k][mask_k].mean():.3f}")
+                logger.info(
+                    f"[cluster_ce #{_cluster_ce_call_count}] "
+                    f"ce={batch_ce.item():.4f}  "
+                    f"student probs: {' '.join(ch_probs)}"
+                )
 
         # ── diversity: push channel mean flow directions apart ───────────────
         # Uses mu-based approach (same as flow_cosine_diversity): gradient
@@ -310,11 +398,267 @@ def flow_cluster_ce_loss(
 
     total_ce  = total_ce  / B
     total_div = total_div / B
-    return total_ce + diversity_weight * total_div
+    return total_ce + diversity_weight * total_div, lmap_vis
+
+
+_flow_angle_ce_call_count = 0
+
+def flow_angle_ce_loss(
+    masks: torch.Tensor,
+    flow: torch.Tensor,
+    instrument_channels: list,
+    instrument_mask: torch.Tensor | None = None,
+    diversity_weight: float = 0.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Direct flow-angle CE loss — replaces k-means with atan2 sector partition.
+
+    Divides [-pi, pi] into K_ch equal sectors (K_ch = number of non-instrument
+    channels).  Each sector maps to one non-instrument channel.  This directly
+    mirrors the RAFT flow visualisation hue, so sector boundaries = color-block
+    boundaries in the gt_flow image.
+
+    No k-means, no dummy cluster, fully deterministic and consistent across batches.
+    Static pixels are suppressed via pixel_w = non_inst_w * flow_mag.
+    """
+    global _flow_angle_ce_call_count
+    _flow_angle_ce_call_count += 1
+    do_debug = (_flow_angle_ce_call_count % 150 == 1)
+
+    B, C, H, W = masks.shape
+    non_inst = [c for c in range(C) if c not in instrument_channels]
+    K_ch = len(non_inst)
+
+    # instrument + static pixel suppression
+    if instrument_mask is not None:
+        inst_w = instrument_mask.detach().clamp(0, 1)
+    else:
+        inst_w = sum(masks[:, c] for c in instrument_channels).clamp(0, 1).detach()
+    non_inst_w = 1.0 - inst_w                               # [B, H, W]
+    flow_mag   = flow.norm(dim=1)                            # [B, H, W]
+    pixel_w    = non_inst_w * flow_mag                       # [B, H, W]
+
+    # non-instrument student masks, re-normalised
+    student = torch.stack([masks[:, c] for c in non_inst], dim=1)  # [B, K_ch, H, W]
+    student = student / (student.sum(dim=1, keepdim=True) + eps)
+
+    # angle → sector label (deterministic, independent of mask state)
+    # atan2 range [-pi, pi] → mapped to [0, K_ch) uniformly
+    with torch.no_grad():
+        angle  = torch.atan2(flow[:, 1], flow[:, 0])                     # [B, H, W]
+        sector = ((angle + math.pi) / (2 * math.pi) * K_ch).long()      # [B, H, W]
+        sector = sector.clamp(0, K_ch - 1)
+
+    total_ce  = torch.tensor(0.0, device=masks.device)
+    total_div = torch.tensor(0.0, device=masks.device)
+    n_pairs   = K_ch * (K_ch - 1) // 2
+
+    for b in range(B):
+        pw      = pixel_w[b]                                 # [H, W]
+        w_total = pw.sum() + eps
+        lmap    = sector[b]                                  # [H, W], values 0..K_ch-1
+
+        # one-hot CE: non_inst[k] should activate where sector==k
+        target = F.one_hot(lmap, K_ch).permute(2, 0, 1).float()  # [K_ch, H, W]
+        log_s  = torch.log(student[b] + eps)                      # [K_ch, H, W]
+        ce     = -(target * log_s).sum(dim=0)                     # [H, W]
+        batch_ce = (ce * pw / w_total).sum()
+        total_ce = total_ce + batch_ce
+
+        if do_debug and b == 0:
+            with torch.no_grad():
+                ch_probs = []
+                for k in range(K_ch):
+                    mask_k = (lmap == k)
+                    if mask_k.sum() > 0:
+                        ch_probs.append(
+                            f"ch{non_inst[k]}@sec{k}={student[b,k][mask_k].mean():.3f}"
+                            f"(n={mask_k.sum().item()})"
+                        )
+                logger.info(
+                    f"[angle_ce #{_flow_angle_ce_call_count}] "
+                    f"ce={batch_ce.item():.4f}  {' '.join(ch_probs)}"
+                )
+
+        if diversity_weight > 0 and n_pairs > 0:
+            flow_dir = flow[b] / (flow_mag[b].unsqueeze(0) + eps)  # [2, H, W]
+            mu_list  = []
+            for ci in range(K_ch):
+                m  = student[b, ci] * pixel_w[b]
+                w  = m.sum() + eps
+                mu = torch.stack([(flow_dir[0] * m).sum() / w,
+                                  (flow_dir[1] * m).sum() / w])
+                mu_list.append(mu / (mu.norm() + eps))
+            div_b = sum(
+                (mu_list[i] * mu_list[j]).sum()
+                for i in range(K_ch) for j in range(i + 1, K_ch)
+            ) / n_pairs
+            total_div = total_div + div_b
+
+    return (total_ce + diversity_weight * total_div) / B
+
+
+def flow_boundary_tv_loss(
+    masks: torch.Tensor,
+    flow: torch.Tensor,
+    instrument_channels: list,
+    var_window: int = 13,
+    alpha: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Edge-aware smoothness loss (Monodepth2 style).
+
+    Penalise mask gradient weighted by exp(-alpha * |∇flow|):
+      - At flow edges  (large |∇flow|): weight ≈ 0 → mask boundary allowed
+      - In smooth flow (small |∇flow|): weight ≈ 1 → mask boundary penalised
+
+    Loss decreases as mask boundaries migrate to flow edge locations.
+    """
+    B, C, H, W = masks.shape
+    non_inst = [c for c in range(C) if c not in instrument_channels]
+
+    # flow assumed already at mask resolution [B, 2, H, W]
+    # edge-aware smoothness (Monodepth2, get_smooth_loss), verbatim form:
+    #   |∂mask| * exp(-|∂flow|), averaged over all pixels
+    grad_fx = (flow[:, :, :, 1:] - flow[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)  # [B,1,H,W-1]
+    grad_fy = (flow[:, :, 1:, :] - flow[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)  # [B,1,H-1,W]
+    wx = (-alpha * grad_fx).exp()   # ~1 smooth, ~0 at edge
+    wy = (-alpha * grad_fy).exp()
+
+    loss = torch.tensor(0.0, device=masks.device)
+    for c in non_inst:
+        m  = masks[:, c:c + 1]
+        gx = (m[:, :, :, 1:] - m[:, :, :, :-1]).abs()
+        gy = (m[:, :, 1:, :] - m[:, :, :-1, :]).abs()
+        loss = loss + (gx * wx).mean() + (gy * wy).mean()
+
+    return loss / len(non_inst)
+
+
+_bilateral_ce_call_count = 0
+
+def flow_bilateral_ce_loss(
+    masks: torch.Tensor,
+    flow: torch.Tensor,
+    instrument_channels: list,
+    window: int = 7,
+    sigma: float = 0.5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Flow-guided bilateral self-training CE — boundary alignment without graying.
+
+    Two decoupled jobs:
+      • "who owns this region"  ← current mask argmax (STABLE; never re-assigns
+        a channel, so the graying that k-means CE caused cannot happen).
+      • "where the boundary is"  ← bilateral vote: each pixel's target label is
+        the flow-similarity-weighted vote of its neighbours' argmax labels.
+
+    Mechanism:
+      - Flow-smooth region: bilateral kernel ≈ 1 everywhere → votes cross freely
+        → a spurious mask boundary sitting in smooth flow gets out-voted and
+        erased (target becomes uniform there).
+      - Flow edge: kernel → 0 across the flow discontinuity → the vote is cut
+        exactly at the flow edge → the target's class boundary lands on the flow
+        edge.  A mask boundary offset from the flow edge sits in a strip whose
+        flow matches one side → it is voted to that side → CE drags the mask
+        boundary onto the flow edge.
+
+    Target is detached and built from argmax, so CE also pushes the mask toward
+    one-hot (anti-gray), and there is no per-frame channel shuffling.
+    """
+    global _bilateral_ce_call_count
+    _bilateral_ce_call_count += 1
+    do_debug = (_bilateral_ce_call_count % 50 == 1)
+
+    B, C, H, W = masks.shape
+    non_inst = [c for c in range(C) if c not in instrument_channels]
+    K = len(non_inst)
+    r = window // 2
+
+    student = torch.stack([masks[:, c] for c in non_inst], dim=1)   # [B, K, H, W]
+    student = student / (student.sum(dim=1, keepdim=True) + eps)
+
+    with torch.no_grad():
+        # stable region identity = current argmax, as one-hot
+        L0     = student.argmax(dim=1)                              # [B, H, W]
+        onehot = F.one_hot(L0, K).permute(0, 3, 1, 2).float()      # [B, K, H, W]
+
+        # per-image flow normalisation so sigma is scale-invariant
+        flow_std = flow.flatten(2).std(dim=2).clamp(min=eps)       # [B, 2]
+        flow_n   = flow / flow_std[:, :, None, None]               # [B, 2, H, W]
+
+        oh_pad   = F.pad(onehot, (r, r, r, r), mode='replicate')
+        flow_pad = F.pad(flow_n, (r, r, r, r), mode='replicate')
+
+        votes  = torch.zeros_like(onehot)                          # [B, K, H, W]
+        wsum   = torch.zeros(B, 1, H, W, device=masks.device)
+        inv2s2 = 1.0 / (2.0 * sigma * sigma)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                oh_s = oh_pad[:, :, r + dy:r + dy + H, r + dx:r + dx + W]
+                fl_s = flow_pad[:, :, r + dy:r + dy + H, r + dx:r + dx + W]
+                fd   = ((flow_n - fl_s) ** 2).sum(dim=1, keepdim=True)  # [B, 1, H, W]
+                w    = torch.exp(-fd * inv2s2)
+                votes = votes + w * oh_s
+                wsum  = wsum + w
+        target = votes / (wsum + eps)                              # [B, K, H, W] soft label
+
+        if do_debug:
+            # how much did the bilateral vote actually move the labels?
+            tgt_lbl   = target.argmax(dim=1)                       # [B, H, W]
+            changed   = (tgt_lbl != L0).float().mean().item()      # frac of relabelled px
+            max_prob  = student.max(dim=1).values.mean().item()    # 1=sharp, 1/K=gray
+            # per-channel argmax occupancy (detect dead/dominant channels)
+            occ = [(L0 == k).float().mean().item() for k in range(K)]
+            logger.info(
+                f"[bilateral_ce #{_bilateral_ce_call_count}] "
+                f"relabelled={changed*100:.2f}%  mean_max_prob={max_prob:.3f}  "
+                f"argmax_occ={[f'{o:.2f}' for o in occ]}"
+            )
+
+    logp = torch.log(student + eps)
+    ce   = -(target * logp).sum(dim=1)                             # [B, H, W]
+    return ce.mean()
+
+
+def flow_angle_outside_loss(
+    non_inst_masks: torch.Tensor,
+    flow: torch.Tensor,
+    instrument_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Direct outside-sector penalty for each non-instrument channel.
+
+    non_inst_masks: [B, K_ch, H, W] — K_ch-way sub-softmax computed from raw logits
+        with ch1 excluded, so gradient never touches ch1.
+    Loss = weighted mean of channel k's activation on pixels OUTSIDE sector k.
+    """
+    B, K_ch, H, W = non_inst_masks.shape
+
+    if instrument_mask is not None:
+        non_inst_w = 1.0 - instrument_mask.detach().clamp(0, 1)
+    else:
+        non_inst_w = torch.ones(B, H, W, device=non_inst_masks.device)
+
+    pixel_w = non_inst_w * flow.norm(dim=1)             # [B, H, W]
+
+    with torch.no_grad():
+        angle  = torch.atan2(flow[:, 1], flow[:, 0])   # [B, H, W]
+        sector = ((angle + math.pi) / (2 * math.pi) * K_ch).long().clamp(0, K_ch - 1)
+
+    w_total = pixel_w.sum() / B + eps
+    total   = torch.tensor(0.0, device=non_inst_masks.device)
+    for k in range(K_ch):
+        outside = (sector != k).float()
+        penalty = (non_inst_masks[:, k] * outside * pixel_w).sum() / w_total
+        total   = total + penalty
+
+    return total / K_ch
 
 
 _DINO_ONLY_KWARGS = frozenset({
     'dino_arch', 'dino_patch_size', 'dino_checkpoint', 'dino_input_size', 'w_dino',
+    'dino_channels',
 })
 
 
@@ -387,9 +731,24 @@ class RCFSoftTissueModel(RCFDinoModel):
         flow_tv_push_margin: float = 0.3,  # hinge margin for cross-cluster push
         # ── V16 flow-cluster CE loss (default off) ────────────────────────
         w_flow_cluster_ce: float = 0.0,
-        flow_cluster_ce_temperature: float = 0.3,   # lower = harder channel claiming
-        flow_cluster_ce_diversity: float = 0.5,     # push channels' cluster profiles apart
+        flow_cluster_ce_temperature: float = 0.3,
+        flow_cluster_ce_diversity: float = 0.5,
         flow_cluster_ce_start_epoch: int = 0,
+        flow_cluster_ce_max_iter: int = 300,        # k-means++ max EM iterations
+        flow_cluster_ce_color_weight: float = 0.0,  # >0 enables joint flow+HSV clustering
+        # ── V34 flow-angle CE loss (default off) ──────────────────────────
+        w_flow_angle_ce: float = 0.0,
+        flow_angle_ce_diversity: float = 0.0,
+        # ── flow-angle outside penalty (direct, no softmax) ───────────────
+        w_flow_angle_outside: float = 0.0,
+        # ── flow boundary TV loss ─────────────────────────────────────────
+        w_flow_boundary_tv: float = 0.0,
+        flow_boundary_tv_var_window: int = 13,
+        flow_boundary_tv_alpha: float = 1.0,
+        # ── flow-guided bilateral self-training CE (boundary alignment) ───
+        w_flow_bilateral_ce: float = 0.0,
+        flow_bilateral_window: int = 7,
+        flow_bilateral_sigma: float = 0.5,
         # ── backward compat with old configs ─────────────────────────────
         w_compact: float = 0.0,
         **kwargs,
@@ -444,11 +803,23 @@ class RCFSoftTissueModel(RCFDinoModel):
         self.flow_tv_push_margin = flow_tv_push_margin
         self._flow_tv_active     = (flow_tv_start_epoch == 0)  # active immediately if no delay
 
-        self.w_flow_cluster_ce           = w_flow_cluster_ce
-        self.flow_cluster_ce_temperature = flow_cluster_ce_temperature
-        self.flow_cluster_ce_diversity   = flow_cluster_ce_diversity
-        self.flow_cluster_ce_start_epoch = flow_cluster_ce_start_epoch
-        self._flow_cluster_ce_active     = (flow_cluster_ce_start_epoch == 0)
+        self.w_flow_cluster_ce             = w_flow_cluster_ce
+        self.flow_cluster_ce_temperature   = flow_cluster_ce_temperature
+        self.flow_cluster_ce_diversity     = flow_cluster_ce_diversity
+        self.flow_cluster_ce_start_epoch   = flow_cluster_ce_start_epoch
+        self.flow_cluster_ce_max_iter      = flow_cluster_ce_max_iter
+        self.flow_cluster_ce_color_weight  = flow_cluster_ce_color_weight
+        self._flow_cluster_ce_active       = (flow_cluster_ce_start_epoch == 0)
+
+        self.w_flow_angle_ce         = w_flow_angle_ce
+        self.flow_angle_ce_diversity = flow_angle_ce_diversity
+        self.w_flow_angle_outside    = w_flow_angle_outside
+        self.w_flow_boundary_tv          = w_flow_boundary_tv
+        self.flow_boundary_tv_var_window = flow_boundary_tv_var_window
+        self.flow_boundary_tv_alpha      = flow_boundary_tv_alpha
+        self.w_flow_bilateral_ce         = w_flow_bilateral_ce
+        self.flow_bilateral_window       = flow_bilateral_window
+        self.flow_bilateral_sigma        = flow_bilateral_sigma
 
         # per-batch state (set in forward, consumed in forward_train)
         self._batch_grasp_xy      = None
@@ -616,6 +987,10 @@ class RCFSoftTissueModel(RCFDinoModel):
         raw    = raw.view(B, I, C, *raw.shape[-2:])
         masks  = F.softmax(raw, dim=2)          # [B, I, C, Hm, Wm]
         masks0 = masks[:, 0]                    # [B, C, Hm, Wm]  frame-0
+
+        # 4-way sub-softmax over non-instrument channels only (ch1 truly excluded)
+        _non_inst = [c for c in range(C) if c not in self.instrument_channels]
+        masks0_non_inst = F.softmax(raw[:, 0][:, _non_inst], dim=1)  # [B, K, Hm, Wm]
 
         # ── forward flow at mask resolution ───────────────────────────────────
         flow = gt_fw_flows[:, 0]
@@ -792,16 +1167,88 @@ class RCFSoftTissueModel(RCFDinoModel):
         if self.w_flow_cluster_ce > 0 and self._flow_cluster_ce_active:
             t_inst_mask = (teacher_p[:, self.distill_channel]
                            if teacher_p is not None else None)
-            L = flow_cluster_ce_loss(
+            img0 = imgs[:, 0] if self.flow_cluster_ce_color_weight > 0 else None
+            L, lmap_vis = flow_cluster_ce_loss(
                 masks0, flow=flow_r,
                 instrument_channels=self.instrument_channels,
                 K=self.flow_tv_K,
-                n_iter=self.flow_tv_n_iter,
+                max_iter=self.flow_cluster_ce_max_iter,
                 temperature=self.flow_cluster_ce_temperature,
                 instrument_mask=t_inst_mask,
                 diversity_weight=self.flow_cluster_ce_diversity,
+                image=img0,
+                color_weight=self.flow_cluster_ce_color_weight,
             )
             losses['loss_flow_cluster_ce'] = L
             losses['loss'] = losses['loss'] + self.w_flow_cluster_ce * L
+
+            # ── cluster visualization ─────────────────────────────────────────
+            if lmap_vis is not None and (self.train_iter - 1) % self.log_interval == 0:
+                try:
+                    K_vis = self.flow_tv_K
+                    # fixed palette: gray=dummy, then red/green/blue/yellow/cyan
+                    palette = torch.tensor([
+                        [0.5, 0.5, 0.5],   # cluster 0 → dummy (static)
+                        [1.0, 0.2, 0.2],   # cluster 1 → ch0
+                        [0.2, 1.0, 0.2],   # cluster 2 → ch2
+                        [0.2, 0.2, 1.0],   # cluster 3 → ch3
+                        [1.0, 1.0, 0.2],   # cluster 4 → ch4
+                    ], dtype=torch.float32)                   # [K, 3]
+                    colored = palette[lmap_vis]               # [H, W, 3]
+                    colored = colored.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                    idx_in_batch = 0
+                    img_frame_id = paths[0][idx_in_batch].split('/')[-1][:-4]
+                    fn_cluster = '{}/train_iter{:07d}_{}_{}_{}_cluster.jpg'.format(
+                        self.save_dir, self.train_iter - 1,
+                        seq_names[idx_in_batch], seq_ids[idx_in_batch], img_frame_id,
+                    )
+                    torchvision.utils.save_image(colored, fn_cluster)
+                except Exception as e:
+                    logger.warn(f"cluster vis save failed: {e}")
+
+        # ── 15. L_flow_angle_ce ───────────────────────────────────────────────
+        if self.w_flow_angle_ce > 0:
+            t_inst_mask = (teacher_p[:, self.distill_channel]
+                           if teacher_p is not None else None)
+            L = flow_angle_ce_loss(
+                masks0, flow=flow_r,
+                instrument_channels=self.instrument_channels,
+                instrument_mask=t_inst_mask,
+                diversity_weight=self.flow_angle_ce_diversity,
+            )
+            losses['loss_flow_angle_ce'] = L
+            losses['loss'] = losses['loss'] + self.w_flow_angle_ce * L
+
+        # ── 16. L_flow_angle_outside ──────────────────────────────────────────
+        if self.w_flow_angle_outside > 0:
+            t_inst_mask = (teacher_p[:, self.distill_channel]
+                           if teacher_p is not None else None)
+            L = flow_angle_outside_loss(
+                masks0_non_inst, flow=flow_r,
+                instrument_mask=t_inst_mask,
+            )
+            losses['loss_flow_angle_outside'] = L
+            losses['loss'] = losses['loss'] + self.w_flow_angle_outside * L
+
+        # ── 17. L_flow_boundary_tv ────────────────────────────────────────────
+        if self.w_flow_boundary_tv > 0:
+            L = flow_boundary_tv_loss(
+                masks0, flow=flow_r,
+                instrument_channels=self.instrument_channels,
+                alpha=self.flow_boundary_tv_alpha,
+            )
+            losses['loss_flow_boundary_tv'] = L
+            losses['loss'] = losses['loss'] + self.w_flow_boundary_tv * L
+
+        # ── 18. L_flow_bilateral_ce ───────────────────────────────────────────
+        if self.w_flow_bilateral_ce > 0:
+            L = flow_bilateral_ce_loss(
+                masks0, flow=flow_r,
+                instrument_channels=self.instrument_channels,
+                window=self.flow_bilateral_window,
+                sigma=self.flow_bilateral_sigma,
+            )
+            losses['loss_flow_bilateral_ce'] = L
+            losses['loss'] = losses['loss'] + self.w_flow_bilateral_ce * L
 
         return losses

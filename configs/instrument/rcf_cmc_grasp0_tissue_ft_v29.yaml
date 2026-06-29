@@ -1,0 +1,254 @@
+# rcf_cmc_grasp0_tissue_ft_v29.yaml
+#
+# v29 = v28 + 直接固定分配 + 调整 loss 权重比例
+#
+#   v28 排序后仍用 Sinkhorn 读 P 做分配；P 在灰图时均匀 → 分配近随机。
+#
+#   v29 三处改动：
+#
+#   1. 直接固定分配（跳过 Sinkhorn）：
+#        cluster 0 (最静止) → dummy  (pixel_w≈0，丢掉没损失)
+#        cluster 1          → ch0
+#        cluster 2          → ch2
+#        cluster 3          → ch3
+#        cluster 4 (最快)   → ch4
+#      完全不依赖 P，梯度方向从第一个 batch 固定，彻底打破灰图吸引子。
+#
+#   2. w_entropy: 0.3 → 1.5
+#      原始 entropy≈1.22，权重 0.3 → 贡献只有 1.7%，无法有效压低 entropy。
+#      提高到 1.5 → 贡献升至 ~8%，能更有力地推动 mask 分化。
+#
+#   3. w_distill: 3.0 → 0.5
+#      distill loss 实际值约 0.002，权重 3.0 → 真实贡献 0.006（≈0%）。
+#      ch1 在训练开始时就已非常接近 teacher，3.0 权重在白白浪费。
+#      降到 0.5 不影响 ch1 保护，同时让其他 loss 比例更合理。
+#
+# Start: grasp10_ft_v9 checkpoint (same as v8–v28)
+
+batch_size: 8
+val_batch_size: 1
+epochs: 50
+learning_rate: 1.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v29
+pretrained_model: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: true
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: 1
+set_object_channel_after_epoch: 0
+
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/trainval.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/trainval_single.txt
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-6
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 1.5       # 0.3→1.5: 原来只占1.7%，提高后更有力压低entropy
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  # ── DINO (disabled) ───────────────────────────────────────────────────────
+  w_dino: 0.0
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  # ── Channel assignments ────────────────────────────────────────────────────
+  instrument_channels: [1]
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  # ── V2 unsupervised losses ─────────────────────────────────────────────────
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.5
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  # ── V3 annotation-driven losses (disabled) ─────────────────────────────────
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  # ── V4 divergence loss (disabled) ─────────────────────────────────────────
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  # ── V5 flow-variance tissue loss (disabled) ───────────────────────────────
+  w_rigid_tissue: 0.0
+
+  # ── V8/V9 flow-cosine assignment loss (disabled) ──────────────────────────
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.3
+
+  # ── V14 flow-cluster TV loss (disabled) ───────────────────────────────────
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  # ── V16 flow-cluster CE loss (直接固定分配，无 Sinkhorn) ──────────────────
+  w_flow_cluster_ce: 4.0
+  flow_cluster_ce_temperature: 0.3   # 仅用于 diversity，不再影响分配
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 1.0
+
+  # ── No reset ──────────────────────────────────────────────────────────────
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  # ── Distillation: 降权重，ch1 本来就已接近 teacher ────────────────────────
+  w_distill:    0.5    # 3.0→0.5: 实际贡献≈0%，降低不影响保护效果
+  distill_mode: one_sided
+  teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

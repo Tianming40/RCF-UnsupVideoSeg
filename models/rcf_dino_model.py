@@ -142,6 +142,7 @@ class RCFDinoModel(RCFModel):
         dino_checkpoint: Optional[str] = None,
         w_dino: float = 0.1,
         dino_input_size: int = 128,
+        dino_channels: Optional[list] = None,
         **kwargs,
     ):
         super().__init__(args, **kwargs)
@@ -149,6 +150,8 @@ class RCFDinoModel(RCFModel):
         self.w_dino = w_dino
         self.dino_input_size = dino_input_size
         self.dino_patch_size = dino_patch_size
+        # None = apply to all channels; [1] = ch1 only, etc.
+        self.dino_channels = dino_channels
 
         # Build and freeze DINO
         raw_dino = _build_dino(dino_arch, dino_patch_size, dino_checkpoint)
@@ -160,8 +163,11 @@ class RCFDinoModel(RCFModel):
     # ------------------------------------------------------------------ #
     # Capture mask logits (same pattern as RCFTissueModel)                #
     # ------------------------------------------------------------------ #
-    def _decode_head_forward(self, x, decode_head):
-        pred = decode_head.forward(x)
+    def _decode_head_forward(self, x, decode_head, flow_feat=None):
+        if flow_feat is not None:
+            pred = decode_head.forward(x, flow_feat=flow_feat)
+        else:
+            pred = decode_head.forward(x)
         if self.training and decode_head is self.decode_head2:
             self._captured_mask_logits = pred          # [B*I, C, H, W]
         return pred
@@ -229,6 +235,7 @@ class RCFDinoModel(RCFModel):
             scalar loss
         """
         B, C, H_m, W_m = masks.shape
+        channels = self.dino_channels if self.dino_channels is not None else list(range(C))
 
         # --- DINO features (no grad, frozen) ---
         feats = self._extract_dino_feats(imgs)          # [B, D, H_p, W_p]
@@ -244,7 +251,7 @@ class RCFDinoModel(RCFModel):
 
         total = torch.tensor(0.0, device=masks.device)
 
-        for c in range(C):
+        for c in channels:
             w_c = masks_p_grad[:, c]                    # [B, H_p, W_p]
             W_c = w_c.sum(dim=(1, 2))                   # [B]
 
@@ -260,7 +267,7 @@ class RCFDinoModel(RCFModel):
             loss_c = (w_c * (1.0 - sim)).sum(dim=(1, 2)) / (W_c + 1e-6)
             total = total + loss_c.mean()
 
-        return total / C
+        return total / len(channels)
 
     # ------------------------------------------------------------------ #
     # Override forward_train to append L_dino                             #

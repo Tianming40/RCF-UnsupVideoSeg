@@ -1,0 +1,237 @@
+# rcf_cmc_grasp0_tissue_ft_v40_test_instrument.yaml
+#
+# TEST-ONLY config for instrument (ch1) IoU on the new grasp0 annotations.
+# 复用 v40 训练配置，只改 test 相关项：
+#   test_data_path -> eval_instrument (Annotations/<id>/<id>.jpg, 白=instrument)
+#   test split     -> ImageSets/val.txt (213 帧)
+#   object_channel -> 1  (instrument 固定 ch1，不需要 oracle)
+#   val_batch_size -> 1
+#   eval_save      -> true
+#
+# 运行：
+#   python main_tissue.py \
+#     configs/instrument/rcf_cmc_grasp0_tissue_ft_v40_test_instrument.yaml \
+#     --test \
+#     --opts pretrained_model saved/grasp0_tissue_ft_v42_260622_202027/epoch=64-step=6110.ckpt
+
+batch_size: 1
+val_batch_size: 1
+epochs: 40
+learning_rate: 3.e-5
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 4
+
+checkpoints_dir: saved/grasp0_tissue_ft_v40_260619_150717
+pretrained_model: saved/grasp0_tissue_ft_v40_260619_150717/epoch=39-step=5960.ckpt
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: true
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: true
+
+train_transform_kwargs:
+  strong_aug: false
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: 1
+set_object_channel_after_epoch: 0
+
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/trainval.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/val.txt
+  zero_ann: false
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval_test_instrument
+
+trainer_kwargs:
+  check_val_every_n_epoch: 999
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 5.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [128, 128]
+  allow_mask_resize: true
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.0
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: [1]
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.5
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 11
+  flow_bilateral_sigma: 0.5
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [128, 128]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+  decode_head2:
+    input_transform: resize_concat
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: [256, 2048]
+    in_index: [0, 3]
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 5
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

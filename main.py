@@ -31,6 +31,7 @@ import dataset
 import models
 import utils
 import wandb
+from metrics import frame_prf as _frame_prf, empty_prf_seq as _empty_prf_seq, mean_prf as _mean_prf, empty_prf_bucket
 
 logger = utils.get_logger()
 # test
@@ -362,6 +363,7 @@ class Model(pl.LightningModule):
         self.iou_all_sequences = {}
         self.max_channel_freq = [0 for _ in range(self.args.model_kwargs["mask_layer"])]
         self.seq_channel_freq = {}  # {seq_name: np.array of shape [mask_layer]}
+        self._prf_all_sequences = {}
 
     @rank_zero_only
     def test_step(self, batch, batch_idx, always_use_max_iou_channel=False):
@@ -475,11 +477,15 @@ class Model(pl.LightningModule):
                 # channels (in descending IoU order) if they improve the union IoU.
                 # This correctly identifies all instrument channels even when one
                 # instrument rarely "wins" head-to-head against another.
-                best_ch = int(np.argmax(frame_ious))
+                # 可选：贪心 union 时排除某些 channel
+                # （tissue 评估排除 instrument ch1，避免器械区域被并进 tissue）
+                _excl = set(getattr(self.args, 'oracle_exclude_channels', None) or [])
+                _cand = [k for k in range(num_channels) if k not in _excl]
+                best_ch = int(max(_cand, key=lambda k: frame_ious[k]))
                 active_channels = [best_ch]
                 best_iou = frame_ious[best_ch]
                 remaining = sorted(
-                    [k for k in range(num_channels) if k != best_ch],
+                    [k for k in _cand if k != best_ch],
                     key=lambda k: frame_ious[k], reverse=True)
                 for ch in remaining:
                     candidate_mask = np.any(
@@ -494,6 +500,8 @@ class Model(pl.LightningModule):
                     self.max_channel_freq[ch] += 1
                     seq_freq[ch] += 1
                 frame_iou = best_iou
+                _eval_mask = (pred_mask_resize[active_channels[0]] if len(active_channels) == 1
+                              else np.any(np.stack([pred_mask_resize[c] for c in active_channels]), axis=0).astype(pred_mask_resize.dtype))
             else:
                 channels = self.seq_object_channels.get(seq_name, [self.object_channel])
                 if len(channels) == 1:
@@ -503,6 +511,7 @@ class Model(pl.LightningModule):
                         np.stack([pred_mask_resize[ch] for ch in channels]), axis=0
                     ).astype(pred_mask_resize.dtype)
                 frame_iou = utils.iou(union_mask, ann, num_classes=2, ignore_index=-1)[1]
+                _eval_mask = union_mask
                 # Collect per-item GT and union mask for batch-correct visualization
                 if self.args.eval_save:
                     ann_vis = np.clip(ann, 0, 1).astype('float32')
@@ -513,6 +522,12 @@ class Model(pl.LightningModule):
             iou_current_sequence = self.iou_all_sequences.setdefault(
                 seq_name, [])
             iou_current_sequence.append(frame_iou)
+            if hasattr(self, '_prf_all_sequences'):
+                _p, _r, _f1 = _frame_prf(_eval_mask, ann)
+                _prf_seq = self._prf_all_sequences.setdefault(seq_name, _empty_prf_seq())
+                _prf_seq['precision'].append(_p)
+                _prf_seq['recall'].append(_r)
+                _prf_seq['f1'].append(_f1)
 
         # Call finalize_eval_save once after the loop with full-batch arrays
         if self.args.eval_save:
@@ -619,7 +634,16 @@ class Model(pl.LightningModule):
             iou_num_frames += len(miou_current_sequence)
 
             if display_all:
-                logger.info(f"{name}_{seq_name}: {miou * 100.:.2f}")
+                _prf_seq = (self._prf_all_sequences.get(seq_name)
+                            if hasattr(self, '_prf_all_sequences') else None)
+                if _prf_seq and _prf_seq['precision']:
+                    _sp = float(np.nanmean(_prf_seq['precision']))
+                    _sr = float(np.nanmean(_prf_seq['recall']))
+                    _sf = float(np.nanmean(_prf_seq['f1']))
+                    logger.info(f"{name}_{seq_name}  miou={miou * 100.:.2f}  "
+                                f"P={_sp * 100.:.2f}  R={_sr * 100.:.2f}  F1={_sf * 100.:.2f}")
+                else:
+                    logger.info(f"{name}_{seq_name}: {miou * 100.:.2f}")
             # This is only computed and logged on rank 0, so do not sync.
             self.log(f'{name}_{seq_name}', miou, sync_dist=False)
 
@@ -632,6 +656,10 @@ class Model(pl.LightningModule):
         miou_frame_avg = iou_sum / iou_num_frames
         logger.info(f"{name}_frame_avg: {miou_frame_avg * 100.:.2f}")
         self.log(name + "_frame_avg", miou_frame_avg, sync_dist=True, reduce_fx="sum")
+
+        if hasattr(self, '_prf_all_sequences') and self._prf_all_sequences:
+            p, r, f1 = _mean_prf(self._prf_all_sequences)
+            logger.info(f"{name}_overall  precision={p * 100.:.2f}  recall={r * 100.:.2f}  f1={f1 * 100.:.2f}")
 
     def get_lr(self, epoch, power, base_lr, min_lr):
         coeff = (1 - epoch / self.args.epochs) ** power

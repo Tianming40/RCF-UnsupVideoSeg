@@ -20,6 +20,12 @@ Usage:
 
 import logging
 
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, SequentialSampler
+import dataset as _ds_mod
+from metrics import empty_prf_bucket, mean_prf as _mean_prf
+
 # ── 1. Register V2 flow head ──────────────────────────────────────────────────
 import models.rcf_model as _rcf_mod
 from models.flow_aggregation_head_with_residual_v2 import FlowAggregationHeadWithResidualV2
@@ -81,19 +87,95 @@ class TissueModel(_BaseModel):
                  sync_dist=True, prog_bar=True, reduce_fx='mean')
         return loss
 
+    # ── 双 val：instrument + tissue，各自 oracle，mIoU 相加 ────────────────────
+    def _make_val_loader(self, data_path, split):
+        ds = self.dataset_cls(
+            data_path, training=False,
+            transform=_ds_mod.get_transform(self.args, training=False),
+            subsample_frame_interval=None,
+            frame_num=1, load_flow=False, split=split, zero_ann=False,
+            **self.args.dataset_kwargs,
+        )
+        return DataLoader(ds, batch_size=1, num_workers=self.args.workers,
+                          pin_memory=True, sampler=SequentialSampler(ds), shuffle=False)
+
+    def val_dataloader(self):
+        # config 里 val_dataset_list: [{data_path, split, name}, ...]；没配则退回单 val
+        vlist = getattr(self.args, 'val_dataset_list', None)
+        if not vlist:
+            return super().val_dataloader()
+        self._val_names = [v.get('name', f'val{i}') for i, v in enumerate(vlist)]
+        return [self._make_val_loader(v['data_path'], v['split']) for v in vlist]
+
+    def _fresh_val_bucket(self):
+        n = self.args.model_kwargs["mask_layer"]
+        return {'iou': {}, 'freq': [0] * n, 'seqfreq': {}, 'prf': empty_prf_bucket()}
+
+    def on_validation_epoch_start(self):
+        self._val_buckets = {}
+        self._val_saved_eval = getattr(self.args, 'eval_save', False)
+        self.args.eval_save = False        # val 不存图，省时
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        if not getattr(self.args, 'val_dataset_list', None):
+            return super().validation_step(batch, batch_idx)
+        if dataloader_idx not in self._val_buckets:
+            self._val_buckets[dataloader_idx] = self._fresh_val_bucket()
+        b = self._val_buckets[dataloader_idx]
+        # 把累积状态指向当前 dataloader 的 bucket（PL 串行跑 dl0 全部再 dl1，安全）
+        self.iou_all_sequences = b['iou']
+        self.max_channel_freq  = b['freq']
+        self.seq_channel_freq  = b['seqfreq']
+        self._prf_all_sequences = b['prf']
+        self.object_channel    = None      # per-frame greedy union oracle
+        # tissue val：贪心 union 排除 instrument channel(s)，避免器械并进 tissue；
+        # instrument val：不排除（instrument 本就在 ch1）
+        nm = self._val_names[dataloader_idx] if dataloader_idx < len(self._val_names) else None
+        if nm == 'tissue':
+            self.args.oracle_exclude_channels = list(self.args.model_kwargs.get('instrument_channels', [1]))
+        else:
+            self.args.oracle_exclude_channels = []
+        self.test_step(batch, batch_idx)
+
+    def validation_epoch_end(self, outputs):
+        if not getattr(self.args, 'val_dataset_list', None):
+            return super().validation_epoch_end(outputs)
+        self.args.eval_save = self._val_saved_eval
+        names = getattr(self, '_val_names', None) or \
+                [f'val{i}' for i in range(len(self._val_buckets))]
+        total = 0.0
+        for idx in sorted(self._val_buckets.keys()):
+            b = self._val_buckets[idx]
+            iou_sum, nfr = 0.0, 0
+            for seq, lst in b['iou'].items():
+                iou_sum += np.nansum(lst); nfr += len(lst)
+            avg = float(iou_sum / max(nfr, 1))
+            nm = names[idx] if idx < len(names) else f'val{idx}'
+            # channel 分布：每个 channel 在 greedy union 里被选中的累计帧数
+            ch_dist = [int(x) for x in b['freq']]
+            p, r, f1 = _mean_prf(b['prf']) if b['prf'] else (0., 0., 0.)
+            logger.info(f'val_miou_{nm}: {avg * 100.:.2f}  ({nfr} frames)  '
+                        f'precision={p * 100.:.2f}  recall={r * 100.:.2f}  f1={f1 * 100.:.2f}  '
+                        f'greedy_channel_dist[ch0..ch{len(ch_dist)-1}]={ch_dist}')
+            self.log(f'val_miou_{nm}', avg, sync_dist=True, prog_bar=True)
+            total += avg
+        logger.info(f'val_miou_sum: {total * 100.:.2f}')
+        self.log('val_miou_sum', total, sync_dist=True, prog_bar=True)
+
 
 # ── 4. Replace ModelCheckpoint: save top-3 by min train loss ─────────────────
 from pytorch_lightning.callbacks import ModelCheckpoint as _OrigMC
 
 
 class _TrainLossCheckpoint(_OrigMC):
-    """ModelCheckpoint that monitors epoch_train_loss (min) instead of val_miou."""
+    """ModelCheckpoint monitoring val_miou_sum (instrument + tissue), keep top-3."""
 
     def __init__(self, *args, **kwargs):
-        kwargs['monitor']              = 'epoch_train_loss'
-        kwargs['mode']                 = 'min'
-        kwargs['save_on_train_epoch_end'] = True
-        kwargs['save_top_k']           = 3
+        kwargs['monitor']                 = 'val_miou_sum'
+        kwargs['mode']                    = 'max'
+        kwargs['save_on_train_epoch_end'] = False   # 在 val 之后存
+        kwargs['save_top_k']              = 3
+        kwargs['save_last']               = True
         super().__init__(*args, **kwargs)
 
 

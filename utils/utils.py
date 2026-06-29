@@ -59,7 +59,12 @@ def merge_cli_opt(config, key, value):
 
     original_value = item_container[key_hierarchy[-1]]
 
-    if isinstance(original_value, bool):
+    if original_value is None:
+        # null in YAML becomes None; let YAML parse the incoming string so
+        # "null"→None, "1"→int(1), "true"→True, etc.
+        value = yaml.safe_load(value)
+        # no type assertion needed: original was untyped None
+    elif isinstance(original_value, bool):
         # bool is a type of int so should be processed first
         if value == "True" or value == "true" or value == "1":
             value = True
@@ -71,8 +76,11 @@ def merge_cli_opt(config, key, value):
         value = int(value)
     elif isinstance(original_value, float):
         value = float(value)
-    
-    assert type(original_value) == type(value), f"{type(original_value)} != {type(value)}"
+    elif isinstance(original_value, list):
+        value = yaml.safe_load(value)
+
+    if original_value is not None:
+        assert type(original_value) == type(value), f"{type(original_value)} != {type(value)}"
     
     logger.info(f"Overriding {key} with {value} (original value: {original_value})")
     item_container[key_hierarchy[-1]] = value

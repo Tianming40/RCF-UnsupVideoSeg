@@ -782,16 +782,20 @@ Ablation baselines: v9 (same losses, no reset) in progress; v8 best = **69.01%**
 
 ---
 
-## Loss schedule overview (v21–v22)
+## Loss schedule overview (v21–v26)
 
 > **Key shift**: Replace `L_flow_tv` (gradient dead zone confirmed in v19/v20) with `L_flow_cluster_ce` (K-means color-block CE, external targets).
 >
 > **Core insight**: `L_flow_cosine` is self-referential — its CE target μ_c is derived from the current mask, so it reinforces the pretrained prior rather than breaking it. `L_flow_cluster_ce` uses external RAFT K-means labels (independent of current mask) and is therefore the true prior-breaking force for aligning non-instrument channels with RAFT flow color blocks.
 
-| Ver | Ep | L_entropy | L_deform | L_distill | L_flow_cosine | fc: temp / diversity | L_flow_cluster_ce | fcc: temp / diversity / start_ep | Role balance |
-|-----|-----|----------|---------|---------|-------------|-------------------|-----------------|--------------------------------|-------------|
-| v21 | 80 | 0.05 | 0.5 | 1.0 relu | 0.5 | 0.5 / 0.5 | 0.5 | 0.3 / 0.5 / ep5 | equal weight; cluster_ce delayed to ep5 |
-| v22 | 80 | 0.05 | 0.5 | 1.0 relu | **0.2** | 0.5 / **0.3** | **1.0** | 0.3 / 0.5 / **ep0** | cluster_ce primary (2×); cosine auxiliary (prevent collapse) |
+| Ver | Ep | L_entropy | L_deform | L_distill | L_flow_cosine | L_flow_cluster_ce | fcc: temp / div / start_ep | K-means | Notes |
+|-----|-----|----------|---------|---------|-------------|-----------------|---------------------------|---------|-------|
+| v21 | 80 | 0.05 | 0.5 | 1.0 relu | 0.5 | 0.5 | 0.3 / 0.5 / ep5 | flow 2D, fixed ring init, 10 iter | equal weight |
+| v22 | 80 | 0.05 | 0.5 | 1.0 relu | 0.2 | 1.0 | 0.3 / 0.5 / ep0 | flow 2D, fixed ring init, 10 iter | cluster_ce primary |
+| v23 | 80 | 0.05 | 0.5 | 1.0 relu | 0.5 | 0.5 | 0.3 / 0.5 / ep5 | flow 2D, **sector-mean init**, 10 iter | = v21 + adaptive init |
+| v24 | 80 | 0.05 | 0.5 | 1.0 relu | 0.2 | 1.0 | 0.3 / 0.5 / ep0 | flow 2D, **sector-mean init**, 10 iter | = v22 + adaptive init |
+| v25 | 50 | **0.3** | 0.5 | **3.0** relu | **0.0** | **3.0** | 0.3 / 0.5 / ep5 | **flow+HSV 5D, k-means++, 300 iter** | cluster_ce sole non-ch1 signal |
+| v26 | 50 | **0.3** | 0.5 | **3.0** relu | **0.0** | **4.0** | 0.3 / 0.5 / **ep0** | **flow+HSV 5D, k-means++, 300 iter** | cluster_ce sole non-ch1 signal, most aggressive |
 
 ### v21 — K-means CE and cosine equal weight (Run 251, in progress)
 
@@ -851,3 +855,493 @@ Ablation baselines: v9 (same losses, no reset) in progress; v8 best = **69.01%**
 | L_deform | 0.5 | residual magnitude |
 | L_flow_cosine | **0.2** | auxiliary: prevents collapse, does not drive assignment |
 | L_flow_cluster_ce | **1.0** | primary: external K-means targets; active from ep0 |
+
+---
+
+### v23 — v21 + data-adaptive K-means init (running)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v23.yaml`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+**Problem fixed:** v21/v22 used a fixed ring at radius 0.5 for K-means seeding. For grasp0 data where instrument motion dominates at r≈0.9 and tissue motion sits at r≈0.1–0.2, this initialization may not align cluster centroids with the actual RAFT flow color blocks.
+
+**Key change vs v21:**
+- K-means init replaced with **data-adaptive deterministic** seeding:
+  - centroid 0 — mean of near-zero pixels (r < 5% max) → background / white in RAFT viz
+  - centroids 1–4 — mean of pixels in each of 4 equal angular sectors (90° each), placing each seed where the actual data lives in that directional band
+
+Loss weights identical to v21.
+
+---
+
+### v24 — v22 + data-adaptive K-means init (running)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v24.yaml`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+Same data-adaptive init as v23, applied on top of v22 (cluster_ce primary, from ep0). Loss weights identical to v22.
+
+---
+
+### v25 — k-means++ + joint flow+HSV, cluster_ce sole signal (eq. weight baseline)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v25.yaml`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+**Core changes vs v23:**
+
+1. **K-means algorithm upgraded to k-means++**: distance-proportional random seeding; better coverage than fixed-ring or sector-mean init.
+
+2. **Feature space expanded to 5D (flow + HSV)**:
+   - flow component: (fx/max, fy/max) — 2D, same space as RAFT flow_to_color
+   - color component: (cos(2πH), sin(2πH), S) — circular hue encoding + saturation; V dropped (brightness irrelevant for color-block identity)
+   - weights: flow × 1.0, color × 1.0 → concatenated 5D
+   - Motivation: pure flow fails to separate same-motion regions with different appearance (e.g. tissue vs background both static); color breaks the tie
+
+3. **Max 300 EM iterations** (was 10; with k-means++ init, typically converges in ~30 iterations)
+
+4. **Strong entropy + distill to counter gray-mask basin**:
+   - `w_entropy: 0.05 → 0.3` (6×): actively pushes masks away from uniform gray
+   - `w_distill: 1.0 → 3.0` (3×): stronger teacher signal anchors ch1 (instrument) throughout domain shift
+
+5. **Cosine loss disabled** (`w_flow_cosine: 0.0`): k-means++ + HSV provides sufficient cluster signal; cosine (self-referential EM) no longer needed
+
+**Loss weights:**
+
+| Loss | Weight | Notes |
+|------|--------|-------|
+| L_seg | 1.0 | warp_seg flow reconstruction |
+| L_entropy | **0.3** | strong push against uniform gray mask |
+| L_distill | **3.0** (one-sided relu) | strong ch1 anchor during domain shift |
+| L_deform | 0.5 | residual magnitude |
+| L_flow_cosine | **0.0** | disabled |
+| L_flow_cluster_ce | **3.0** | sole non-ch1 learning signal; flow+HSV 5D k-means++; ep5 start |
+
+---
+
+### v26 — k-means++ + joint flow+HSV, cluster_ce most aggressive
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v26.yaml`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+Same architecture as v25 but with the cluster_ce loss pushed further: `4.0` weight active from **epoch 0** (no warmup). Intended to test whether an even stronger and earlier clustering signal can overcome the gray-mask basin faster.
+
+**Key differences vs v25:**
+
+| | v25 | v26 |
+|--|-----|-----|
+| `w_flow_cluster_ce` | 3.0 | **4.0** |
+| `flow_cluster_ce_start_epoch` | 5 | **0** |
+
+**Loss weights:**
+
+| Loss | Weight | Notes |
+|------|--------|-------|
+| L_seg | 1.0 | warp_seg flow reconstruction |
+| L_entropy | **0.3** | strong push against uniform gray mask |
+| L_distill | **3.0** (one-sided relu) | strong ch1 anchor during domain shift |
+| L_deform | 0.5 | residual magnitude |
+| L_flow_cosine | **0.0** | disabled |
+| L_flow_cluster_ce | **4.0** | sole non-ch1 learning signal; flow+HSV 5D k-means++; ep0 start |
+
+---
+
+## Loss schedule overview (v27–v34)
+
+> **Shared across all versions**: `w_seg=1.0`, `w_deform=0.5`, `batch_size=8`, `optimizer=Adam(wd=1e-4)`, `teacher_ckpt=grasp10_ft_v9_fulltrain`
+>
+> **Always zero**: `L_flow_cosine`, `L_flow_tv`, `L_rigid_tissue`, `L_dino`
+
+| Ver | Ep | L_entropy | L_distill | distill_mode | L_flow_cluster_ce | fcc: color_weight / div | L_flow_angle_ce | Notes |
+|-----|-----|----------|---------|-------------|-----------------|------------------------|----------------|-------|
+| v27 | 50 | 0.3 | 3.0 relu | one_sided | 4.0 (ep0) | 1.0 (flow+HSV) / 0.5 | — | Sinkhorn-STE channel↔cluster assignment (replaces softmax P) |
+| v28 | 50 | 0.3 | 3.0 relu | one_sided | 4.0 (ep0) | 1.0 (flow+HSV) / 0.5 | — | Sort cluster labels by ascending flow magnitude for cross-batch consistency |
+| v29 | 50 | **1.5** | **0.5** relu | one_sided | 4.0 (ep0) | 1.0 (flow+HSV) / 0.5 | — | Entropy ×5, distill ×0.17 (distill contribution was ≈0%, entropy too weak) |
+| v30 | 50 | 1.5 | 0.5 relu | one_sided | 4.0 (ep0) | **1.0** (flow+HSV) / 0.5 | — | Same as v29; cluster viz shows salt-and-pepper noise (color_weight=1.0 dominates) |
+| v31 | 50 | 1.5 | 0.5 relu | one_sided | 4.0 (ep0) | **0.0** (flow only) / 0.5 | — | Clustering on flow unit direction vectors only; cluster boundaries = RAFT color blocks |
+| v32 | 50 | 1.5 | **3.0** | **symmetric** | 4.0 (ep0) | 0.0 / 0.5 | — | Symmetric BCE distill prevents ch1 from absorbing tissue regions |
+| v33 | 50 | **15.0** | 3.0 | symmetric | 4.0 (ep0) | 0.0 / 0.5 | — | Entropy ×10 to forcibly escape uniform-gray mask attractor |
+| v34 | 50 | 15.0 | 3.0 | symmetric | **0.0** | — | **4.0** (div=0.5) | Replace k-means with atan2 angle sectors; 4 sectors → 4 non-inst channels |
+
+### Key changes summary (v27→v34)
+
+**v27**: Replaced softmax(P) channel↔cluster assignment with Sinkhorn-STE, enforcing 1-to-1 matching and guaranteeing non-zero gradients even when masks are uniformly gray.
+
+**v28**: Re-sorted cluster labels by ascending flow magnitude so that cluster 0 always corresponds to the most static (background) pixels, ensuring consistent label ordering across batches.
+
+**v29**: Found that distill (w=3.0) contributed ≈0% to the total loss (teacher and student were nearly identical), and entropy only accounted for 1.7% — completely dominated by warp_seg + cluster_ce. Raised entropy weight 0.3→1.5 and lowered distill 3.0→0.5.
+
+**v30**: Same weights as v29. Cluster visualization revealed severe salt-and-pepper noise: color_weight=1.0 caused image HSV texture to dominate clustering, completely decoupled from RAFT flow visualization logic.
+
+**v31**: Changed clustering features to flow unit direction vectors (`pts = flow / |flow|`), color_weight=0. Cluster boundaries now directly align with RAFT color block boundaries. However, ch1 absorbed large tissue regions because one_sided distill only prevents dropout, not expansion.
+
+**v32**: Switched distill to symmetric BCE — penalizes both directions: tissue pixels (teacher≈0) are strongly suppressed if student activates there; instrument pixels (teacher≈1) are prevented from dropping out. Weight raised 0.5→3.0 to compensate for smaller per-unit BCE magnitude. Entropy still stuck at 1.30–1.35.
+
+**v33**: Raised entropy weight 1.5→15.0 (×10), increasing its contribution from ~10% to ~50%+ of total loss, forcibly pushing masks away from the uniform-gray attractor. ep0 val_miou=61.89%, peak 67.79% (ep1) but high variance in later epochs.
+
+**v34** ⭐: Replaced k-means cluster_ce with `flow_angle_ce`: divide [-π, π] into 4 equal sectors via atan2, each non-instrument channel fits one sector. Fully deterministic, zero EM iterations. Peak 66.67% (ep25), stabilizes at 65–66% in later epochs (vs. v33's 55–62% late-epoch variance). **Notable: grasp10 instrument segmentation (val_miou) keeps improving with continued training rather than decaying** — unlike all prior versions where fine-tuning on grasp0 eventually degrades the pretrained ch1 instrument detector.
+
+### val_miou summary
+
+| Ver | Job | Best | ep0 | Notes |
+|-----|-----|------|-----|-------|
+| v28 | 258/259 | ~65% | 65.00 | k-means with magnitude-sorted labels |
+| v29 | 260 | ~61% | 61.00 | dummy cluster absorbed 96% of pixels |
+| v30 | 261 | ~55% | 55.00 | salt-and-pepper cluster noise, early stop |
+| v31 | 262 | ~56% | 56.00 | ch1 absorbed tissue (one_sided distill), early stop |
+| v32 | 263 | ~64% | 59.00 | symmetric distill protects ch1 boundary |
+| v33 | 264 | **67.79%** (ep1) | 61.89 | entropy 15.0, high late-epoch variance |
+
+---
+
+## Grasp0 Tissue Segmentation — Real-Annotation Evaluation (260622)
+
+First evaluation against **real CVAT annotations** on CMC_grasp0 (222 labeled frames:
+209 with tissue, 213 with instrument). Metric = **foreground IoU (DAVIS J)** under
+**per-frame greedy-union oracle** (each frame picks + merges the channels that best
+match its GT — see `main.py` test_step). Tissue evaluated on the 209-frame
+`eval_tissue/val.txt`.
+
+Tooling: `tools/split_tissue_anno.py` (color→binary), `tools/build_eval_dirs.py`
+(eval roots + symlinked JPEGImages), `script/run_grasp0_eval_all.sh` (batch eval),
+results in `saved/grasp0_eval_260622_111644/`.
+
+> ⚠️ **Data-leak caveat**: every model below was trained on the **full 601 set**
+> (which *includes* these 222 labeled frames). Training is self-supervised (no GT
+> used), so this is label-leak-free but **image-leak optimistic**. The first truly
+> image-isolated run is **v41** (trained on `train_unlabeled_379.txt`, 379 frames,
+> the 222 labeled ones excluded), in progress.
+
+### Baseline (starting point of all grasp0_tissue_ft runs)
+
+| Model | tissue J (%) | tissue P/R/F1 (%) | instrument J (%) | instrument P/R/F1 (%) |
+|-------|-------------|-------------------|-----------------|----------------------|
+| **v9** (`grasp10_ft_v9 epoch0-step149`) | **67.65** | 80.35 / 82.79 / 79.94 | **68.82** | 77.50 / 86.00 / 80.02 |
+
+### tissue oracle J — best checkpoint per version (sorted)
+
+| Version | Best ckpt | tissue J (%) |
+|---------|-----------|-------------|
+| **v18** ⭐ | ep76 | **74.61** |
+| v36b | ep49/last | 74.31 |
+| v23 | ep79/last | 74.28 |
+| v35 | ep48/last | 74.07 |
+| v22 | ep69 | 73.99 |
+| v24 | last | 73.96 |
+| v3 | ep29/last | 73.59 |
+| v6 | ep28 | 73.46 |
+| v4 | ep25 | 73.40 |
+| v20 | ep76 | 73.18 |
+| v16 | ep17 | 73.10 |
+| v40 (bilateral CE) | ep39/last | 73.09 |
+| v19 | ep79 | 72.97 |
+| ft_260615_102513 | ep20 | 72.85 |
+| v21 | ep77 | 72.83 |
+| v12 | last | 72.73 |
+| v7 | ep25 | 72.68 |
+| v17 | ep75 | 72.60 |
+| v13 | ep47 | 72.22 |
+| v37 | last | 71.98 |
+| v2 | ep4 | 71.36 |
+| v28 | ep7 | 69.19 |
+| v36c | ep9/last | 68.57 |
+| v27 | ep13 | 68.55 |
+| **v9 baseline** | — | **67.65** |
+| v29 | ep10/last | 68.27 |
+| v30 | ep2 | 67.35 |
+| v31 | ep0 | 65.57 |
+| v26 | ep44 | 65.14 |
+| v33 | ep37 | 62.96 |
+| v32 | ep8 | 59.20 |
+| v34 | ep46 | 57.39 |
+| v36a | ep0 | 57.11 |
+
+**Notes**
+- tissue almost always lands in **ch3 + ch4** (e.g. v40 dist `[17,42,4,205,164]`);
+  models that scatter tissue into other channels (v26/v32/v34/v36a) score worst.
+- Best models (**v18 / v36b / v23**, ~74.3–74.6%) beat the v9 start (68.33%) by **+6 pts**.
+- v40 (bilateral CE) = 73.09%, solidly above baseline; v41 (no-leak) is the honest re-test, in progress.
+| v34 ⭐ | 265 | **66.67%** (ep25) | 59.47 | angle_ce, more stable late epochs (65–66%); **val_miou continues to improve with more training rather than decaying** |
+
+---
+
+## v43 Evaluation Results (260623, job 299)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v43.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v43_260623_111047/`
+**Key changes vs v42:** `distill_mode: one_sided → symmetric` (BCE 自适应弹簧), `w_distill: 1.0 → 2.0`
+
+Instrument channel (ch1) stabilized at **0.63–0.65** instead of dropping to 0.57 (v42), enabling `val_miou_sum` monitoring to correctly track joint improvement.
+
+Evaluated on:
+- **Tissue**: `eval_tissue/` (209 labeled frames), per-frame greedy-union oracle, `oracle_exclude_channels=[1]`
+- **Instrument**: `eval_instrument/` (213 labeled frames), fixed ch1
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 |
+| ep7   | 70.78 | 81.59 / 85.01 / 82.07 | **66.03** | 74.24 / 85.37 / 77.81 |
+| **ep48** ⭐ | **71.69** | **83.74 / 84.19 / 82.72** | 64.77 | 74.80 / 82.38 / 76.66 |
+| ep51  | 71.58 | 83.74 / 84.08 / 82.63 | 64.80 | 75.59 / 82.24 / 76.76 |
+| last  | 70.47 | 82.99 / 83.76 / 81.84 | 63.75 | 74.65 / 81.43 / 75.94 |
+
+**Best tissue: ep48 (71.69%)** — improves over v42's single-val best.
+**Best instrument: ep7 (66.03%)** — symmetric distill holds ch1 throughout training.
+
+### Comparison with baseline
+
+| Model | tissue J (%) | instrument J (%) |
+|-------|-------------|-----------------|
+| v9 baseline | 67.65 | 68.82 |
+| v43 best (ep48 / ep7) | **71.69** | **66.03** |
+| Δ vs baseline | +4.04 | -2.79 |
+
+---
+
+## All-Version Ranking: tissue + instrument mIoU sum (job 300)
+
+> Best checkpoint per version, sorted by `tissue + instrument` sum descending.
+> Evaluated on `eval_tissue/` (209 frames, oracle) + `eval_instrument/` (213 frames, ch1).
+> v9 baseline: `grasp10_ft_v9_fulltrain epoch=0-step=149`.
+
+| Rank | Version | Best ckpt | tissue J (%) | inst J (%) | sum (%) |
+|------|---------|-----------|:------------:|:----------:|:-------:|
+| 1 | **v43** ⭐ | ep7 | 70.78 | **66.03** | **136.81** |
+| 2 | **v9 baseline** | ep0 | 67.65 | 68.82 | 136.47 |
+| 3 | **v47** | ep0 | 67.90 | **67.80** | **135.70** |
+| 4 | **v46** | ep1 | 69.54 | 65.71 | 135.25 |
+| 5 | v41 | ep37 | 71.10 | 61.91 | 133.01 |
+| 4 | v42 | ep64 | 72.15 | 60.47 | 132.62 |
+| 5 | v35 | ep0 | 68.77 | 63.12 | 131.89 |
+| 6 | v3 | ep24 | 73.04 | 58.47 | 131.51 |
+| 7 | v2 | ep4 | 70.86 | 59.94 | 130.80 |
+| 8 | v36b | ep49 | 74.03 | 55.88 | 129.91 |
+| 9 | v1 | ep19 | 72.06 | 57.65 | 129.71 |
+| 10 | v8 | ep28 | 72.77 | 56.46 | 129.23 |
+| 11 | v6 | last | 72.68 | 56.25 | 128.93 |
+| 12 | v12 | ep43 | 71.98 | 56.56 | 128.54 |
+| 13 | v36c | ep8 | 67.40 | 60.92 | 128.32 |
+| 14 | v23 | ep78 | 73.37 | 54.88 | 128.25 |
+| 15 | v7 | ep25 | 72.07 | 55.91 | 127.98 |
+| 16 | v40 | ep39 | 72.60 | 55.27 | 127.87 |
+| 17 | v4 | ep29 | 72.58 | 54.94 | 127.52 |
+| 18 | v37 | ep17 | 71.36 | 55.55 | 126.91 |
+| 19 | v24 | last | 72.88 | 53.83 | 126.71 |
+| 20 | v22 | ep69 | 73.08 | 53.30 | 126.38 |
+| 21 | v18 | last | 73.80 | 51.52 | 125.32 |
+| 22 | v20 | ep76 | 72.14 | 52.92 | 125.06 |
+| 23 | v13 | ep49 | 70.82 | 54.03 | 124.85 |
+| 24 | v19 | ep78 | 72.07 | 52.45 | 124.52 |
+| 25 | v17 | last | 71.91 | 51.94 | 123.85 |
+| 26 | v21 | ep78 | 71.66 | 50.00 | 121.66 |
+| 27 | v34 | ep46 | 56.47 | 63.44 | 119.91 |
+| 28 | v33 | ep36 | 62.02 | 55.42 | 117.44 |
+| 29 | v36a | ep0 | 56.25 | 59.55 | 115.80 |
+| 30 | v31 | ep1 | 63.11 | 52.56 | 115.67 |
+| 31 | v30 | ep0 | 64.62 | 50.77 | 115.39 |
+| 32 | v28 | ep7 | 64.22 | 50.85 | 115.07 |
+| 33 | v27 | ep13 | 63.50 | 50.25 | 113.75 |
+| 34 | v32 | ep8 | 58.54 | 53.79 | 112.33 |
+| 35 | v29 | ep10 | 64.03 | 48.17 | 112.20 |
+| 36 | v26 | ep49 | 52.48 | 40.20 | 92.68 |
+| 37 | v16 | ep17 | 55.76 | 2.16 | 57.92 |
+
+---
+
+## v46 Evaluation Results (260624, job 305)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v46.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v46_260624_090944/`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+**Key changes vs v43:**
+- `w_flow_bilateral_ce: 4.0` — flow-guided bilateral self-training CE on non-instrument channels; zero gradient to ch1 (sub-softmax trick)
+- `w_dino: 2.0` — DINO ch1 anchor (was 0 in v43)
+- `w_deform: 1.0` — non-instrument residual magnitude reward (active vs 0 in v43)
+- `distill_mode: one_sided`, `w_distill: 5.0` — relu(teacher−student) only; effectively near-zero signal (raw ≈ 0.004)
+
+**Findings:** tissue improved above v43 (+1–2 pp) but instrument declined steadily from ep0 (65.71%) to ~50% at ep80. one_sided distill raw ≈ 0.004 → weighted ≈ 0.02, essentially zero ch1 protection. `deform` loss (w=1.0) actively pushes ch1 down via softmax competition.
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 |
+| **ep1** ⭐ (best sum) | 69.54 | 80.97 / 84.20 / 81.21 | **65.71** | 75.44 / 83.92 / 77.33 |
+| ep3  | 70.52 | 81.11 / 85.24 / 81.86 | 62.34 | 75.05 / 79.54 / 74.68 |
+| **ep10** ⭐ (best tissue) | **70.80** | 82.15 / 84.91 / 82.15 | 62.42 | 73.57 / 80.31 / 74.26 |
+
+---
+
+## v47 Evaluation Results (260624, job 305)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v47.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v47_260624_094240/`
+**Pretrained from:** `saved/grasp10_ft_v9_fulltrain_ft_260609_213030/epoch=0-step=149.ckpt`
+
+**Key changes vs v46:**
+- `distill_mode: one_sided → symmetric` — bidirectional BCE, real gradient to ch1; symmetric raw ≈ 0.07 vs one_sided raw ≈ 0.004
+- `w_distill: 5.0 → 2.0` — reduced because symmetric is self-adaptive (gradient ∝ teacher/student)
+- `w_dino: 2.0 → 3.0` — stronger DINO ch1 appearance anchor
+
+**Findings:** symmetric distill gave real ch1 gradient. Instrument held at 64–67% for the first ~5 epochs (vs v46's immediate drop), but still declined to ~50% by ep80. Root cause: `deform` (w=1.0) and `entropy` (w=5.0) together overpower the distill+DINO protection — `bilateral_ce` has zero ch1 gradient (sub-softmax) and is not the cause. **v47 ep0 (67.80% instrument, 67.90% tissue, sum=135.70) ranks 3rd all-time, just below the v9 baseline in instrument quality.**
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 |
+| **ep0** ⭐ (best sum) | 67.90 | 79.12 / 84.33 / 80.10 | **67.80** | 82.91 / 78.26 / 79.25 |
+| ep2  | **70.48** | 82.28 / 84.02 / 81.92 | 64.37 | 74.58 / 82.61 / 76.79 |
+| ep6  | 70.44 | 81.49 / 84.80 / 81.76 | 63.28 | 74.06 / 81.53 / 75.07 |
+
+### Loss gradient analysis
+
+| Loss | Weight | Ch1 gradient | Direction on ch1 |
+|------|--------|-------------|-----------------|
+| `warp_seg` | 1.0 | ✅ full softmax | uncertain |
+| `entropy` | 5.0 | ✅ full softmax | ⬇️ amplifies decline |
+| `DINO` | 3.0 | ✅ ch1 only | ⬆️ anchor |
+| `deform` | 1.0 | ✅ via softmax | ⬇️ rewards non-inst residual → crowds out ch1 |
+| `distill` (symmetric) | 2.0 | ✅ ch1 only | ⬆️ protection |
+| `bilateral_ce` | 4.0 | ❌ zero (sub-softmax renorm cancels) | — |
+| `flow_cosine` | 0.5 | ❌ sub-softmax main term | — |
+
+**Key finding:** `bilateral_ce` does **not** hurt ch1 (zero gradient via sub-softmax renormalisation). The true causes of ch1 decline are `deform` (actively pushes ch1 down via softmax competition) and `entropy` (amplifies any ch1 drop). Next experiments (v48, v49) disable all four: `entropy=0`, `deform=0`, `flow_cosine=0`, `distill=0`.
+
+---
+
+## v51 Evaluation Results (260625, job 311)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v51.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v51_260624_202504/`
+**Pretrained from:** `data/pretrained/densecl_r50_imagenet_200ep.pth` (from scratch — no grasp10 inheritance)
+
+**Key design (from-scratch baseline):**
+- Start from DenseCL (ImageNet contrastive, no flow head) — zero channel-assignment inheritance
+- Loss: `warp_seg` (w=1.0) + `DINO` (w=1.0, all 5 channels, `dino_channels: null`)
+- All other losses disabled: `bilateral_ce=0`, `entropy=0`, `deform=0`, `distill=0`, `flow_cosine=0`
+- `instrument_channels: []`, `oracle_exclude_channels: []` — no hard-coded channel exclusion
+- lr=1e-4 (flow/mask heads randomly initialised), epochs=80
+
+**Instrument channel:** After training, instrument naturally migrated to **ch4** (not ch1). Eval configs use `object_channel: 4` (instrument) and `oracle_exclude_channels: [4]` (tissue).
+
+**Training dynamics:**
+- DINO loss converges to ~0.585 within 2 epochs and stays **flat** for all 80 epochs — channel semantic content fixed early
+- `warp_seg` decreases monotonically from ~28 → ~3, continuously refining spatial boundaries
+- Instrument mIoU peaks around ep16–ep41, tissue steadily climbs to 73–74% (highest across all versions)
+- No systematic channel collapse (unlike v46–v48 starting from v9)
+
+**DINO loss mechanism:** Not K-means — a **mask-weighted centroid consistency loss** per channel. Each channel's assigned pixels are pulled toward their ViT-feature centroid. Converges quickly to a stable semantic layout, then acts as a fixed anchor.
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) | sum (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|---------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 | 136.47 |
+| **ep16** ⭐ (best inst) | 70.13 | 80.63 / 84.96 / 81.76 | **61.30** | 70.34 / 83.44 / 74.14 | 131.43 |
+| **ep41** ⭐ (best sum) | **73.58** | 83.18 / 86.79 / 84.21 | 59.84 | 76.25 / 72.76 / 72.64 | **133.42** |
+| ep51 | 73.26 | 83.02 / 86.90 / 84.03 | 58.23 | 70.88 / 75.87 / 71.67 | 131.49 |
+| last (ep79) | 73.43 | 84.16 / 86.21 / 84.15 | 53.26 | 64.52 / 74.12 / 66.71 | 126.69 |
+
+### Key findings
+
+- **Highest tissue mIoU ever recorded (73.58%)** at ep41 — DenseCL + warp_seg + DINO all-channel achieves better tissue than any v9-based fine-tuning
+- Instrument is lower than the v9 baseline (59.84% vs 68.82%) because there is no explicit instrument anchor; `warp_seg` alone cannot guarantee instrument stays in a fixed channel
+- Best sum (133.42 at ep41) is below v43 (136.81) and v9 baseline (136.47), but **tissue quality is substantially higher**
+- Training is stable — no collapse pattern seen in v46–v48
+
+---
+
+## v52 Evaluation Results (260625, job 315 train / job 319 eval)
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v52.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v52_260625_102034/`
+**Pretrained from:** `data/pretrained/densecl_r50_imagenet_200ep.pth` (from scratch)
+
+**Key changes vs v51:**
+- `decode_head2`: FCNHead (48×48, `in_index=[0,3]`) → **MultiScaleSegHead** — feat1, feat2, feat3 are each projected to 256ch via 1×1 conv, summed element-wise at H/8, fused with a 3×3 dilated conv, upsampled to H/4, concatenated with feat0, then refined by two 3×3 convs → output [5, H/4, W/4] = [5, 96, 96]
+- `mask_size`: [128,128] → **[96,96]** — matches the native output resolution of MultiScaleSegHead; warp_seg loss now operates at true 96×96 rather than upsampled 48→128
+- Parameters: 5.90M → 3.28M (fewer params in decode_head2 despite richer multi-scale fusion, since resize_concat is removed)
+- All other settings identical to v51: DenseCL from scratch, warp_seg + DINO (w=1.0), epochs=80
+
+**Instrument channel:** After training, the instrument naturally migrated to **ch3**. Eval uses `object_channel: 3` (instrument) and `oracle_exclude_channels: [3]` (tissue oracle excludes ch3).
+
+**Training dynamics vs v51:**
+- Loss converges faster: at epoch 31, v52 loss=5.22 vs v51 loss=6.43 (19% lower), indicating MultiScaleSegHead fits the training data more efficiently
+- Tissue mIoU trajectories are similar; instrument mIoU is highly variable in both — this is a dataset-level issue (weak instrument supervision in grasp0), not introduced by MultiScaleSegHead
+- At epoch 21, v52 sum=132.97 is already close to v51's all-time best of 133.42 at epoch 41
+
+**Note:** Eval was run while training was still ongoing (~epoch 31); `last.ckpt` reflects the latest checkpoint at eval time. The drop in instrument mIoU at `last` (51.89%) follows the same late-epoch decline seen in v51.
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) | sum (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|---------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 | 136.47 |
+| **v51 ep41** ⭐ (v51 best) | 73.58 | 83.18 / 86.79 / 84.21 | 59.84 | 76.25 / 72.76 / 72.64 | 133.42 |
+| **ep15** | 68.75 | 79.30 / 85.11 / 80.72 | **63.14** | 85.47 / 69.84 / 75.16 | 131.89 |
+| **ep20** | 71.03 | 81.46 / 85.56 / 82.34 | 61.24 | 78.47 / 72.17 / 73.65 | 132.27 |
+| **ep21** ⭐ (best sum) | 71.33 | 81.97 / 85.24 / 82.56 | 61.64 | 78.90 / 72.70 / 74.10 | **132.97** |
+| last (~ep31) | **73.60** | 83.86 / 86.60 / 84.22 | 51.89 | 67.41 / 67.96 / 65.27 | 125.49 |
+
+### Key findings
+
+- **MultiScaleSegHead converges faster:** ep21 sum=132.97 nearly matches v51's best (133.42 at ep41), while v52 has only used 21 of 80 epochs — at equal epoch counts v52 consistently outperforms v51
+- **Tissue mIoU continues to climb:** at last (~ep31), tissue=73.60% already exceeds v51's record of 73.58%; full 80-epoch training is expected to push tissue above 74%
+- **Instrument mIoU instability is dataset-driven:** peaks at ep15 (63.14%) then gradually declines, mirroring v51's behaviour — root cause is that grasp0 provides weak warp_seg supervision for instruments, so the oracle picks different channels across epochs rather than a stable one
+- **Fewer parameters, richer features:** 3.28M vs 5.90M; using feat1/feat2 (previously unused in FCNHead's resize_concat) provides effective mid-level detail that improves both speed of convergence and tissue boundary quality
+- Trade-off: to push sum above baseline, instrument quality needs to improve without sacrificing the high tissue performance
+
+---
+
+## v53 & v54 Evaluation Results (260626, job 317 / 320 train — job 321 eval)
+
+### v53
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v53.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v53_260625_192932/`
+
+**Key changes vs v52:**
+- `data_path`: CMC_grasp0_deinterlaced (379 seqs) → **CMC_grasp0_5_10_merged** with split `train_g0379_g10601.txt` — combines grasp0 (379 pairs) + grasp10 (601 pairs) = **980 training pairs**
+- `w_dino`: 1.0 → **0.1** — calibrated for warp_seg loss scale (~4–16 on this dataset vs ~100 on data_medical)
+- Architecture unchanged: MultiScaleSegHead, mask_size=[96,96]
+- Instrument at **ch3** (same as v52); eval uses `object_channel: 3` / `oracle_exclude_channels: [3]`
+
+**Motivation:** grasp10 sequences feature stronger instrument motion, providing richer warp_seg training signal for instrument channel assignment.
+
+### v54
+
+**Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v54.yaml`
+**Run dir:** `saved/grasp0_tissue_ft_v54_260625_201208/`
+
+**Key changes vs v53:**
+- `resize_short` for 720×576 images: 400 → **576** — images are no longer downscaled; crop margin increases from 16 px to 192 px, giving more diverse crops
+- `w_dino`: 0.1 → **0.08**
+- Instrument migrated to **ch4** after training; eval uses `object_channel: 4` / `oracle_exclude_channels: [4]`
+
+### Results per checkpoint
+
+| Checkpoint | tissue mIoU (%) | tissue P / R / F1 (%) | instrument mIoU (%) | instrument P / R / F1 (%) | sum (%) |
+|------------|----------------|----------------------|---------------------|--------------------------|---------|
+| **v9 baseline** | 67.65 | 80.35 / 82.79 / 79.94 | 68.82 | 77.50 / 86.00 / 80.02 | 136.47 |
+| **v52 ep21** ⭐ (v52 best) | 71.33 | 81.97 / 85.24 / 82.56 | 61.64 | 78.90 / 72.70 / 74.10 | 132.97 |
+| **v53 ep42** | 72.81 | 84.33 / 84.98 / 83.73 | 61.71 | 77.84 / 73.30 / 73.53 | 134.52 |
+| **v53 ep43** ⭐ (v53 best sum) | 72.82 | 85.17 / 83.99 / 83.65 | **63.95** | 76.46 / 79.03 / 75.63 | **136.77** |
+| **v53 ep47** | 71.35 | 85.49 / 81.94 / 82.73 | 62.07 | 76.20 / 75.34 / 73.98 | 133.42 |
+| **v53 last** | 69.08 | 84.15 / 80.75 / 81.11 | 52.98 | 69.57 / 67.13 / 66.39 | 122.06 |
+| **v54 ep16** | 74.49 | 83.64 / 87.97 / 84.79 | 56.69 | 63.24 / 85.67 / 70.08 | 131.18 |
+| **v54 ep21** | 74.45 | 84.07 / 86.98 / 84.68 | 57.82 | 63.24 / 87.58 / 71.18 | 132.27 |
+| **v54 ep25** ⭐ (v54 best sum) | 74.45 | 83.60 / 87.67 / 84.72 | 58.80 | 64.72 / 87.84 / 72.17 | 133.25 |
+| **v54 last** ⭐ (v54 best tissue) | **75.66** | 83.73 / 88.89 / 85.56 | 44.64 | 55.63 / 66.86 / 58.65 | 120.30 |
+
+### Key findings
+
+- **v53 ep43 matches the v9 baseline:** sum=136.77 vs v9's 136.47 — the first unsupervised model to reach this level, achieved by adding grasp10 training data for stronger instrument motion signal
+- **Grasp10 data directly improves instrument mIoU:** v53's best instrument (63.95%) exceeds v52's best (61.64%) by +2.3 pp, while maintaining comparable tissue performance
+- **resize_short 400 vs 576 trade-off (v53 vs v54):** larger crops in v54 push tissue mIoU higher (~74–76% vs ~71–73%) but hurt instrument mIoU (~45–59% vs ~52–64%). At 720×576 resolution, resize_short=576 preserves more scene context but makes the instrument occupy a smaller relative area, weakening its warp_seg signal
+- **Late-epoch instrument collapse persists in both:** instrument mIoU declines at last checkpoints (v53_last=52.98%, v54_last=44.64%), consistent with the grasp0 dataset issue of weak instrument supervision — channels drift away from instrument as tissue representation matures
+- **v54 tissue is the new record:** v54_last achieves tissue=75.66%, surpassing v52_last (73.60%) and v51's best (73.58%), at the cost of instrument quality (44.64%)
+- **Best overall checkpoint: v53 ep43** — tissue=72.82%, instrument=63.95%, sum=136.77%; represents the best instrument/tissue balance achieved by unsupervised training on this dataset

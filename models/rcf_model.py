@@ -20,6 +20,8 @@ from .crf_head import CRFHead
 from .multi_scale_seg_head import MultiScaleSegHead
 from .unet_seg_head import UNetSegHead
 from .unet_seg_head_v2 import UNetSegHeadV2
+from .unet_seg_head_v3 import UNetSegHeadV3
+from .flow_aggregation_head_v3 import FlowAggregationHeadV3
 
 from copy import deepcopy
 

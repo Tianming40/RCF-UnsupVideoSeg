@@ -40,6 +40,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _ASPPModule(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling (ASPP) as a drop-in replacement for a single
+    dilated conv.  Takes [B, in_ch, H, W] → [B, out_ch, H, W].
+
+    Five parallel branches:
+      1. 1×1 conv                     (captures local context)
+      2. 3×3 conv, dilation=rates[0]  (e.g. 6)
+      3. 3×3 conv, dilation=rates[1]  (e.g. 12)
+      4. 3×3 conv, dilation=rates[2]  (e.g. 18)
+      5. Global avg pool → 1×1 → upsample (captures global context)
+
+    All five outputs (each out_ch) are concatenated → 5·out_ch → 1×1 fused to out_ch.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, rates=(6, 12, 18)):
+        super().__init__()
+
+        def _branch(k, pad, dil):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, padding=pad, dilation=dil, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+
+        self.b0 = _branch(1, 0, 1)
+        self.b1 = _branch(3, rates[0], rates[0])
+        self.b2 = _branch(3, rates[1], rates[1])
+        self.b3 = _branch(3, rates[2], rates[2])
+        self.gap = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_ch * 5, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        gap = F.interpolate(self.gap(x), size=x.shape[-2:], mode='bilinear', align_corners=False)
+        return self.fuse(torch.cat([self.b0(x), self.b1(x), self.b2(x), self.b3(x), gap], dim=1))
+
+
 class MultiScaleSegHead(nn.Module):
     """
     Args:
@@ -61,6 +107,8 @@ class MultiScaleSegHead(nn.Module):
         mid_channels: int = 256,
         feat_channels=(256, 512, 1024, 2048),
         fuse_dilation: int = 6,
+        use_aspp: bool = False,
+        aspp_rates: tuple = (6, 12, 18),
         dropout_ratio: float = 0.1,
         align_corners: bool = False,
         use_edge_feat: bool = False,
@@ -106,14 +154,17 @@ class MultiScaleSegHead(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # ── 2. 3×3 dilated conv at H/8 to mix information across scales ───────
-        pad = fuse_dilation
-        self.fuse_conv = nn.Sequential(
-            nn.Conv2d(mid_channels, mid_channels, 3,
-                      padding=pad, dilation=fuse_dilation, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-        )
+        # ── 2. spatial context mixing at H/8: single dilated conv or ASPP ─────
+        if use_aspp:
+            self.fuse_conv = _ASPPModule(mid_channels, mid_channels, rates=aspp_rates)
+        else:
+            pad = fuse_dilation
+            self.fuse_conv = nn.Sequential(
+                nn.Conv2d(mid_channels, mid_channels, 3,
+                          padding=pad, dilation=fuse_dilation, bias=False),
+                nn.BatchNorm2d(mid_channels),
+                nn.ReLU(inplace=True),
+            )
 
         # ── 3. optional: edge enhancement (Sobel on feat0 → mid_channels additive skip)
         if use_edge_feat:

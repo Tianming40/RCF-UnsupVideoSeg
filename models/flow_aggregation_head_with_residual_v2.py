@@ -51,6 +51,62 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
             self.register_buffer('coord_map', coord_map_data)
 
     # ------------------------------------------------------------------ #
+    # Override get_demean_affine_flow to avoid MAGMA batched LU          #
+    # ------------------------------------------------------------------ #
+    def get_demean_affine_flow(self, mask, flow):
+        """
+        Identical to the parent implementation except that the
+        torch.linalg.solve call is replaced by an analytical 2×2 inverse.
+
+        torch.linalg.solve dispatches to MAGMA's batched LU on CUDA for
+        small matrices.  With batch shape [B, C, 2, 2] = [8, 5, 2, 2],
+        the per-matrix stride (20 floats = 80 bytes) is not a power-of-two
+        multiple of 128 bytes, which triggers a CUDA misaligned-address
+        error (cudaErrorMisalignedAddress 716) inside apply_lu_factor_
+        batched_magma.  The closed-form 2×2 inverse is exact and avoids
+        MAGMA entirely.
+        """
+        B, C, H, W = mask.shape
+        mask_spatial_normalized = mask / mask.sum(dim=(2, 3), keepdim=True)
+        img_preds_1d = torch.flatten(mask_spatial_normalized, 2, 3)  # [B, C, H*W]
+
+        F_u = torch.flatten(flow, 2, 3).permute(0, 2, 1)            # [B, H*W, 2]
+        mu_F = torch.bmm(img_preds_1d, F_u)                          # [B, C, 2]
+        mu_omega = img_preds_1d @ self.coord_map                      # [B, C, 2]
+
+        F_u_de_mean = F_u[:, None, ...] - mu_F[:, :, None, ...]      # [B, C, H*W, 2]
+        u_de_mean = self.coord_map[None, None, ...] - mu_omega[:, :, None, ...]
+
+        F_u_demean_u_demean_T = torch.einsum(
+            'b i j k, b i j l -> b i j k l', F_u_de_mean, u_de_mean)
+        sigma_F_omega = torch.einsum(
+            'b i j, b i j k l -> b i k l', img_preds_1d, F_u_demean_u_demean_T)
+
+        u_demean_u_demean_T = torch.einsum(
+            'b i j k, b i j l -> b i j k l', u_de_mean, u_de_mean)
+        sigma_omega_omega = torch.einsum(
+            'b i j, b i j k l -> b i k l', img_preds_1d, u_demean_u_demean_T)
+
+        # Analytical 2×2 solve: A_star = (sigma_omega_omega^{-1} @ sigma_F_omega^T)^T
+        # For A = [[a,b],[c,d]]:  A^{-1} = [[d,-b],[-c,a]] / det(A)
+        A = sigma_omega_omega.float()                                  # [B, C, 2, 2]
+        a, b = A[..., 0, 0], A[..., 0, 1]
+        c, d = A[..., 1, 0], A[..., 1, 1]
+        det = (a * d - b * c).clamp(min=1e-6).unsqueeze(-1).unsqueeze(-1)
+        A_inv = torch.stack(
+            [torch.stack([d, -b], dim=-1),
+             torch.stack([-c, a], dim=-1)], dim=-2
+        ) / det                                                        # [B, C, 2, 2]
+        # X = A_inv @ sigma_F_omega^T  →  A_star = X^T
+        RHS = sigma_F_omega.permute(0, 1, 3, 2).float()               # [B, C, 2, 2]
+        A_star = torch.matmul(A_inv, RHS).permute(0, 1, 3, 2)         # [B, C, 2, 2]
+
+        F_pred_demean = torch.einsum('b i j k, b i l k -> b i l j', A_star, u_de_mean)
+        F_pred2_2d = F_pred_demean.view(B, C, H, W, 2)
+        F_pred2_sum_2d = torch.einsum('b i j k, b i j k l -> b l j k', mask, F_pred2_2d)
+        return F_pred2_sum_2d
+
+    # ------------------------------------------------------------------ #
     # Override detect_flow_changes_batch to use self.boundary_threshold   #
     # ------------------------------------------------------------------ #
     def detect_flow_changes_batch(self, flow_data,

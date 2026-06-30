@@ -1362,7 +1362,7 @@ Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); t
 | Version | Key change | Inst mIoU | Tissue mIoU | Sum |
 |---------|-----------|:---------:|:-----------:|:---:|
 | v40 | + Flow bilateral-CE loss (w=2.0) | 55.27 | 73.09 | 128.36 |
-| v42 | FCNHead → **MultiScaleSegHead** | 60.47 | 72.15 | 132.62 |
+| v42 | bilateral window/sigma tuning + flow cosine loss | 60.47 | 72.15 | 132.62 |
 | v43 | Loss rebalancing | 66.03 | 71.69 | 137.72 |
 | v46 | Stronger bilateral (w=4) + DINO (w=2) | 65.71 | 70.80 | 136.51 |
 | v47 | w_dino = 3 | **67.80** | 70.48 | **138.28** |
@@ -1372,7 +1372,7 @@ Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); t
 
 | Version | Key change | Inst mIoU | Tissue mIoU | Sum |
 |---------|-----------|:---------:|:-----------:|:---:|
-| v52 | New pipeline: merged grasp0+grasp10 data; mask_size 128→96 | 61.64 | 71.33 | 132.97 |
+| v52 | FCNHead → **MultiScaleSegHead**; merged grasp0+grasp10 data; mask_size 128→96 | 61.64 | 71.33 | 132.97 |
 | v53 | w_dino 1.0→0.1 (calibrated for merged data) | **63.95** | 72.82 | **136.77** |
 | v54 | Higher crop res (resize_short 400→576) | 58.80 | **74.45** | 133.25 |
 | v55 | + Sobel edge feat in decoder | 63.83 | 70.17 | 134.00 |
@@ -1383,3 +1383,11 @@ Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); t
 | v60 | topk 4→2 (easy-example mining) | 63.86 | 68.51 | 132.37 |
 | <span style="color:red">**v61**</span> | <span style="color:red">**UNetSegHead** (top-down coarse-to-fine) + edge feat</span> | <span style="color:red">64.01</span> | <span style="color:red">72.51</span> | <span style="color:red">**136.52**</span> |
 | v62 | **UNetSegHeadV2** (true FPN, standard backbone strides) | 62.83 | 72.65 | 135.48 |
+| v63 | **UNetSegHeadV3** — true skip-concat (cat instead of add at lateral connections) | — | — | — |
+| v64 | MultiScaleSegHead + **ASPP** (parallel dil=6/12/18 + GAP, replaces single fuse_conv) | — | — | — |
+
+### Phase 4 — FlowAggregationHead improvements
+
+| Version | Key change | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:---------:|:-----------:|:---:|
+| v65 | **FlowAggregationHeadV3**: GroupNorm in flow_feat_before_agg + magnitude-weighted segment aggregation (high-motion pixels up-weighted) | — | — | — |

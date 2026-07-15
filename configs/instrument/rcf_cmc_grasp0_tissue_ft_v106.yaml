@@ -1,29 +1,51 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v106.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v106 = v105 + per-source flow clamp override (bridges get clamp_flow_t=25
+# instead of the global 10)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v105:
+#   decode_head.clamp_flow_t_overrides: {"_b105": 25., "_b50": 25.}
+#   (decode_head.clamp_flow_t stays 10 — this is the DEFAULT for anything
+#   not matching a bridge pattern, i.e. g0/g5/g10 are unaffected)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Root cause found after v105 showed no improvement over v83/v102: measured
+# what fraction of GT flow COMPONENTS actually exceed clamp_flow_t=10 —
+# g0/g5/g10 (original ~1-frame pairs): 7.8-10.7%, essentially the level the
+# threshold was tuned for. b105/b50 (bridge pairs, ~5-frame real gap, mean
+# flow magnitude 19-22px vs the original's 5-7px): 41-42% of components
+# were being hard-clamped — the new pairs' large-motion signal, the entire
+# reason for adding them, was mostly being truncated away before the loss
+# ever saw it. Not a model-capacity problem; a preprocessing/hyperparameter
+# mismatch (clamp tuned for the old data silently gutting the new data).
+#
+# New mechanism (models/flow_aggregation_head_with_residual.py,
+# norm_and_clamp_flow): clamp_flow_t_overrides is a {substring: threshold}
+# dict matched against each sample's seq_name (already threaded through the
+# whole forward_train -> decode_head call chain, no new dataset/collate
+# plumbing needed) to pick a PER-SAMPLE clamp threshold instead of one
+# global scalar. seq_names now passed through decode_head.forward() (both
+# the V1 base class and V2 override) and rcf_model.py's decode_head call
+# site; falls back to the original single-clamp_flow_t behaviour when
+# seq_names is None or no override matches, so no other config is affected.
+# At clamp=25: g0 clip rate drops to 0.8% (barely touched), bridges drop to
+# 14.9%/18.9% (roughly comparable to g0/g5/g10's original ~10% at clamp=10,
+# not identical but much closer than the 4-5x gap at a uniform threshold).
+#
+# Isolated single-variable test on top of v105 — everything else (the
+# re-deinterlaced data, the bridge pairs, the un-reweighted mix ratio)
+# unchanged, so this isolates specifically "does un-clipping the bridge
+# signal help" from "does adding bridge data help at all" (v105's question).
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v106
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -57,8 +79,8 @@ log_interval: 100
 object_channel: null
 set_object_channel_after_epoch: 0
 oracle_exclude_channels: []
-data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged
-test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
 dataset_kwargs: {}
 
 train_dataset_kwargs:
@@ -67,7 +89,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_b105_b50_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -77,10 +99,10 @@ test_dataset_kwargs:
   zero_ann: false
 
 val_dataset_list:
-  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
     split: ImageSets/val.txt
     name: instrument
-  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
     split: ImageSets/val.txt
     name: tissue
 
@@ -105,6 +127,7 @@ model_kwargs:
   align_corners: false
   mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
+  gt_flow_downsample_mode: area
   log_interval: 100
 
   freeze_backbone: false
@@ -199,16 +222,17 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
     norm_flow: false
     clamp_flow_t: 10.
+    clamp_flow_t_overrides: {"_b105": 25., "_b50": 25.}
     free_residual: false
     free_residual_with_affine: true
     free_scale: false
@@ -219,13 +243,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

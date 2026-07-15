@@ -1,29 +1,40 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v96.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v96 = v64 + heteroscedastic (LEARNED per-pixel) uncertainty on warp loss
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   decode_head.use_heteroscedastic_loss: true
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# New mechanism (flow_aggregation_head_with_residual_v2.py): a small conv
+# head predicts sigma(x,y) > 0 per pixel from the already-computed residual
+# prediction (all_pred_residual_fw/bw, dense, same resolution as flow), and
+# the warp loss becomes the heteroscedastic Gaussian NLL:
+#   loss = (gt_flow - pred_flow)^2 / (2*sigma^2) + log(sigma)
+# instead of the fixed squared error. log(sigma) regularises against the
+# trivial "inflate sigma everywhere to zero out the error term" collapse —
+# the network can only lower its loss by learning WHERE the flow signal is
+# genuinely unreliable (occlusion, specular highlights, blood, RAFT failure)
+# and down-weighting there, not by cheating uniformly.
+# Composes with (does not replace) the existing boundary mask — both are
+# multiplied together, so this is purely additive on top of the fixed
+# boundary_dilation/floor mechanism (v83), which stays at its untouched
+# defaults (dilate=7, floor=0) here since this is an isolated ablation on
+# plain v64, not yet combined with v83's recipe.
+# +1473 params (two tiny conv heads). Verified end-to-end: forward pass,
+# loss computation, and gradient flow to both the sigma heads and masks
+# smoke-tested successfully before submission.
+# Base: same backbone (dilated ResNet), same training data as v53.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v96
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -199,9 +210,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -219,13 +228,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_heteroscedastic_loss: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

@@ -141,6 +141,7 @@ class RCFDinoModel(RCFModel):
         dino_patch_size: int = 8,
         dino_checkpoint: Optional[str] = None,
         w_dino: float = 0.1,
+        w_dino_merge: float = 0.0,
         dino_input_size: int = 128,
         dino_channels: Optional[list] = None,
         **kwargs,
@@ -148,6 +149,7 @@ class RCFDinoModel(RCFModel):
         super().__init__(args, **kwargs)
 
         self.w_dino = w_dino
+        self.w_dino_merge = w_dino_merge
         self.dino_input_size = dino_input_size
         self.dino_patch_size = dino_patch_size
         # None = apply to all channels; [1] = ch1 only, etc.
@@ -270,6 +272,55 @@ class RCFDinoModel(RCFModel):
         return total / len(channels)
 
     # ------------------------------------------------------------------ #
+    # DINO cross-channel appearance-affinity (soft merge) loss             #
+    # ------------------------------------------------------------------ #
+    def _dino_merge_loss(self, masks: torch.Tensor, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        L_dino_merge: pulls a channel PAIR's DINO centroids together, weighted
+        by how much the two channels' soft masks already spatially overlap
+        (mask_i * mask_j). This is purely appearance + existing-overlap driven
+        — no spatial-position heuristic (e.g. no "ring around instrument =
+        tissue" assumption) and no fixed channel identity is required.
+
+        Motivation: motion-based common fate correctly splits an instrument's
+        shaft and jaw into separate channels (different motion patterns), but
+        eval/appearance treat them as one object. This loss lets channels that
+        already border each other (non-trivial soft overlap at the shared
+        boundary) AND look visually similar (metal texture, etc.) drift closer
+        together in DINO space, without forcing a merge on dissimilar or
+        spatially disjoint channel pairs (background vs. tissue, say).
+
+        masks: [B, C, H_m, W_m] soft masks after softmax
+        imgs:  [B, 3, H, W]     first-frame training images
+        """
+        B, C, H_m, W_m = masks.shape
+        feats = self._extract_dino_feats(imgs)          # [B, D, H_p, W_p], frozen
+        _, D, H_p, W_p = feats.shape
+
+        if H_m != H_p or W_m != W_p:
+            masks_p = F.interpolate(masks, (H_p, W_p), mode="bilinear", align_corners=False)
+        else:
+            masks_p = masks
+
+        centroids = []
+        for c in range(C):
+            w_c = masks_p[:, c]
+            W_c = w_c.sum(dim=(1, 2))
+            centroid = (feats * w_c.unsqueeze(1)).sum(dim=(2, 3)) / (W_c.unsqueeze(1) + 1e-6)
+            centroids.append(F.normalize(centroid, dim=1))    # [B, D]
+
+        total = torch.tensor(0.0, device=masks.device)
+        n_pairs = 0
+        for i in range(C):
+            for j in range(i + 1, C):
+                affinity = (centroids[i] * centroids[j]).sum(dim=1)          # [B], cos sim
+                overlap = (masks_p[:, i] * masks_p[:, j]).mean(dim=(1, 2))   # [B], soft co-occurrence
+                total = total + (overlap * (1.0 - affinity)).mean()
+                n_pairs += 1
+
+        return total / n_pairs
+
+    # ------------------------------------------------------------------ #
     # Override forward_train to append L_dino                             #
     # ------------------------------------------------------------------ #
     def forward_train(self, imgs, seq_ids, seq_names, paths,
@@ -279,7 +330,7 @@ class RCFDinoModel(RCFModel):
             imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks
         )
 
-        if self.w_dino <= 0.0 or self._captured_mask_logits is None:
+        if (self.w_dino <= 0.0 and self.w_dino_merge <= 0.0) or self._captured_mask_logits is None:
             return losses
 
         # Reconstruct soft masks from captured logits
@@ -301,9 +352,14 @@ class RCFDinoModel(RCFModel):
         masks_frame0 = masks_all[:, 0]                  # [B, C, H, W]
         imgs_frame0 = imgs[:, 0]                        # [B, 3, H, W]
 
-        l_dino = self._dino_consistency_loss(masks_frame0, imgs_frame0)
+        if self.w_dino > 0.0:
+            l_dino = self._dino_consistency_loss(masks_frame0, imgs_frame0)
+            losses["loss_dino"] = l_dino
+            losses["loss"] = losses["loss"] + self.w_dino * l_dino
 
-        losses["loss_dino"] = l_dino
-        losses["loss"] = losses["loss"] + self.w_dino * l_dino
+        if self.w_dino_merge > 0.0:
+            l_dino_merge = self._dino_merge_loss(masks_frame0, imgs_frame0)
+            losses["loss_dino_merge"] = l_dino_merge
+            losses["loss"] = losses["loss"] + self.w_dino_merge * l_dino_merge
 
         return losses

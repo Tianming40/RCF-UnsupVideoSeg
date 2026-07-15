@@ -1,29 +1,36 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v95.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v95 = v83 (current all-time best, 139.36) with DenseASPP replacing plain ASPP
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v83:
+#   decode_head2.type:                MultiScaleSegHead  →  MultiScaleSegHeadV2
+#   decode_head2.use_aspp:             true → false
+#   decode_head2.use_dense_aspp:       false → true
+#   decode_head2.dense_aspp_rates:     [3, 6, 12, 18]
+#   decode_head2.dense_aspp_growth_rate: 64
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Same DenseASPP module as v94 (isolated ablation on plain v64), now stacked
+# on v83's full recipe (g5 data + bg removal + supervision density + data
+# cleaning) instead. DenseASPP densifies the effective dilation coverage via
+# DenseNet-style cascaded dilated layers (each sees all previous layers'
+# outputs) rather than v83's still-inherited-from-v64 independent parallel
+# ASPP branches — same underlying "gridding" problem v93 (HDC on v83) also
+# targets, but via broader/denser coverage rather than rate coprimality.
+# Mechanistically orthogonal to all four of v83's components: only touches
+# the spatial context module inside decode_head2, no interaction with
+# decode_head's bg removal/density or the training data.
+# Eval sets untouched; epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v95
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +74,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -199,11 +206,11 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
@@ -219,13 +226,19 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
-    type: MultiScaleSegHead
+    type: MultiScaleSegHeadV2
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp/use_dense_aspp=true
+    use_aspp: false
+    use_dense_aspp: true
+    dense_aspp_rates: [3, 6, 12, 18]
+    dense_aspp_growth_rate: 64
     dropout_ratio: 0.1
     align_corners: false
 

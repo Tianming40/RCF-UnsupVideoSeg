@@ -1,29 +1,31 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v81.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v81 = v78 (+g5 data + bg removal) + mask_layer 5 → 6
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v78:
+#   mask_layer / decode_head2.num_classes: 5 → 6
+#   decode_head3.num_classes: 20 → 24 (2 dirs × 2 coords × 6 layers)
+#   bg_channels: +ch5 (only affects zero-weight losses)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Rationale (signal diagnosis 2026-07-03): every trained version splits the
+# instrument across 2-3 channels IN THE SAME FRAME (union freq 377 >> 213
+# frames) — shaft and jaw have different motion patterns, so common fate
+# correctly decomposes them as separate parts. With 5 channels the budget
+# (2 instrument parts + 1-2 tissue + bg) is fully packed, squeezing tissue.
+# A 6th channel gives the part-level decomposition room to breathe.
+# NOTE: offline eval scripts hardcoding NUM_CLASSES=5 must use 6 for v81.
+# Eval sets untouched; epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v81
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +69,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -101,7 +103,7 @@ model_kwargs:
   w_sharpen: 0
   w_entropy: 0.0
   separate_residual: true
-  mask_layer: 5
+  mask_layer: 6
   align_corners: false
   mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
@@ -122,7 +124,7 @@ model_kwargs:
   instrument_channel: 1
   tissue_channel: 2
   grasping_channel: 1
-  bg_channels: [0, 3, 4]
+  bg_channels: [0, 3, 4, 5]
   distill_channel: 1
 
   w_rigid:      0.0
@@ -198,10 +200,8 @@ model_kwargs:
   decode_head:
     ssim_sz: 1
     create_flownet: true
-    mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    mask_layer: 6
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -219,13 +219,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
-    num_classes: 5
+    num_classes: 6
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 
@@ -238,7 +242,7 @@ model_kwargs:
     in_index: -1
     num_convs: 2
     dropout_ratio: 0.1
-    num_classes: 20
+    num_classes: 24
     norm_cfg: *id001
     align_corners: false
     loss_decode:

@@ -1,29 +1,51 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v104.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v104 = v83 + E-step-consistency auxiliary loss
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v83:
+#   decode_head.use_em_consistency_loss: true
+#   decode_head.em_consistency_weight: 0.1
+#   decode_head.em_consistency_temperature: 1.0
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Architectural framing motivating this: aggregate_flow_with_residual is
+# effectively an M-step (per-channel rigid motion models — flow_agg
+# constant + affine — fit via closed-form weighted least squares), but
+# there's never been a matching E-step: mask (the assignment) is predicted
+# purely from RGB appearance, with no signal telling it whether its
+# assignment actually agrees with which channel's OWN rigid model best
+# explains a pixel's true flow. warp_seg only ever sees the FINAL
+# mask-mixed reconstruction, so a locally wrong assignment can go
+# unpenalised if other channels' affine/residual flexibility quietly
+# compensates for it downstream.
+# New loss (models/flow_aggregation_head_with_residual_v2.py,
+# _em_consistency_loss): compute each channel's own rigid-model prediction
+# at every pixel (_per_channel_rigid_flow — constant + affine, NOT
+# residual, which has no channel-specific identity and would trivially
+# explain any assignment), form target = softmax(-per_channel_error / T)
+# — the pseudo-responsibility a real E-step would compute — and push mask
+# toward it via cross-entropy. target is detached: only mask gets
+# gradient, the rigid models stay governed purely by warp_seg.
+# AUXILIARY, not a replacement for warp_seg — see discussion: this loss
+# only supervises relative assignment quality and would collapse to a
+# trivial pass on its own (uniform per-channel fit quality -> uniform
+# target -> any mask "satisfies" it). warp_seg remains what keeps the
+# rigid models themselves accurate in absolute terms.
+# Required a small refactor of the V2 affine closed-form solve
+# (get_demean_affine_flow) to expose the per-channel prediction before its
+# final mask-weighted collapse — pure extraction, no behaviour change to
+# any existing config (get_demean_affine_flow's own output is identical).
+# No other v83 setting touched.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v104
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +89,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -199,11 +221,11 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
@@ -219,13 +241,20 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+    use_em_consistency_loss: true
+    em_consistency_weight: 0.1
+    em_consistency_temperature: 1.0
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

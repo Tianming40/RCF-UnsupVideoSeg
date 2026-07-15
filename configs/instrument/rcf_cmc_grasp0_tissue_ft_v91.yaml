@@ -1,29 +1,33 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v91.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v91 = v64 + Strip Pooling after ASPP (isolated ablation)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   decode_head2.type:              MultiScaleSegHead  →  MultiScaleSegHeadV2
+#   decode_head2.use_strip_pooling: true
+#   (use_concat_fusion=false, use_aspp_attn=false, use_attention_gate=false
+#    — everything else same as v64)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Strip Pooling (Hou et al., CVPR 2020): ASPP's dilated convs sample an
+# isotropic square grid at every rate; a long thin structure like an
+# instrument shaft benefits from long, THIN receptive fields aligned with its
+# own axis instead. Pools along H and W independently (1×W / H×1 strips),
+# 1D-convs each, broadcasts back, sums, fuses additively.
+# Output BN zero-initialised -> identity at init (verified: max diff 0.0 in
+# smoke test), gradually activated during training like NonLocalBlock/
+# AttentionGate before it.
+# Base: same backbone, ASPP rates [6,12,18], training data as v64.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 150
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v91
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -199,9 +203,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -221,11 +223,14 @@ model_kwargs:
 
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
-    type: MultiScaleSegHead
+    type: MultiScaleSegHeadV2
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    use_strip_pooling: true
     dropout_ratio: 0.1
     align_corners: false
 

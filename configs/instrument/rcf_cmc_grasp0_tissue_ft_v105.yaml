@@ -1,29 +1,56 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v105.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v105 = v102 + re-deinterlaced data (CMC_grasp0_5_10_merged_bwdif) + g10-g5/g5-g0 bridge pairs
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v102:
+#   data_path: CMC_grasp0_5_10_merged → CMC_grasp0_5_10_merged_bwdif
+#   train_dataset_kwargs.split: train_g0379_g5601_g10601_clean.txt
+#     → train_g0379_g5601_g10601_b105_b50_clean.txt
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Two changes bundled here (not a single-variable isolation, by design — see
+# below): the base images are now the properly re-deinterlaced ones (see
+# README "CMC Re-deinterlacing (260713)": ffmpeg bwdif, motion-adaptive,
+# idet-gated per-sequence — replaces the old naive row-duplication that
+# destroyed half the real vertical information on every frame), AND the
+# training split now includes 899 additional cross-segment "bridge" pairs
+# on top of the existing 1557 g0/g5/g10 pairs:
+#   - _b105: g10's POST frame -> g5's PRE frame (~5-frame real gap)
+#   - _b50:  g5's POST frame  -> g0's PRE frame (~5-frame real gap)
+#   (post->pre bridging chosen because it empirically gave the best RAFT
+#   warp-reconstruction quality among 4 candidate pairings, tested on 6
+#   sample cases before committing — see conversation)
+# Both new flow directories were quality-filtered by the SAME criteria used
+# to clean the original 1557 (mean flow >30px or p99 >80px -> excluded):
+# b105 601->466 kept (135 excluded, 22.5%), b50 601->433 kept (168 excluded,
+# 28.0%) — a meaningfully higher toxic rate than the original g0/g5/g10 set
+# (24/1581, 1.5%), consistent with larger real motion gaps producing more
+# RAFT failures. No proportional reweighting applied yet (no gap1
+# duplication to skew the mix) — this is the "raw mixed" baseline, current
+# ratio is ~63% g0/g5/g10 : ~19% b105 : ~18% b50 by raw entry count.
+#
+# Deliberately bundled (re-deinterlace + bridges together) rather than two
+# separate single-variable versions: the bridge pairs THEMSELVES are only
+# meaningful/generatable from the re-deinterlaced source (bridge flow was
+# computed directly on CMC_grasp0_5_10_merged_bwdif's frames), so testing
+# "bridges alone, old deinterlace" isn't a coherent isolated variant here —
+# the two changes are coupled by construction, not by choice.
+#
+# Eval sets UNCHANGED (still CMC_grasp0_deinterlaced/eval_instrument,
+# eval_tissue — the original, not re-deinterlaced) — for direct
+# comparability against v83/v102/etc.'s existing numbers. All other v102
+# settings (gt_flow_downsample_mode: area, boundary density, bg removal,
+# etc.) untouched.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v105
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -57,8 +84,8 @@ log_interval: 100
 object_channel: null
 set_object_channel_after_epoch: 0
 oracle_exclude_channels: []
-data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged
-test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
 dataset_kwargs: {}
 
 train_dataset_kwargs:
@@ -67,7 +94,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_b105_b50_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -77,10 +104,10 @@ test_dataset_kwargs:
   zero_ann: false
 
 val_dataset_list:
-  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
     split: ImageSets/val.txt
     name: instrument
-  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
     split: ImageSets/val.txt
     name: tissue
 
@@ -105,6 +132,7 @@ model_kwargs:
   align_corners: false
   mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
+  gt_flow_downsample_mode: area
   log_interval: 100
 
   freeze_backbone: false
@@ -199,11 +227,11 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
@@ -219,13 +247,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

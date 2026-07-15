@@ -83,7 +83,27 @@ class RAFT(nn.Module):
         return up_flow.reshape(N, 2, 8*H, 8*W)
 
 
-    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
+    @staticmethod
+    def _derive_confidence(corr, radius=4):
+        """
+        corr: [B, levels*(2r+1)^2, H, W] — the concatenated correlation-pyramid
+              local lookup already computed each GRU iteration (same tensor fed
+              to update_block), not an extra pass.
+        Returns confidence in (0,1], shape [B,1,H,W]: max softmax probability
+        over the FINEST-level (level 0, native-resolution) local correlation
+        window. A sharp, single-peaked window (confident, unambiguous match)
+        gives a value near 1; a flat/multi-modal window (ambiguous match —
+        occlusion, low texture, specular highlight) gives a value near
+        1/window_size. Cheap: no extra RAFT forward pass, just a softmax+max
+        over a tensor that's already in memory.
+        """
+        window = (2 * radius + 1) ** 2
+        finest = corr[:, :window]
+        probs = torch.softmax(finest, dim=1)
+        conf, _ = probs.max(dim=1, keepdim=True)
+        return conf
+
+    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False, return_confidence=False):
         """ Estimate optical flow between pair of frames """
 
         image1 = 2 * (image1 / 255.0) - 1.0
@@ -139,6 +159,10 @@ class RAFT(nn.Module):
             flow_predictions.append(flow_up)
 
         if test_mode:
+            if return_confidence:
+                conf = self._derive_confidence(corr, radius=self.args.corr_radius)
+                conf = F.interpolate(conf, size=flow_up.shape[-2:], mode='bilinear', align_corners=False)
+                return coords1 - coords0, flow_up, conf
             return coords1 - coords0, flow_up
-            
+
         return flow_predictions

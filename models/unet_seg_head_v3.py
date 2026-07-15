@@ -26,11 +26,13 @@ Aux heads at H/32, H/16, H/8 stored in self.last_aux_logits.
 Interface identical to MultiScaleSegHead / UNetSegHeadV2.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .multi_scale_seg_head import _ASPPModule
 
 
 def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -74,6 +76,8 @@ class UNetSegHeadV3(nn.Module):
         use_flow_feat: bool = False,
         flow_in_channels: int = 64,
         flow_drop_p: float = 0.5,
+        use_aspp: bool = False,
+        aspp_rates: Tuple[int, int, int] = (2, 4, 6),
         # compatibility shims
         in_channels=None, in_index=None, input_transform=None,
         channels=None, norm_cfg=None, loss_decode=None,
@@ -91,7 +95,12 @@ class UNetSegHeadV3(nn.Module):
         m = mid_channels
 
         # ── Stage 1: feat3 H/32 ───────────────────────────────────────────────
-        self.proj3 = _proj(c3, m)
+        # proj3 is either a 1×1 projection or ASPP (when use_aspp=True).
+        # ASPP captures multi-scale context at the bottleneck before decoding.
+        if use_aspp:
+            self.proj3 = _ASPPModule(c3, m, rates=aspp_rates)
+        else:
+            self.proj3 = _proj(c3, m)
         self.stage1_conv = _conv_block(m, m)
         self.aux_seg1 = nn.Conv2d(m, num_classes, 1)
 

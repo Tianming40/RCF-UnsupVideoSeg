@@ -1,29 +1,37 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v85.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v85 = v75 (+g5 data, NO bg removal) + PER-CHANNEL learnable residual scale
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v75:
+#   decode_head.use_per_channel_residual_scale: true
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# NOTE: originally spun off v78 (which includes use_bg_affine_removal), but
+# bg removal was found to regress v75's offline result (v78 online 1.340 vs
+# v75's 1.390, and v75 uniquely keeps the instrument in a SINGLE channel
+# offline — all bg-removal variants split 2ch). Base is v75 instead, with
+# bg removal OFF, so this experiment isolates the residual-scale change only.
+#
+# residual_adjustment_scale (=10, global scalar shared by all 5 channels)
+# becomes a learnable [mask_layer] vector, init'd to 10 so behaviour matches
+# v75 exactly at step 0 (verified: max diff 4.8e-7 at init). Background and
+# instrument channels need very different residual freedom — bg is ~static,
+# instrument moves non-rigidly. v77 (global scale 10→5) hurt instrument
+# specifically (std 0.032, worst of batch) because a uniform cut punishes
+# channels that actually needed the freedom. Here each channel's scale can
+# shrink or grow independently: background channels can tighten (forcing
+# mask+affine to explain more) while instrument channels keep slack.
+# Eval sets untouched; epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v85
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +75,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -199,9 +207,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -219,13 +225,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_per_channel_residual_scale: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

@@ -1,0 +1,305 @@
+# rcf_cmc_grasp0_tissue_ft_v109.yaml
+#
+# v109 = v106 + per-source cycle-consistency confidence gating, applied ONLY
+# to bridge pairs (b105/b50), gap1 (g0/g5/g10) left effectively unaffected.
+# ALSO includes topk_scale_normalize (added after the base version was
+# planned — see below), since without it bridge samples barely get any
+# gradient regardless of this version's own mechanism.
+#
+# Changes vs v106:
+#   decode_head.use_cycle_conf: true
+#   decode_head.cycle_conf_sigma: 50.          # default (g0/g5/g10) — near-off
+#   decode_head.cycle_conf_sigma_overrides: {"_b105": 5., "_b50": 4.}
+#   decode_head.topk_scale_normalize: true
+#
+# topk_scale_normalize background: measured offline (real v106 dataloader +
+# v106's own checkpoint, script topk_bridge_survival.py) that hard topk=4
+# selection ranks samples by RAW squared-error loss, which scales with GT
+# flow magnitude squared — bridge pairs (~3-4x larger GT flow than gap1)
+# had ~7-9x larger raw loss and only ~15% topk survival vs ~72% for gap1 in
+# the SAME batches (ResolutionGroupedBatchSampler mixes them freely). This
+# meant bridge samples were being starved of gradient almost entirely,
+# independent of any other fix. topk_scale_normalize ranks by GT-flow-scale-
+# normalised (relative) error instead — verified this brings bridge's
+# survival rate up to ~40%, roughly matching its ~37% share of the split —
+# while the loss actually backpropagated for selected samples is unchanged
+# (only the SORTING criterion is normalised). See README.
+#
+# Background: v72 already tested use_cycle_conf globally (σ=1.0) on gap1-only
+# data and it HURT (sum 132.61 vs v64's 138.89) — README's recorded reason:
+# gap1 cycle error is already tiny (median 0.28px, "nothing to filter") and
+# σ=1.0 also suppressed legitimate large-motion instrument edges (occlusion
+# false positives). That result says nothing about bridge pairs, which were
+# measured this session via an offline scan of Flows_NewCT/BackwardFlows_NewCT
+# in CMC_grasp0_5_10_merged_bwdif (script: cycle_conf_stats.py):
+#
+#   group   pixel median   pixel p90   frac>5px   frac>10px
+#   g0            0.369        3.04      6.37%       3.15%
+#   g5            0.268        2.04      4.39%       2.36%
+#   g10           0.226        1.89      4.73%       2.69%
+#   b105          0.538       12.61     16.76%      11.52%
+#   b50           0.824       20.18     23.45%      16.34%
+#
+# gap1 numbers match the v72-era 0.28px reference — confirms that finding.
+# Bridges have a much heavier tail (p90 12-20px vs 2-3px, ~17-23% of pixels
+# >5px vs ~5%) — real occlusion/non-rigid-motion signal to filter, unlike
+# gap1's near-clean distribution. Reusing v72's σ=1.0 globally would both
+# fail to meaningfully gate the bridges (still too sharp relative to their
+# scale) AND repeat the gap1 regression, so this uses the new per-source
+# override mechanism instead (cycle_conf_sigma_overrides, same pattern as
+# clamp_flow_t_overrides — substring-matched against seq_names, already
+# threaded through the full forward chain).
+#
+# σ choice (not swept, single reasoned pick): default σ=50 makes gap1's
+# conf ≈ exp(-3/50) ≈ 0.94 at its own p90 — essentially unaffected, avoiding
+# v72's regression. Bridge σ=5/4 gives conf ≈ exp(-5/5) ≈ 0.37 at the >5px
+# threshold (moderate suppression) down to exp(-20/4) ≈ 0.007 at the worst
+# b50 tail (near-total suppression) — sharp enough to actually gate the
+# occluded/non-rigid regions the offline scan found, without touching the
+# majority of bridge pixels that are cycle-consistent.
+#
+# Isolated single-variable test on top of v106 (which itself isolated the
+# clamp override on top of v105/re-deinterlaced+bridge data) — same dataset,
+# same split, same clamp overrides; only cycle-conf gating is added.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v109
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train_g0379_g5601_g10601_b105_b50_clean.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/val.txt
+  zero_ann: false
+
+val_dataset_list:
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
+    split: ImageSets/val.txt
+    name: instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+    split: ImageSets/val.txt
+    name: tissue
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    clamp_flow_t_overrides: {"_b105": 25., "_b50": 25.}
+    use_cycle_conf: true
+    cycle_conf_sigma: 50.
+    cycle_conf_sigma_overrides: {"_b105": 5., "_b50": 4.}
+    topk_scale_normalize: true
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHead
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

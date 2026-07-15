@@ -1,29 +1,28 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v76.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v76 = v64 + strengthened DINO visual-consistency signal
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   w_dino:          0.1 → 0.5   (v47 evidence: w_dino=3 was FCNHead-era best 138.28;
+#                                 0.5 is a calibrated middle step for MSHead+merged data)
+#   dino_input_size: 128 → 256   (16×16 → 32×32 patch tokens, 4× finer DINO features;
+#                                 256 % patch_size(8) == 0, pos-emb interpolates)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Rationale: DINO features carry strong objectness — direct counterforce against
+# instrument channel splitting. Risk: too much DINO pulls masks toward pure visual
+# clustering, ignoring motion; hence 0.5 not 3.0.
+# Everything else identical to v64. epochs 80 (best epochs land <62 historically).
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v76
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -111,12 +110,12 @@ model_kwargs:
   freeze_backbone_stages: 0
   freeze_flow_head: false
 
-  w_dino: 0.1
+  w_dino: 0.5
   dino_channels: null
   dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
   dino_arch: vit_small
   dino_patch_size: 8
-  dino_input_size: 128
+  dino_input_size: 256
 
   instrument_channels: []
   instrument_channel: 1
@@ -199,9 +198,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -225,7 +222,9 @@ model_kwargs:
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

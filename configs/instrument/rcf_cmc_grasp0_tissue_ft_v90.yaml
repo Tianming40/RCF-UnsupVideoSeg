@@ -1,29 +1,33 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v90.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v90 = v64 + HDC (Hybrid Dilated Convolution) dilation rates for ASPP
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   decode_head2.aspp_rates: [6, 12, 18] → [5, 9, 17]
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# v64's rates [6,12,18] share a common factor (gcd=6 pairwise) — the classic
+# "gridding artifact" trigger (Wang et al., "Understanding Convolution for
+# Semantic Segmentation", 2018): each dilated conv's fixed sampling grid
+# leaves periodic gaps, and when consecutive rates share a common factor the
+# gaps ALIGN across branches instead of being filled in by each other,
+# leaving small blind spots in the effective receptive field.
+# [5,9,17] is pairwise coprime (gcd=1 for every pair) — same coverage range
+# (~5-17 vs ~6-18) but the sampling grids of the three branches no longer
+# align, so their blind spots fill each other in. Purely a rate substitution:
+# zero new parameters, zero code changes (aspp_rates is already a plain
+# config-driven tuple in _ASPPModule).
+# Everything else identical to v64. epochs 80 (was 150; best epochs land <62).
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v90
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -199,9 +203,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -225,7 +227,9 @@ model_kwargs:
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [5, 9, 17]
     dropout_ratio: 0.1
     align_corners: false
 

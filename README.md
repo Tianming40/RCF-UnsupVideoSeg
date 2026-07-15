@@ -1349,7 +1349,7 @@ Evaluated on:
 
 ## Grasp0 Segmentation — Version Summary
 
-Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); tissue mIoU = two-pass oracle excluding the instrument channel. Numbers are the best checkpoint per version.
+Eval protocol: Phases 1–3 use the single-channel protocol (instrument = fixed oracle-detected channel; tissue = two-pass oracle excluding it). Phases 4–6 use the **adaptive 1ch/2ch protocol** (see "Adaptive offline eval protocol" below) — the `mode` column shows which one was triggered. Numbers are the best checkpoint per version.
 
 ### Phase 1 — Baseline
 
@@ -1381,13 +1381,272 @@ Eval protocol: instrument mIoU = single best channel (fixed, oracle-detected); t
 | v58 | clamp_flow_t 10→20, topk 4→6 | 64.48 | 69.96 | 134.44 |
 | v59 | Flow guidance + clamp=20 + topk=6 | 62.54 | 64.18 | 126.72 |
 | v60 | topk 4→2 (easy-example mining) | 63.86 | 68.51 | 132.37 |
-| <span style="color:red">**v61**</span> | <span style="color:red">**UNetSegHead** (top-down coarse-to-fine) + edge feat</span> | <span style="color:red">64.01</span> | <span style="color:red">72.51</span> | <span style="color:red">**136.52**</span> |
+| <span style="color:red">**v61**</span> | <span style="color:red">**UNetSegHead** (top-down coarse-to-fine) + edge feat</span> | <span style="color:red">61.82</span> | <span style="color:red">74.73</span> | <span style="color:red">136.55</span> |
 | v62 | **UNetSegHeadV2** (true FPN, standard backbone strides) | 62.83 | 72.65 | 135.48 |
-| v63 | **UNetSegHeadV3** — true skip-concat (cat instead of add at lateral connections) | — | — | — |
-| v64 | MultiScaleSegHead + **ASPP** (parallel dil=6/12/18 + GAP, replaces single fuse_conv) | — | — | — |
+| v63 | **UNetSegHeadV3** — true skip-concat (cat instead of add at lateral connections) | 66.97 | 68.63 | 135.60 |
+| v63† | v63 ep32, **2-channel oracle** (instrument split across ch2+ch3) | 66.43 | 71.14 | **137.57** |
+| <span style="color:red">**v64**</span> | <span style="color:red">MultiScaleSegHead + **ASPP** (parallel dil=6/12/18 + GAP, replaces single fuse_conv)</span> | <span style="color:red">**65.57**</span> | <span style="color:red">**73.32**</span> | <span style="color:red">**138.89** ⭐</span> |
+
+> Eval results (offline, `run_grasp0_eval_v61_v63_v64.sh`): best checkpoint per version.
+> v61 best: ep177 (sum 136.55); v63 best: ep13 (sum 135.60, single-ch); v64 best: ep25 (sum 138.89, new overall best).
+> † v63 instrument splits across ch2+ch3 after ep13: single-channel eval penalises the split. Re-eval with 2-channel oracle (`run_grasp0_eval_v63_oracle2.sh`): ep32 reaches inst=66.43/tissue=71.14/sum=137.57, surpassing ep13. Tissue quality continues to improve even when instrument assignment is ambiguous.
 
 ### Phase 4 — FlowAggregationHead improvements
 
-| Version | Key change | Inst mIoU | Tissue mIoU | Sum |
-|---------|-----------|:---------:|:-----------:|:---:|
-| v65 | **FlowAggregationHeadV3**: GroupNorm in flow_feat_before_agg + magnitude-weighted segment aggregation (high-motion pixels up-weighted) | — | — | — |
+Offline eval (260703, job 373, `run_grasp0_eval_v65_v77.sh`, adaptive 1ch/2ch protocol — see note below). Best checkpoint per version.
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| v65 | **FlowAggregationHeadV3**: GN + magnitude-weighted aggregation | 1ch | **67.52** | 54.38 | 121.90 |
+| v66 | v64 + FlowAggV3 (GN + magnitude, mag_clamp=1.5) | 2ch | 56.31 | 53.91 | 110.22 |
+| v67 | v63 + ASPP at UNet bottleneck (rates=[2,4,6]) | 1ch | 59.33 | 68.69 | 128.02 |
+| v68 | v64 + FlowAggV3 (**GN only**, no magnitude weighting) | 1ch | 60.64 | 72.11 | 132.75 |
+
+> v65/v66 (magnitude weighting): collapse mode — everything moving gets pulled into the instrument channel; inst 67.5 is the all-time high but tissue collapses to 54. v67: ASPP rates too large for 12×12 bottleneck. Magnitude weighting abandoned.
+
+### Phase 5 — Seg-head refinements (all ≤ v64; head capacity saturated)
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| v69 | v64 + MultiScaleSegHeadV2 (concat+1×1 fusion + NonLocalBlock after ASPP) | 1ch | 63.12 | 69.82 | 132.94 |
+| v70 | v64 + AttentionGate on feat0 skip | 1ch | 58.20 | 73.31 | 131.51 |
+| v71 | v69 + AttentionGate (all three) | 2ch | 59.77 | 70.68 | 130.45 |
+
+> Conclusion: no seg-head refinement beats v64's plain ASPP. The bottleneck is training-signal quality, not model capacity. Phase closed.
+
+### Phase 6 — Signal quality & data (diagnosis-driven)
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| v72 | v64 + cycle-consistency confidence gating (σ=1.0) | 1ch | 64.34 | 68.27 | 132.61 |
+| v73 | v64 + background flow removal (spatial median, pre-aggregation) | 2ch | 64.24 | 68.94 | 133.18 |
+| v74 | v72 + v73 combined | 1ch | 60.93 | 69.05 | 129.98 |
+| <span style="color:red">**v75**</span> | <span style="color:red">v64 + **grasp5 data** (980 → 1581 pairs, +61%)</span> | <span style="color:red">**1ch**</span> | <span style="color:red">63.42</span> | <span style="color:red">**75.08**</span> | <span style="color:red">**138.50**</span> |
+| v76 | v64 + DINO boost (w 0.1→0.5, input 128→256) | 2ch | 62.14 | 66.06 | 128.20 |
+| v77 | v64 + residual tightened (scale 10→5) | 1ch | 60.80 | 70.49 | 131.29 |
+
+> **v75 (+g5 data) is the Phase-6 winner** (138.50, within noise of v64's 138.89) and the only version where the instrument stays in a **single channel** — the extra half-grasp data appears to bind shaft+jaw into one channel. All bg-removal variants split 2ch.
+> v72: flows are already clean (cycle error median 0.28px) — nothing to filter; σ=1.0 also suppresses instrument edges (occlusion zones). v76: DINO balance point shifted with merged data; v47's w=3 evidence didn't transfer. v77: tightening the residual destabilises channel assignment (inst std 0.032, worst of batch).
+
+### Adaptive offline eval protocol (260703)
+
+Signal diagnosis showed every version splits the instrument across 2–3 channels **within the same frame** (union frequency 377 ≫ 213 frames): shaft and jaw have different motion patterns, so common fate correctly decomposes them as parts. This is a granularity mismatch with the whole-instrument GT, not temporal channel drift. `run_grasp0_eval_v65_v77.sh` therefore picks the protocol per checkpoint:
+- **1ch** (second channel < 10% of detect frames): instrument fixed top-1 channel; tissue oracle excludes it.
+- **2ch**: instrument greedy-union oracle over top-2; tissue oracle over the remaining channels.
+
+### Phase 7 — Supervision density & data cleaning (260706, job 381, adaptive protocol)
+
+Offline eval, best checkpoint per version:
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| <span style="color:red">**v83**</span> | <span style="color:red">v78 + **boundary dilate 7→15 + floor 0.1** + clean split (−24 toxic pairs)</span> | <span style="color:red">**1ch**</span> | <span style="color:red">66.76</span> | <span style="color:red">72.60</span> | <span style="color:red">**139.36** ⭐</span> |
+| v79 | v78 + affine bg removal (vs v73's median) | 1ch | 66.23 | 67.43 | 133.66 |
+| v78 | v75 (+g5) + v73 (bg removal, median) combined | 1ch | 59.85 | 73.73 | 133.58 |
+| v82 | v78 + mask_size 96→128 | 1ch | 60.54 | 72.68 | 133.22 |
+| v81 | v78 + mask_layer 5→6 | 2ch | 62.14 | 70.63 | 132.77 |
+| v80 | v64 + EMA (eval_on_ema) | 1ch | 55.77 | 68.80 | 124.57 |
+
+> **v83 is the new all-time best (139.36), surpassing v64's 138.89.** Supervision density (raising warp-loss coverage from ~20% to ~40% of pixels, non-boundary floor 0.1) plus dropping 24 toxic pairs (1 blur, 23 RAFT-failure flows with p99 up to 298px) delivers the first confirmed win beyond v64's architecture change. v83 keeps the instrument in a single channel (like v75) and also improves tissue precision/recall balance.
+> v79 (affine bg removal) does not beat v73/v78 (median) — global affine fit is biased by instrument pixels more than the simpler median. v81 (6 channels) reverted to 2ch mode and did not help — the extra channel didn't give tissue the room the diagnosis hypothesized. v82 (mask 128) marginal — confirms the seg head's native 96×96 output caps the gain from finer flow supervision alone. **v80 (EMA) underperforms — likely still warming up early in training (EMA lags main weights); best epochs available so far are all early (≤9), needs re-checking once training resumes/completes.**
+
+### Phase 8 — Per-channel residual scale & boundary-align loss (260707, offline eval)
+
+Offline eval, best checkpoint per version:
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| <span style="color:blue">**v85**</span> | v75 (+g5, **no** bg removal) + **per-channel learnable residual scale** | 1ch | 63.10 | **75.33** | **137.59** |
+| v86 | v75 + new **boundary-align loss** (`w_boundary_align=0.05`) | 2ch | 62.26 | 74.82 | 132.56 |
+| v84 | v83 **minus** bg removal (isolates its contribution) | 2ch | 61.09 | 74.40 | 127.68 |
+
+> **v85 confirms the inst/tissue "seesaw" pattern**: its tissue F1 (75.33) is the best of the whole project (even above v75's 75.08), while instrument stays mediocre (63.10) — consistent with the hypothesis that per-channel residual freedom (background/tissue channels can tighten independently) helps tissue specifically, orthogonal to v83's bg-removal+density mechanism (which favours instrument). v85 does **not** beat v83's 139.36 alone, but is the strongest tissue-favouring result to date.
+> **v84 vs v83 confirms bg removal is a load-bearing component, not incidental**: same data+density+clean split, only bg removal removed — mode reverts to **2ch** (instrument re-splits into shaft+jaw, ch2+3) and sum drops 11.7 points (139.36→127.68). Supervision density alone, without first cleaning the flow signal, destabilises channel assignment.
+> v86 (boundary-align loss) reverted to 2ch and landed below v83 — the new loss doesn't yet counteract the channel-split tendency the way bg removal does; needs to be tested stacked *with* bg removal+density rather than on bare v75.
+
+### Phase 9 — v87–v89: combining v83's instrument gain with v85's tissue gain (260707, offline eval)
+
+Diagnosis motivating this phase: v83 (bg removal + supervision density) and v85 (per-channel residual scale) pull the inst/tissue balance in **opposite directions** from the same v64+g5 base — mechanistically near-orthogonal (bg removal/density clean the flow signal fed into aggregation; per-channel scale changes residual freedom per channel), acting on different parts of `aggregate_flow_with_residual` with no code-level conflict. Hypothesis: combining should recover v85's tissue gain while keeping v83's instrument gain.
+
+- **v87** = v83 + per-channel residual scale (v85) — the direct combination test.
+- **v88** = v83 + new **DINO cross-channel merge loss** (`w_dino_merge=0.05`): pulls a channel *pair's* DINO centroids together, weighted by existing soft-mask overlap (`mask_i·mask_j`) — only channels that already border each other *and* look visually similar get pulled closer. No spatial-position heuristic (a "ring around instrument = tissue" prior was considered and rejected — fails for blood/specular/smoke near the instrument, or pre-contact frames); purely appearance + existing-overlap driven, channel-index-agnostic like the existing `w_dino` it's paired with. Targets the same "instrument boundary release → imprecise tissue reabsorption" mechanism identified from v83's P/R shift (inst precision +8, tissue precision −3.75 from v78→v83) — the hypothesis is that letting visually-similar bordering channels merge on their own reduces spurious channel splits without an ad-hoc spatial rule.
+- **v89** = v87 + v88 (all three: bg removal + density + per-channel scale + DINO merge) — the full kitchen-sink combination.
+
+Offline eval, best checkpoint per version:
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| v87 | v83 + per-channel residual scale | 1ch | 64.61 | 72.56 | 137.17 |
+| v88 | v83 + DINO merge loss | 1ch | 61.34 | 72.74 | 134.08 |
+
+> **Hypothesis rejected — neither combination beats v83's 139.36.** v87's instrument actually *drops* from v83's 66.76 to 64.61 while tissue stays essentially flat (72.56 vs 72.60) — the expected tissue recovery from v85's mechanism did not transfer once bg removal had already cleaned the flow signal (v85's tissue gain was demonstrated *without* bg removal; with it, the residual has less "work" left for per-channel scale to redistribute). v88 underperforms on both axes — stacking a new loss onto an already-tuned recipe just adds competing gradients rather than the intended synergy. v87's best epoch (ep9) landing well below v83's ep8 on the same nominal epoch also suggests the extra learnable parameter changes training dynamics/variance rather than cleanly composing.
+> **v83 (139.36) remains the standing champion.** v89 (all four components stacked) is unlikely to exceed it given both individual additions already underperform, though its result is pending. This closes the "kitchen sink" combination direction — v85's per-channel scale and the new DINO merge loss do not compose additively with v83's recipe; further gains likely require an independent signal source (e.g. RPCA-based instrument pseudo-labels, discussed earlier) or offline CRF post-processing on top of v83 directly, rather than more loss/architecture stacking on this recipe.
+
+### Phase 10 — v90–v96: classic multi-scale/receptive-field architecture tricks (offline eval, `eval_batch_v89_v97_260709_083823`)
+
+Departure from loss/data stacking (Phase 9 closed that direction) back to **structural** changes in the spirit of what actually worked before (ASPP, the one architectural change that beat baseline).
+
+| Version | Key change | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:---------:|:-----------:|:---:|
+| v90 | v64 + **HDC** dilation rates `[6,12,18]→[5,9,17]` (pairwise coprime, fixes gridding artifact, zero new params) | 1ch | 62.82 | 70.01 | 132.83 |
+| v91 | v64 + **Strip Pooling** after ASPP (long/thin receptive field for shaft-like structures) | 1ch | 66.23 | 71.36 | 137.59 |
+| v92 | v85 (per-channel residual scale) + Strip Pooling | 2ch | 61.03 | 72.33 | 133.36 |
+| v93 | v83 + HDC (`[5,9,17]`) | 1ch | 64.04 | 73.14 | 137.18 |
+| v94 | v64 + **DenseASPP** (cascaded dilated convs, rates `[3,6,12,18]`, more param-efficient than plain ASPP) | 2ch | 64.28 | 67.23 | 131.51 |
+| v95 | v83 + DenseASPP | 1ch | 66.38 | 71.51 | 137.89 |
+| v96 | v64 + **heteroscedastic uncertainty** on warp loss (learned per-pixel σ, NLL loss) | 1ch | 61.50 | 73.49 | 134.99 |
+
+> **None beat v83's 139.36.** v91 (Strip Pooling on v64, 137.59) and v95 (DenseASPP on v83, 137.89) come closest but still fall short — both plausible-sounding receptive-field tricks land 1.5–2 points under baseline. HDC (v90/v93) is neutral-to-mildly-negative on both bases. DenseASPP on v64 (v94) reverts to 2ch mode and drops tissue sharply (67.23, well below v64's own ~73) — the parameter efficiency didn't translate to better separation.
+> **v96 (heteroscedastic σ) is the first clean negative result with a mechanistic explanation**, later confirmed and amplified by v98 (see Phase 11): comparing v96 against v64's own baseline over the same 80-epoch window (ep60–79) shows peak sum drops (1.390→1.350) and, more tellingly, **instrument mIoU falls from 0.599→0.544** while tissue is untouched (0.726→0.723) — a targeted, not general, degradation. A follow-up epistemic-vs-aleatoric probe (TTA-based prediction variance vs the learned σ map) found the learned σ nowhere near as spatially concentrated on the instrument as the true (epistemic) uncertainty is — the σ head learns a nearly-flat baseline rather than sharply localising to genuinely hard regions, diluting gradient roughly uniformly rather than selectively. Net effect: σ discounts supervision hardest exactly where CMC already has the least signal (instrument, ~1% of frame area), with no compensating benefit elsewhere.
+
+### Phase 11 — v97–v104: signal-routing mechanisms on the v83/v64 base (260709–260712, offline eval, `eval_batch_v89_v97` + `eval_batch_v97_v104_260712_084620`)
+
+Motivated by an architecture-as-EM framing: `aggregate_flow_with_residual` is effectively an **M-step** (per-channel rigid motion models fit via closed-form weighted least squares / a small pooling network), but the model never had an explicit **E-step** — mask (assignment) is predicted purely from RGB appearance with no signal telling it whether its assignment agrees with which channel's own fitted motion model actually explains a pixel's true flow. This phase probes that gap plus several other structural asymmetries found by close code reading, all isolated single-variable changes on the v83 or v64 base.
+
+| Version | Key change | Base | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:----:|:---------:|:-----------:|:---:|
+| v97 | Flow-embedding metric-learning loss (intra/inter centroid, reuses `flow_feat_before_agg`) | v64 | 1ch | 60.66 | 70.50 | 131.16 |
+| v98 | v83 + heteroscedastic σ (same mechanism as v96, stacked on the champion instead of plain v64) | v83 | 1ch | 53.43 | 74.23 | 127.66 |
+| v99 | Cross-frame mask-warp consistency loss (mask2 warped by fw_flow should agree with mask1) | v83 | 1ch | 61.46 | 73.60 | 135.06 |
+| v100 | Residual head (`decode_head3`) given multi-scale input (feat0 96×96 + feat3, via `resize_concat`) instead of feat3-only | v83 | 1ch | 63.29 | 73.30 | 136.59 |
+| v101 | topk hard-cutoff (4/8) → **soft** softmax-weighted sample reweighting (z-scored, all 8 samples contribute) | v83 | 1ch | 64.86 | 70.94 | 135.80 |
+| <span style="color:red">**v102**</span> | <span style="color:red">GT flow downsample bilinear → **area** before the warp loss</span> | v83 | <span style="color:red">**1ch**</span> | <span style="color:red">65.69</span> | <span style="color:red">**74.08**</span> | <span style="color:red">**139.77** ⭐</span> |
+| v103 | Residual + affine **disabled entirely** (pure mask-weighted mean, no per-pixel correction) | v83 | 2ch | 48.08 | 51.20 | 99.28 |
+| v104 | **E-step-consistency** auxiliary loss (mask pushed toward `softmax(-per_channel_fit_error/T)`, target detached) | v83 | 1ch | 62.87 | 73.19 | 136.06 |
+
+> <span style="color:red">**v102 (139.77) is the new all-time best**</span>, taking the record from v83 (139.36, +0.41). Worth reading precisely, though: the composition shifted rather than improved uniformly — **instrument is slightly down (66.76→65.69) and tissue is up (72.60→74.08)**, and +0.41 sum is small next to this project's observed checkpoint-to-checkpoint noise. It's a real (if modest) record, not a dominant win. The online-training curve for v102 had suggested a cleaner win — all three axes higher, tighter late-epoch variance — than the offline eval actually delivered, another instance of the online-curve-overstates-the-result pattern seen before with v75 and v91: trust the offline number, not the online shape.
+> **v98 is the second confirmation that heteroscedastic σ is a systematic, worsening problem, not base-dependent noise** — and offline-vs-offline (not mixing with the online-curve numbers used for v96's initial diagnosis), it's markedly worse on the champion base: v64→v96 drops instrument 65.57→61.50 (−4.1), v83→v98 drops it 66.76→53.43 (−13.3), roughly **3× the damage**. The mechanistic read: v83's win comes specifically from *widening* boundary supervision coverage (`boundary_dilation`/`boundary_floor`), and boundary pixels are exactly where σ is most likely to be (wrongly) inflated — the two mechanisms compete for the same territory and σ wins, quietly erasing much of v83's own contribution.
+> **v103 (residual off) is unambiguously the worst result in this batch** (99.28, and reverted to 2ch/split-channel mode on every checkpoint) — confirms the residual+affine terms are load-bearing, not a "lazy escape hatch" the model can be forced to do without; a pure piecewise-constant common-fate model cannot represent this data's actual (non-rigid, articulated) motion.
+> **v99, v100, v104 (mask-warp consistency, residual multi-scale input, E-step consistency) are all mildly negative** (135–137, i.e. 2–4 points under v83) despite each being motivated by a genuine, verified structural gap (no cross-frame consistency term; residual head physically cannot see the highest-resolution feature map; no E-step-like signal existed at all). None of the three broke anything as badly as v98/v103, but none delivered a net gain either — consistent with this project's broader pattern that *routing/consistency* fixes are lower-leverage than *signal density/data-quality* fixes (v75, v83's own wins).
+> **v101 (soft topk) is inconclusive/messy**: online curve showed a fast, tight convergence to a *lower* instrument plateau than v83 (0.529 vs 0.599, ep46–65 average) — a genuinely concerning signal — and offline eval confirms no checkpoint beats v83, with the `last` checkpoint reverting to 2ch mode and cratering to 115.17. Whether softmax-reweighting itself is harmful or just interacts badly with something else (e.g. the z-score normalisation's behaviour under this base's specific loss-value distribution) is not disentangled yet.
+>
+> **Net verdict for this phase**: the EM/E-step framing motivated four of the eight versions (v97, v99, v101 softening topk's implicit robust-statistics role, v104) but none produced a clean win — this doesn't invalidate the framing as a description of the architecture, but does suggest the missing E-step isn't the current bottleneck, or that these particular implementations of it aren't yet capturing it usefully. Combined with Phase 10's similar string of near-misses, the pattern first seen in Phase 5/9 continues to hold: **this architecture at this data scale is much easier to make worse than better** — v83's signal-density recipe (Phase 7) is still the only mechanism-level change in the project's history that produced a decisive, reproducible win.
+
+## Dataset Diagnosis — CMC vs data_medical (260708)
+
+Signal-quality comparison between the two available datasets, motivated by the observation that the same architecture performs differently on each. **Two independent axes — neither dataset wins on both.**
+
+### Structural differences (the primary reason behavior differs — not just "quality")
+
+| | **data_medical** | **CMC** (grasp0_5_10_merged) |
+|---|---|---|
+| Data type | **8 continuous video sequences**, 225 frames each | **980–1581 pre/post frame pairs** (2 frames per "sequence") |
+| Total frames | 1800 (real continuous video) | 2 frames per pair, no true temporal continuity |
+| Training sampling | Random frame-gap (1–3) sampled *within* a sequence | Fixed pre/post pair |
+| Resolution | **1280×1024** | 720×576 |
+| Annotation | Multi-class (0–19+, EndoVis-style part-level instrument labels) | 5-class semantic (bg/instrument/tissue) |
+
+data_medical is the classic EndoVis instrument-segmentation dataset (continuous surgical video); CMC is sparse before/after-state sampling. Same architecture, fundamentally different temporal density and label granularity — not directly comparable without accounting for this.
+
+### Image quality
+
+| Metric | data_medical | CMC |
+|---|:---:|:---:|
+| Brightness (median) | 94.8 | ~91–95 (similar) |
+| Contrast (median) | **45.1** | ~36 (CMC lower) |
+| Blurry frames (lapvar<100) | 18% | 12–15% (similar) |
+| **comb_row** (interlace/vertical-detail metric) | **1.37** | **1.00** |
+| Overexposed | 0.07% | 0.1% (similar) |
+
+`comb_row` ≈ 1.0 is **not** "cleaner" — natural (non-interlaced) images typically show ~1.15–1.2 for this row/column-symmetry metric. CMC's 1.00 is evidence of **over-smoothing from the deinterlace pipeline**: real vertical detail was destroyed along with the interlace artifact, a permanent, unrecoverable loss for boundary-precision purposes (previously diagnosed: this caps how tight the instrument-boundary IoU can ever get on CMC, independent of model/training changes). data_medical's higher contrast and comb_row indicate the image itself retains more genuine structure — **CMC is *not* better here.**
+
+### Flow quality — larger magnitude, more per-pixel cycle noise — but NOT necessarily worse training signal
+
+| Metric | data_medical | CMC |
+|---|:---:|:---:|
+| Flow magnitude (mean) | **18.85** | 4–6 |
+| Flow p99 | **96.82** | 22–45 |
+| Cycle error, absolute (median) | 1.65 | 0.18–0.46 |
+| Cycle error >3px, absolute (bad px) | 41.8% | 6.6–14.6% |
+| **Cycle error, relative to flow magnitude** (median) | 0.154 | 0.080 |
+| Extreme-flow frames (>150px) | 39% (31/80) | rare |
+
+**Correction (260708): the initial "data_medical flow is noisier → worse signal" conclusion was wrong** — it graded flow quality with a metric (absolute cycle-error px) that this architecture doesn't actually depend on, and empirically the model trains *well* on data_medical despite these numbers. Re-examining the mechanism:
+
+1. **Mask-weighted flow aggregation is a spatial average**, and averaging suppresses per-pixel noise (∝ 1/√N over the mask's pixel count) regardless of per-pixel relative noise level — what matters for *channel separability* is the absolute gap between channels' mean motion, which scales with the true motion magnitude. data_medical's flow is ~3.5× larger in magnitude than CMC's, so the aggregated per-channel signal is likely *better separated* even though individual pixels look noisier.
+2. **The warp-loss boundary mask (`detect_flow_changes_batch`) keys off flow *angle*, not magnitude.** Angular estimation error from a fixed positional noise shrinks as the flow vector gets longer (`atan(noise/magnitude)` → 0 as magnitude grows) — so data_medical's larger flow vectors likely give *more* stable angle estimates, which is the actual quantity this architecture's supervision-masking depends on. Grading by cycle-error magnitude was the wrong axis.
+3. **A large share of "cycle inconsistency" reflects genuine occlusion/dis-occlusion from real fast instrument motion**, not RAFT failure — cycle consistency is expected to break at occluded pixels even for a perfect flow estimator. RCF's residual-correction and affine-relaxation machinery (`free_residual_with_affine`) exists specifically to absorb exactly this kind of aggregation-unexplainable discrepancy — it's tolerance the architecture was designed to have, not a defect it's fighting.
+4. **Continuous video with variable frame-gap sampling (1–3) gives richer motion-pattern diversity** than CMC's single fixed pre/post pair, an implicit regularisation CMC structurally cannot offer.
+
+### Conclusion — data_medical's larger, more richly-structured motion may be a stronger *raw* common-fate signal, not a noisier one
+
+| Axis | Likely stronger on | Why |
+|---|---|---|
+| Image spatial detail (contrast, vertical resolution) | **data_medical** | CMC's deinterlace pipeline over-smoothed real vertical detail (comb_row 1.00 vs natural ~1.15–1.2) |
+| Raw motion-signal strength for common-fate separation | **data_medical** (revised) | Larger flow magnitude → larger absolute inter-channel motion gap after mask-weighted averaging, and more stable angle estimates for boundary detection |
+| Per-pixel flow cycle-consistency (absolute/relative px) | CMC | Smaller motion, less occlusion churn — but this metric doesn't directly predict aggregated-signal quality for this architecture |
+
+Net: data_medical likely wins on *both* axes that matter to this architecture (image detail *and* effective common-fate signal strength), which is consistent with the empirical observation that it trains well. The earlier "CMC's cleaner flow should make it the more reliable dataset" framing was a category error — it applied a per-pixel noise metric to an architecture whose actual mechanism (spatial averaging + angle-based boundary detection) is largely robust to exactly that kind of noise, and instead benefits from motion magnitude.
+
+## CMC Re-deinterlacing (260713) — the old pipeline destroyed real information; a proper fix is in progress
+
+The "CMC's deinterlace over-smoothed vertical detail" finding above (comb_row 1.00) was re-investigated at the code level and confirmed with hard, reproducible evidence — then fixed.
+
+### The bug: the old deinterlace was exact row-duplication, not smoothing
+
+`tools/deinterlace_cmc_grasp0.py`'s `bob_deinterlace`:
+```python
+out[0::2] = out[1::2]   # every even row := an exact copy of the row below it
+```
+Verified directly on real output files: **every even row is byte-for-byte identical to the odd row below it, 100% of the time, on every image tested.** This is not blur/smoothing — it's outright duplication. Every 576-row CMC image has only 288 rows of real, independent information; the other 288 are mechanical copies. Any mechanism that depends on sub-2-row vertical precision (boundary localisation, fine instrument contours) is working against data that structurally cannot support it, independent of model or training choices.
+
+### Confirming interlacing is real (not assumed) — and resolution-dependent
+
+Before deciding how to fix this, checked whether the raw (pre-deinterlace) source is actually interlaced at all:
+
+- **Visual inspection** of raw frames (zoomed crops, both busy/high-detail and calm/low-motion regions) shows a clear, pervasive horizontal comb/venetian-blind pattern — present broadly across frames, not just at moving edges.
+- **Quantitative confirmation via ffmpeg's `idet` filter** (the standard interlace-detection tool), fed each sequence's *real* (pre, post) frame pair as a genuine 2-frame stream (a duplicated/looped single frame gives `idet` — and `bwdif` — nothing to detect; both need authentic inter-frame difference). Full scan, 601 sequences × 3 grasp offsets (3606 frames):
+
+| | TFF | BFF | Progressive | Undetermined |
+|---|:---:|:---:|:---:|:---:|
+| grasp0 | 884 | 0 | 318 | 0 |
+| grasp5 | 882 | 0 | 318 | 2 |
+| grasp10 | 876 | 2 | 318 | 6 |
+
+~73% TFF-interlaced, ~26.5% genuinely progressive (never interlaced) — same 318 sequences across all three grasp offsets (consistent with per-case recording equipment being fixed across a case's g0/g5/g10 samples).
+
+**Root cause of the progressive fraction: resolution.** CMC is a mix of 720×576 (PAL, 72.9%) and 1920×1080 (27.1%) source footage (438 vs 163 sequences per grasp offset — matches the Grasp10 Fine-tuning resolution breakdown table exactly). Targeted re-scan by resolution:
+
+| | TFF | Progressive |
+|---|:---:|:---:|
+| 576p sample (n=20) | 40/40 | 0 |
+| 1080p sample (n=20) | 2/40 | 38/40 |
+
+**576p is essentially 100% interlaced (expected — PAL is inherently interlaced by format); 1080p is essentially 100% progressive (expected — modern HD capture).** A blanket "deinterlace everything" pass would have been wrong in a *new* way on top of the old duplication bug: it would needlessly process the ~27% that was never interlaced.
+
+### The fix: `tools/deinterlace_cmc_bwdif.py`
+
+Per-sequence adaptive pipeline, replacing the naive duplication:
+1. **Detect**: run `idet` on the sequence's real (pre, post) pair (not a fake loop) → tff / bff / progressive / undetermined.
+2. **tff/bff** → deinterlace with ffmpeg's `bwdif` (motion-adaptive bob-weave: static regions keep real information from both fields via weave, only genuine motion regions fall back to spatial interpolation), fed the real (pre, post) pair for authentic temporal context — parity matched to the detected field order.
+3. **progressive/undetermined** → copied through unchanged, no processing.
+
+Verified end-to-end on real content before the bulk run: a raw frame showing heavy combing across an instrument's edge (exactly the boundary-precision-critical region this project cares about) came out with the comb artifact essentially eliminated and a clean edge after bwdif — a direct, visual, data-level improvement in exactly the failure mode (`comb_row`/boundary precision ceiling) diagnosed above.
+
+Output mimics `CMC_grasp0_5_10_merged/`'s directory structure (`JPEGImages/<stem>_g{0,5,10}/`) with entirely new content, written to a **new** dataset root `CMC_grasp0_5_10_merged_bwdif/` — does not touch/overwrite `CMC_grasp0_5_10_merged/`, which all current trained models and precomputed `Flows_NewCT`/`BackwardFlows_NewCT` still depend on. `ImageSets/*.txt` copied verbatim from the existing merged dataset (case IDs / split membership unchanged — only pixel content changes).
+
+**Status: full batch run complete** (1803 sequences, 3606 frames). Result breakdown: `{'tff': 1321, 'bff': 1, 'progressive': 477, 'undetermined': 4}` — matches the earlier detection scan closely (the small shift from 884+882+876=2642 TFF in the initial per-offset scan to 1321 here reflects the same underlying ~73%/26.5% split, just tallied once over the merged run rather than three separate per-offset passes). RAFT flows (`Flows_NewCT`/`BackwardFlows_NewCT`) must still be regenerated on the new images before any training can use them — not yet done. No training config points at `CMC_grasp0_5_10_merged_bwdif/` yet.
+
+### Post-hoc verification: did it actually work?
+
+**Re-ran `idet` on the *output* images** (same real-pair methodology) to check whether the processed frames still look interlaced:
+
+| | TFF before | TFF after | reduction |
+|---|:---:|:---:|:---:|
+| g0 | 884 | 228 | −74% |
+| g5 | 882 | 326 | −63% |
+| g10 | 876 | 352 | −60% |
+
+Large, consistent drop across all three offsets — but not to zero. Spot-checked several still-TFF-flagged *output* sequences visually: the comb artifact is essentially gone in every case checked: the residual TFF flags are very likely `idet` false positives, not real leftover combing — CMC's surgical-instrument footage has a lot of fine specular highlights and sharp metallic edges, exactly the kind of high-contrast local texture that can trip a generic combing detector even with no genuine field-mismatch present.
+
+**Signal-strength check (comb_row-style row-difference ratio), decomposed by processing outcome** (not blended — mixing bwdif-processed and untouched-progressive frames in one average was initially misleading):
+
+| | comb metric | vs. this dataset's own progressive (native) frames |
+|---|:---:|:---:|
+| Progressive (native, untouched) — the realistic ceiling | 0.585 | — |
+| **New (bwdif-processed TFF frames)** | **0.553** | gap closed to 0.032 |
+| Old (naive row-duplication) | 0.499 | gap was 0.086 |
+
+New method closes **~63% of the gap** to this dataset's own native (never-interlaced) signal level, vs. the old duplication method. Correction en route to this result: the earlier "natural photos ~1.15–1.2" reference (used above and in the original Dataset Diagnosis section) turned out not to apply here — CMC's own genuinely-progressive frames only score 0.585 on this metric, nowhere near 1.15–1.2, because endoscopic footage (macro lens, wet/specular tissue, video compression) has fundamentally different texture statistics than whatever "natural photos" the original reference was calibrated on. Comparing against the dataset's own native frames (same domain, same optics) is the fair baseline; the "natural photos" number should not be treated as a target for CMC.
+
+Net: deinterlacing quality is real, substantial, and visually confirmed — but bounded by physics, not just algorithm quality. Weave (bwdif's static-region path) recovers true full-resolution information where fields agree; in genuine motion regions half the vertical information for that specific field pair was never captured and cannot be invented by any deinterlacer, however good. The new pipeline gets close to the achievable ceiling; it does not and cannot fully erase the interlace format's inherent information loss in moving regions.

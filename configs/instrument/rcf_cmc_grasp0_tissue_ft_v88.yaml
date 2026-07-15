@@ -1,29 +1,40 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v88.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v88 = v83 (current best, 139.36) + DINO cross-channel merge loss (w_dino_merge=0.05)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v83:
+#   model_kwargs.w_dino_merge: 0 → 0.05
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# New loss (rcf_dino_model.py _dino_merge_loss): for each channel PAIR, pulls
+# their DINO centroids together, weighted by existing soft-mask overlap
+# (mask_i * mask_j) — only channels that already border each other (non-zero
+# overlap at their shared boundary) AND look visually similar (metal texture,
+# etc.) are pulled closer in DINO space. No spatial-position heuristic (no
+# "ring around instrument = tissue" assumption, which was considered and
+# rejected as too fragile — fails for blood/specular/smoke near the
+# instrument, or pre-contact frames). No fixed channel identity required —
+# purely appearance + already-existing overlap driven, channel-agnostic like
+# the existing _dino_consistency_loss it's paired with.
+#
+# Motivates: motion-based common fate correctly splits instrument shaft/jaw
+# into separate channels (different motion), but this creates the eval-time
+# granularity mismatch (single-channel/2ch protocol) and the observed inst/
+# tissue "seesaw" (v83 inst-favoring vs v85 tissue-favoring) — hypothesis is
+# that letting visually-similar bordering channels merge on their own reduces
+# spurious channel splits without fighting the correct motion-based ones.
+# w=0.05 conservative starting weight (same order as w_dino=0.1).
+# Eval sets untouched; epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v88
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +78,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -112,6 +123,7 @@ model_kwargs:
   freeze_flow_head: false
 
   w_dino: 0.1
+  w_dino_merge: 0.05
   dino_channels: null
   dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
   dino_arch: vit_small
@@ -199,11 +211,11 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
@@ -219,13 +231,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

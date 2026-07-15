@@ -1,29 +1,27 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v71.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v71 = v69 + attention gate on feat0 skip connection (all three improvements)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   decode_head2.type:               MultiScaleSegHead  →  MultiScaleSegHeadV2
+#   decode_head2.use_concat_fusion:  true   (concat+1×1 replaces proj+sum fusion)
+#   decode_head2.use_aspp_attn:      true   (NonLocalBlock after ASPP, zero-init W_out)
+#   decode_head2.use_attention_gate: true   (gate feat0 skip with semantic context)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# AttentionGate: spatial attn = sigmoid(W_g(fused_up) + W_x(feat0))
+#   Suppresses noise in feat0 skip connection (specularities, blood artefacts).
+# Base: same backbone, ASPP rates [6,12,18], training data as v64.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v71
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -199,9 +197,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -221,11 +217,16 @@ model_kwargs:
 
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
-    type: MultiScaleSegHead
+    type: MultiScaleSegHeadV2
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    use_concat_fusion: true
+    use_aspp_attn: true
+    use_attention_gate: true
     dropout_ratio: 0.1
     align_corners: false
 

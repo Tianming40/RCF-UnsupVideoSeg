@@ -252,8 +252,12 @@ class Model(pl.LightningModule):
                 raise ValueError("Unknown module in state_dict")
 
             if not ema_loaded:
-                # To implement, call `self.model.init_ema()`
-                assert (getattr(self.model, "backbone2_ema", None) is None) and (getattr(self.model, "decode_head2_ema", None) is None), "EMA is enabled but weights are not loaded"
+                if (getattr(self.model, "backbone2_ema", None) is not None) or (getattr(self.model, "decode_head2_ema", None) is not None):
+                    # Non-main-model pretrained weights (e.g. DenseCL backbone-only):
+                    # EMA shadows are still randomly initialized — copy the freshly
+                    # loaded main weights into them.
+                    logger.info("EMA enabled with backbone-only pretrained weights: initializing EMA from the main model")
+                    self.model.init_ema()
 
             logger.info(f"Mismatches in the pretrained model: {mismatches}")
         else:

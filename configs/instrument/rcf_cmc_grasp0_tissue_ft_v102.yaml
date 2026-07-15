@@ -1,29 +1,34 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v102.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v102 = v83 + GT flow downsample mode: bilinear → area
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v83:
+#   model_kwargs.gt_flow_downsample_mode: bilinear → area
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# GT flow is downsampled from crop resolution (384x384) to mask_size
+# (96x96, 4x reduction) before the warp loss. Bilinear interpolation blends
+# instrument-boundary motion vectors with surrounding background motion
+# AT THE DOWNSAMPLE STEP ITSELF, before boundary_dilation/floor even get a
+# chance to weight anything — for a target that occupies ~1% of frame area,
+# this dilutes exactly the pixels v83's supervision-density mechanism is
+# built to preserve. 'area' (box/average pooling — the more standard choice
+# for *downsampling* specifically; bilinear is more natural for upsampling)
+# is tested here as the isolated single-variable alternative.
+# New model-level `gt_flow_downsample_mode` param (models/rcf_model.py,
+# default 'bilinear' so all other configs are unaffected); only the GT-flow
+# resize call site in forward_train uses it — mask/pred-flow resizing
+# elsewhere is untouched. No other v83 setting touched.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v102
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +72,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -105,6 +110,7 @@ model_kwargs:
   align_corners: false
   mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
+  gt_flow_downsample_mode: area
   log_interval: 100
 
   freeze_backbone: false
@@ -199,11 +205,11 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
@@ -219,13 +225,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

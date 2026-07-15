@@ -1,29 +1,29 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v80.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v80 = v64 + EMA (exponential moving average weights, eval/checkpoint on EMA)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   eval_on_ema: true                (top-level; val + checkpoint use EMA weights)
+#   model_kwargs.ema_m: 0.999
+#   backbone2.create_ema: true
+#   decode_head2.create_ema: true
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Rationale: online val oscillates heavily (inst std 0.026+). EMA averages the
+# weights over recent steps → smoother curves, more reliable checkpoint
+# selection, typically +0.3~0.5 for free (Mean Teacher / BYOL standard).
+# Note: EMA lags the main weights early on — low val in the first epochs is
+# expected; judge from ep15+. Everything else identical to v64. epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v80
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -37,6 +37,9 @@ export_all_seg: false
 
 disable_wandb: true
 allow_overwriting_checkpoints_dir: false
+
+# EMA: validate/checkpoint on the EMA (momentum-averaged) weights
+eval_on_ema: true
 
 train_transform_kwargs:
   strong_aug: true
@@ -181,7 +184,10 @@ model_kwargs:
   distill_mode: symmetric
   teacher_ckpt: null
 
+  ema_m: 0.999
+
   backbone2:
+    create_ema: true
     dilations: [1, 1, 2, 4]
     strides: [1, 2, 1, 1]
     type: ResNet
@@ -199,9 +205,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -221,11 +225,14 @@ model_kwargs:
 
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
+    create_ema: true
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

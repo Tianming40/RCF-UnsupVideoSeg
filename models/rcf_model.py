@@ -18,6 +18,7 @@ from .fcn_head import FCNHead
 from .compactness_head import CompactnessHead
 from .crf_head import CRFHead
 from .multi_scale_seg_head import MultiScaleSegHead
+from .multi_scale_seg_head_v2 import MultiScaleSegHeadV2
 from .unet_seg_head import UNetSegHead
 from .unet_seg_head_v2 import UNetSegHeadV2
 from .unet_seg_head_v3 import UNetSegHeadV3
@@ -53,6 +54,7 @@ class RCFModel(nn.Module):
                  crf_pos_weight=1.,
                  crf_neg_weight=1.,
                  crf_mask_pos_th=-1.,
+                 w_boundary_align=0,
                  mask_layer=1,
                  train_iter=0,
                  train_cfg=None,
@@ -65,7 +67,8 @@ class RCFModel(nn.Module):
                  freeze_flow_head=False,
                  object_aware_sharpening=False,
                  separate_residual=False,
-                 allow_mask_resize=False):
+                 allow_mask_resize=False,
+                 gt_flow_downsample_mode='bilinear'):
         super(RCFModel, self).__init__()
         self.args = args
         self.save_dir = os.path.join(args.checkpoints_dir, "saved")
@@ -76,6 +79,18 @@ class RCFModel(nn.Module):
         
         # Moved from decoder in v1 to main module
         self.align_corners = align_corners
+
+        # GT flow is downsampled from crop resolution (e.g. 384x384) to
+        # mask_size (96x96, a 4x reduction) before being fed into the warp
+        # loss. Bilinear averages instrument-boundary motion vectors with
+        # surrounding background motion at the downsample step itself —
+        # for a target that's already only ~1% of frame area, that dilutes
+        # exactly the pixels the boundary-density mechanism (v83) tries to
+        # preserve. 'area' (average pooling, still anti-aliased but treats
+        # the box uniformly rather than a smooth bilinear kernel) and
+        # 'nearest' (zero blending, preserves extremes but aliases) are the
+        # two alternatives worth isolating.
+        self.gt_flow_downsample_mode = gt_flow_downsample_mode
 
         self.mask_layer = mask_layer
         # decode_head is flow aggregation module
@@ -155,10 +170,26 @@ class RCFModel(nn.Module):
             self.crf_head = None
         
         self.crf_use_ema = crf_use_ema
-        
+
         self.ema_m = ema_m
-        
+
         self.log_interval = log_interval
+
+        # boundary-align loss: penalize mask boundaries that fall on
+        # photometrically flat regions (no corresponding image edge).
+        # One-directional (only discourages spurious boundaries, never pulls
+        # boundaries toward arbitrary image edges) — safer than an
+        # edge-attraction loss given interlace/specular artifacts in the data.
+        self.w_boundary_align = w_boundary_align
+        if self.w_boundary_align > 0:
+            self.register_buffer(
+                'sobel_x_ba',
+                torch.tensor([[[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]]).view(1, 1, 3, 3),
+            )
+            self.register_buffer(
+                'sobel_y_ba',
+                torch.tensor([[[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]]).view(1, 1, 3, 3),
+            )
 
         self.mask_size = tuple(mask_size)
         self.allow_mask_resize = allow_mask_resize
@@ -261,6 +292,15 @@ class RCFModel(nn.Module):
             align_corners=self.align_corners,
             warning=False)
         return output
+
+    def _resize_gt_flow(self, flow, shape):
+        """Downsample GT flow to mask_size. mode is gt_flow_downsample_mode
+        (default 'bilinear', matching the historical behaviour of self.resize)
+        — 'area'/'nearest' don't accept align_corners."""
+        mode = self.gt_flow_downsample_mode
+        if mode == 'bilinear':
+            return self.resize(flow, shape)
+        return F.interpolate(flow, size=shape, mode=mode)
 
     def let_tensor_vis(self, t, setmax=False):
         t = t.clone()
@@ -460,6 +500,29 @@ class RCFModel(nn.Module):
         # all_pred_mask: [B, I, C=5, 48, 48]
         return -(all_pred_mask * log_all_pred_mask).sum(dim=2).mean()
 
+    def get_boundary_align_loss(self, all_pred_mask, imgs):
+        """
+        Penalize mask boundaries in photometrically flat image regions.
+        all_pred_mask: [B, I, C, Hm, Wm]  (mask resolution)
+        imgs:          [B, I, 3, H, W]    (crop resolution)
+        """
+        B, I, C, Hm, Wm = all_pred_mask.shape
+        gray = imgs.reshape(B * I, *imgs.shape[2:]).mean(dim=1, keepdim=True)
+        gray_ds = self.resize(gray, (Hm, Wm))
+
+        img_gx = F.conv2d(gray_ds, self.sobel_x_ba, padding=1)
+        img_gy = F.conv2d(gray_ds, self.sobel_y_ba, padding=1)
+        img_edge = (img_gx ** 2 + img_gy ** 2 + 1e-6).sqrt()
+        img_edge_w = img_edge / (img_edge.amax(dim=(2, 3), keepdim=True) + 1e-6)
+
+        mask_flat = all_pred_mask.reshape(B * I * C, 1, Hm, Wm)
+        mask_gx = F.conv2d(mask_flat, self.sobel_x_ba, padding=1)
+        mask_gy = F.conv2d(mask_flat, self.sobel_y_ba, padding=1)
+        mask_edge = (mask_gx ** 2 + mask_gy ** 2 + 1e-6).sqrt()
+        mask_edge = mask_edge.view(B * I, C, Hm, Wm).sum(dim=1, keepdim=True)
+
+        return (mask_edge * (1.0 - img_edge_w)).mean()
+
     def get_pl_loss(self, all_pred_mask, pl_masks):
         # all_pred_mask: [B, I, C=5, 48, 48]
         # pl_masks (range from 0 to 1): [B, I, 48, 48]
@@ -524,14 +587,14 @@ class RCFModel(nn.Module):
 
         # mask shape should be (48, 48), all_pred_mask.shape[-3:]: (2, 48, 48)
         # gt_fw_flows, gt_bw_flows (before resize): [B, 1, C=2, 480, 584]
-        gt_fw_flows = self.resize(gt_fw_flows.view(batch_size * flow_num, *gt_fw_flows.shape[2:]), self.mask_size)
-        gt_bw_flows = self.resize(gt_bw_flows.view(batch_size * flow_num, *gt_bw_flows.shape[2:]), self.mask_size)
+        gt_fw_flows = self._resize_gt_flow(gt_fw_flows.view(batch_size * flow_num, *gt_fw_flows.shape[2:]), self.mask_size)
+        gt_bw_flows = self._resize_gt_flow(gt_bw_flows.view(batch_size * flow_num, *gt_bw_flows.shape[2:]), self.mask_size)
         # After resize and view: [B, 1, C=2, 48, 48]
         gt_fw_flows = gt_fw_flows.view(batch_size, flow_num, 2, *self.mask_size)
         gt_bw_flows = gt_bw_flows.view(batch_size, flow_num, 2, *self.mask_size)
 
         # Get flow from the flow head (pred_flows is normalized for visualization)
-        pred_flows, loss_flow = self.decode_head(imgs, all_pred_mask, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw)
+        pred_flows, loss_flow = self.decode_head(imgs, all_pred_mask, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw, seq_names=seq_names)
         assert len(pred_flows['gt_flow']) == 1 and len(pred_flows['pred_flow']) == 1
         pred_flows_resize = [self.resize(it, all_pred_mask.shape[-2:]) for it in pred_flows['pred_flow']][0]
         agg_flow_resize = [self.resize(it, all_pred_mask.shape[-2:]) for it in pred_flows['agg_flow']][0]
@@ -568,7 +631,12 @@ class RCFModel(nn.Module):
             loss_entropy = self.get_entropy_loss(all_pred_mask, log_all_pred_mask)
             loss = loss + loss_entropy * self.w_entropy
             losses["loss_entropy"] = loss_entropy
-        
+
+        if self.w_boundary_align > 0:
+            loss_boundary_align = self.get_boundary_align_loss(all_pred_mask, imgs)
+            loss = loss + loss_boundary_align * self.w_boundary_align
+            losses["loss_boundary_align"] = loss_boundary_align
+
         if self.compactness_head:
             loss_compactness = self.compactness_head.get_compactness_loss(all_pred_mask)
             if loss_compactness is not None:

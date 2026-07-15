@@ -1,29 +1,45 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v111.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v111 = v102 + topk_scale_normalize (generic-usefulness test, no bridge/bwdif)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v102:
+#   decode_head.topk_scale_normalize: true
+#   (data_path, split, eval sets — everything else — UNCHANGED from v102:
+#   still CMC_grasp0_5_10_merged (old dataset, NOT bwdif), still
+#   train_g0379_g5601_g10601_clean.txt, i.e. gap1-only, no bridges at all)
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Background: topk_scale_normalize was built for the CMC bridge investigation
+# (v109/v110) — hard topk=4 selection ranks samples by RAW squared-error
+# loss, which scales with GT flow magnitude squared, so sources with
+# different motion scales compete unfairly for gradient. That problem is
+# most dramatic for bridge-vs-gap1 (7-9x loss gap), but the SAME mechanism
+# could apply more subtly within a pure gap1 dataset too: different cases
+# have different instrument speeds/resolutions, so even without any bridge
+# data, some samples in a batch could have inherently larger GT flow
+# magnitude than others and get systematically out-competed in topk purely
+# on scale, not fit quality.
+#
+# This version isolates the question "is topk_scale_normalize a generically
+# useful fix, independent of the bridge/bwdif story" — same v102 recipe,
+# same OLD (non-bwdif) dataset, only the topk ranking criterion changes from
+# absolute to GT-flow-scale-relative error. If this helps (or is neutral)
+# on top of v102's already-strong baseline, it's worth folding into the
+# "main" recipe regardless of how the bridge direction resolves. If it hurts
+# v102, that's useful too — it would mean topk's absolute-scale ranking was
+# doing something load-bearing for gap1-only training that we don't yet
+# understand, and the fix should stay scoped to bridge-containing configs
+# only.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v111
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -67,7 +83,7 @@ train_dataset_kwargs:
   flow_suffix:  "_NewCT"
   flow_suffix2: "_NewCT"
   flow_suffix3: "_NewCT"
-  split: ImageSets/train_g0379_g10601.txt
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
   zero_ann: false
 
 test_dataset_kwargs:
@@ -105,6 +121,7 @@ model_kwargs:
   align_corners: false
   mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
   allow_mask_resize: true
+  gt_flow_downsample_mode: area
   log_interval: 100
 
   freeze_backbone: false
@@ -199,16 +216,17 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
     flow_feat_before_agg_kernel_size: 3
     num_flow_feat_channels: 64
     mask_size: [96, 96]     # ← aligned with mask_size
     norm_flow: false
     clamp_flow_t: 10.
+    topk_scale_normalize: true
     free_residual: false
     free_residual_with_affine: true
     free_scale: false
@@ -219,13 +237,17 @@ model_kwargs:
     residual_adjustment_scale: 10.
     pred_div_coeff: 10.
 
+    use_bg_affine_removal: true
+
   # ── New segmentation head ──────────────────────────────────────────────────────────────
   decode_head2:
     type: MultiScaleSegHead
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

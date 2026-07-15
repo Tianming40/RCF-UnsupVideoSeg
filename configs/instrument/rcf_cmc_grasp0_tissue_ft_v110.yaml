@@ -1,0 +1,323 @@
+# rcf_cmc_grasp0_tissue_ft_v110.yaml
+#
+# v110 = v106 + per-sample mask-gradient detach for bridge pairs (b105/b50)
+#       + topk_scale_normalize (added after this version was planned — see
+#         below; without it bridge samples barely reach the backward pass
+#         at all, regardless of the detach mechanism below).
+#
+# Changes vs v106:
+#   decode_head.detach_mask_patterns: ["_b105", "_b50"]
+#   decode_head.topk_scale_normalize: true
+#
+# topk_scale_normalize background: measured offline (real v106 dataloader +
+# v106's own checkpoint, script topk_bridge_survival.py) that hard topk=4
+# selection ranks samples by RAW squared-error loss, which scales with GT
+# flow magnitude squared — bridge pairs (~3-4x larger GT flow than gap1)
+# had ~7-9x larger raw loss and only ~15% topk survival vs ~72% for gap1 in
+# the SAME batches (ResolutionGroupedBatchSampler mixes them freely). This
+# meant the mask-detach fix below had very little opportunity to matter,
+# since 85% of the time bridge samples were excluded from the backward pass
+# entirely (topk operates on the whole sample, not per-branch). Ranking by
+# GT-flow-scale-normalised (relative) error instead brings bridge's
+# survival rate to ~40%, roughly matching its ~37% share of the split — the
+# loss actually backpropagated for selected samples is unchanged (only the
+# SORTING criterion is normalised). See README.
+#
+# Background: v105/v106/v107 all mixed bridge pairs into training the same
+# way as gap1 (g0/g5/g10) and none beat v83/v102. This session did two
+# rounds of investigation before landing on the real mechanism:
+#
+# 1. Verified the bridge FLOW DATA ITSELF is reliable — not the problem.
+#    Composed-vs-direct RAFT consistency check (compose fw_g10+fw_b105 via
+#    warp, compare against a fresh independent RAFT inference run directly
+#    on the skipped-frame pair): cos_sim median 0.92-0.97 across AC/CE/BE/AF
+#    skip-distances (n=438, see README/scratch script bridge_skip_consistency
+#    family). Degrades gracefully with chain length, no sign of RAFT
+#    hallucinating garbage on the large-gap pairs.
+#
+# 2. Found the real problem: a structural TRAINING conflict, not a data
+#    problem. Each bridge frame is ALSO an endpoint of an adjacent gap1
+#    pair — e.g. g5's pre-frame (call it C) is the SAME physical image as
+#    b105's post-frame. Out of the 6 frames per case (A..F across
+#    g10/b105/g5/b50/g0), 4 (B,C,D,E — two-thirds) have this double
+#    identity. mask prediction (decode_head2) is per-IMAGE (not
+#    per-pair) — so the SAME image's mask gets pulled, across different
+#    training samples in the same epoch, toward fitting two motion-scale-
+#    mismatched flow targets (gap1's ~1-frame gap, ~5-7px mean flow vs
+#    bridge's ~5-frame real gap, ~19-22px mean flow). This is architectural
+#    interference, independent of whether the underlying flow values are
+#    individually accurate (they are, per point 1).
+#
+#    residual prediction (decode_head3, via pred_separate_residual) does
+#    NOT have this problem — it's pair-conditioned (both frames' features
+#    concatenated as input), so it can already learn different residual
+#    behaviour for a bridge-context pair vs a gap1-context pair without any
+#    same-input-different-target conflict. Only the mask branch needed a
+#    fix.
+#
+# Fix: detach_mask_patterns (new mechanism, flow_aggregation_head_with_
+# residual_v2.py — _maybe_detach_mask, applied to mask1/mask2 right after
+# they're sliced from `masks`, before cycle-conf / aggregation). For any
+# sample whose seq_name matches a bridge pattern, mask1/mask2 are
+# .detach()'d via a per-element torch.where before use in
+# aggregate_flow_with_residual — the flow-reconstruction loss for that
+# sample is computed exactly as before (uses the real, verified-reliable
+# bridge flow) and still trains decode_head3 (residual) and the backbone
+# path reached through it, but contributes zero gradient to decode_head2
+# (mask) for that sample. Verified via direct unit test: per-sample grad on
+# a toy mask tensor is exactly 0 for bridge-pattern samples, unchanged for
+# gap1 samples.
+#
+# clamp_flow_t_overrides is KEPT UNCHANGED from v106 — that fixes a
+# different, independent problem (GT flow VALUE truncation before
+# aggregation), not the mask-gradient conflict this version targets. Both
+# fixes are orthogonal and compatible.
+#
+# Isolated single-variable test on top of v106 — same re-deinterlaced data,
+# same bridge pairs, same split (train_g0379_g5601_g10601_b105_b50_clean.txt,
+# unweighted ~63%:37% gap1:bridge ratio — not v107's x2 duplication), same
+# clamp overrides; only the mask-detach mechanism is added. If this still
+# doesn't beat v83/v102, the bridge direction is very likely a dead end —
+# not because of data quality (ruled out) or this specific training
+# conflict (ruled out by this test), meaning whatever residual-only signal
+# remains isn't enough to help on its own.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v110
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train_g0379_g5601_g10601_b105_b50_clean.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/val.txt
+  zero_ann: false
+
+val_dataset_list:
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
+    split: ImageSets/val.txt
+    name: instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+    split: ImageSets/val.txt
+    name: tissue
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    clamp_flow_t_overrides: {"_b105": 25., "_b50": 25.}
+    detach_mask_patterns: ["_b105", "_b50"]
+    topk_scale_normalize: true
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHead
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

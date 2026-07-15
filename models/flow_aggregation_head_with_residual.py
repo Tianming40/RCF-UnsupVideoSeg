@@ -65,6 +65,7 @@ class FlowAggregationHeadWithResidual(nn.Module):
                  residual_adjustment_scale=10.,
                  norm_flow=False,
                  clamp_flow_t=None,
+                 clamp_flow_t_overrides=None,
                  filter_flow_t=None,
                  free_residual=False,
                  free_residual_with_affine=False,
@@ -122,6 +123,14 @@ class FlowAggregationHeadWithResidual(nn.Module):
 
         self.norm_flow = norm_flow
         self.clamp_flow_t = clamp_flow_t
+        # Per-source clamp override: {substring_matched_against_seq_name: threshold}.
+        # e.g. {"_b105": 25., "_b50": 25.} lets cross-segment "bridge" pairs (real
+        # motion gap ~5x larger than the original ~1-frame pairs, see conversation)
+        # use a looser clamp than clamp_flow_t, instead of one global threshold
+        # tuned for the much-smaller original data silently truncating ~40% of
+        # the new pairs' flow magnitude. Falls back to clamp_flow_t when
+        # seq_names is not provided (e.g. older call sites) or no pattern matches.
+        self.clamp_flow_t_overrides = clamp_flow_t_overrides
         self.filter_flow_t = filter_flow_t
 
         self.free_residual = free_residual
@@ -151,12 +160,27 @@ class FlowAggregationHeadWithResidual(nn.Module):
 
             self.coord_map = coord_map
 
-    def norm_and_clamp_flow(self, flow):
+    def norm_and_clamp_flow(self, flow, seq_names=None):
         # flow: [B, C=2, H, W]
         if self.norm_flow:
             flow = flow / flow.abs().max()
 
-        if self.clamp_flow_t is not None:
+        if self.clamp_flow_t_overrides and seq_names is not None:
+            # Per-sample threshold: default clamp_flow_t, overridden per-item
+            # when its seq_name matches one of the override patterns.
+            B = flow.shape[0]
+            thresholds = []
+            for i in range(B):
+                name = seq_names[i]
+                t = self.clamp_flow_t
+                for pattern, override_t in self.clamp_flow_t_overrides.items():
+                    if pattern in name:
+                        t = override_t
+                        break
+                thresholds.append(t if t is not None else float('inf'))
+            t_tensor = torch.tensor(thresholds, device=flow.device, dtype=flow.dtype).view(B, 1, 1, 1)
+            flow = flow.clamp(min=-t_tensor, max=t_tensor)
+        elif self.clamp_flow_t is not None:
             flow = flow.clamp(min=-self.clamp_flow_t, max=self.clamp_flow_t)
 
         if self.filter_flow_t is not None:
@@ -307,8 +331,14 @@ class FlowAggregationHeadWithResidual(nn.Module):
                                    * mask[:, None, ...]).sum(dim=2) * self.residual_adjustment_scale
             flow_overall = flow_agg + flow_affine + residual_adjustment
         else:
-            # No residual
+            # No residual — pure flow_agg (mask-weighted pooled aggregation,
+            # no affine, no per-pixel residual correction). This branch was
+            # previously unreachable in practice: residual_adjustment was
+            # referenced in the return statement below but never assigned
+            # here, causing UnboundLocalError the moment both free_residual
+            # and free_residual_with_affine were False.
             flow_overall = flow_agg
+            residual_adjustment = torch.zeros_like(flow_agg)
 
         # Output: [B, C1=2, H, W]
         return flow_overall, flow_agg, residual_adjustment, flow_affine
@@ -347,7 +377,7 @@ class FlowAggregationHeadWithResidual(nn.Module):
         return dilated_mask
 
     
-    def forward(self, imgs, masks, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw):
+    def forward(self, imgs, masks, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw, seq_names=None):
         # masks [B, C=5, H, W]: expected to sum up to 1 across channel dimension (C=5)
         # gt_fw_flows: [B, im_num - 1, C=2, H, W]
         # gt_bw_flows: [B, im_num - 1, C=2, H, W]
@@ -381,8 +411,8 @@ class FlowAggregationHeadWithResidual(nn.Module):
             gt_fw_flow = gt_fw_flows[:, i-1, ...]
             gt_bw_flow = gt_bw_flows[:, i-1, ...]
 
-            gt_fw_flow = self.norm_and_clamp_flow(gt_fw_flow)
-            gt_bw_flow = self.norm_and_clamp_flow(gt_bw_flow)
+            gt_fw_flow = self.norm_and_clamp_flow(gt_fw_flow, seq_names=seq_names)
+            gt_bw_flow = self.norm_and_clamp_flow(gt_bw_flow, seq_names=seq_names)
 
             # fw_flow_overall, bw_flow_overall: [B, C=2, H, W]
             fw_flow_overall, fw_flow_agg, fw_residual_adjustment, fw_flow_affine = self.aggregate_flow_with_residual(

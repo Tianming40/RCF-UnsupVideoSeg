@@ -1,29 +1,28 @@
-# rcf_cmc_grasp0_tissue_ft_v65.yaml
+# rcf_cmc_grasp0_tissue_ft_v77.yaml
 #
-# v65 = v53 + FlowAggregationHeadV3 (GN + magnitude-weighted aggregation)
+# v77 = v64 + tightened residual freedom (force masks to explain more motion)
 #
-# Changes vs v53:
-#   decode_head.type: FlowAggregationHeadWithResidualV2 → FlowAggregationHeadV3
-#   decode_head.use_mag_weight: true
-#   decode_head.mag_clamp: 3.0
+# Changes vs v64:
+#   decode_head.residual_adjustment_scale: 10. → 5.
 #
-# V3 changes in FlowAggHead:
-#   1. GroupNorm replaces no-norm in flow_feat_before_agg (stabilises training)
-#   2. Magnitude-weighted aggregation: pixels with higher flow magnitude
-#      (fast-moving instruments) contribute more to the per-segment flow prototype;
-#      static/slow pixels (tissue background) are down-weighted.
-#      weight = clamp(|flow| / mean(|flow|), max=3.0), renormalised per segment.
+# Rationale: with clamp_flow_t=10, GT flow lives in ±10 and a residual scale of
+# 10 lets the free residual span the ENTIRE flow range — the mask can be lazy
+# because reconstruction error is absorbed by the residual ("relaxed common
+# fate" over-relaxed). Scale 5 halves that freedom: whatever the residual can't
+# absorb must be explained by mask-weighted aggregation + per-channel affine,
+# pushing mask boundaries to align with true motion boundaries.
+# Everything else identical to v64. epochs 80.
 
 batch_size: 8
 val_batch_size: 1
-epochs: 120
+epochs: 80
 learning_rate: 1.e-4
 optimizer: Adam
 weight_decay: 1.e-4
 
 workers: 8
 
-checkpoints_dir: saved/grasp0_tissue_ft_v53
+checkpoints_dir: saved/grasp0_tissue_ft_v77
 pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
 model_cls: RCFSoftTissueModel
 
@@ -199,9 +198,7 @@ model_kwargs:
     ssim_sz: 1
     create_flownet: true
     mask_layer: 5
-    type: FlowAggregationHeadV3
-    use_mag_weight: true
-    mag_clamp: 1.5
+    type: FlowAggregationHeadWithResidualV2
     topk: 4
     boundary_threshold: 0.1745
     flow_feat_before_agg_kernel_size: 3
@@ -216,7 +213,7 @@ model_kwargs:
     eps: 0.01
     q: 0.4
     allow_residual_resize: true
-    residual_adjustment_scale: 10.
+    residual_adjustment_scale: 5.
     pred_div_coeff: 10.
 
   # ── New segmentation head ──────────────────────────────────────────────────────────────
@@ -225,7 +222,9 @@ model_kwargs:
     num_classes: 5
     mid_channels: 256
     feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
-    fuse_dilation: 6
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
     dropout_ratio: 0.1
     align_corners: false
 

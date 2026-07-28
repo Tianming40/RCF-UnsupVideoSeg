@@ -324,10 +324,10 @@ class RCFDinoModel(RCFModel):
     # Override forward_train to append L_dino                             #
     # ------------------------------------------------------------------ #
     def forward_train(self, imgs, seq_ids, seq_names, paths,
-                      gt_fw_flows, gt_bw_flows, pl_masks):
+                      gt_fw_flows, gt_bw_flows, pl_masks, gaps=None):
         self._captured_mask_logits = None
         losses = super().forward_train(
-            imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks
+            imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks, gaps=gaps
         )
 
         if (self.w_dino <= 0.0 and self.w_dino_merge <= 0.0) or self._captured_mask_logits is None:

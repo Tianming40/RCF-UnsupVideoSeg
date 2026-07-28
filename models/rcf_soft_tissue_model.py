@@ -962,7 +962,7 @@ class RCFSoftTissueModel(RCFDinoModel):
     # ── forward_train ──────────────────────────────────────────────────────────
 
     def forward_train(self, imgs, seq_ids, seq_names, paths,
-                      gt_fw_flows, gt_bw_flows, pl_masks):
+                      gt_fw_flows, gt_bw_flows, pl_masks, gaps=None):
         # super() = RCFDinoModel which:
         #   1. resets _captured_mask_logits
         #   2. runs RCFModel.forward_train (sets _captured_mask_logits, calls
@@ -970,7 +970,7 @@ class RCFSoftTissueModel(RCFDinoModel):
         #   3. appends L_dino
         #   4. returns WITHOUT clearing _captured_mask_logits
         losses = super().forward_train(
-            imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks,
+            imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks, gaps=gaps,
         )
 
         if self._captured_mask_logits is None:

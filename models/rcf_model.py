@@ -55,6 +55,7 @@ class RCFModel(nn.Module):
                  crf_neg_weight=1.,
                  crf_mask_pos_th=-1.,
                  w_boundary_align=0,
+                 w_visual_consistency=0,
                  mask_layer=1,
                  train_iter=0,
                  train_cfg=None,
@@ -190,6 +191,16 @@ class RCFModel(nn.Module):
                 'sobel_y_ba',
                 torch.tensor([[[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]]).view(1, 1, 3, 3),
             )
+
+        # visual-consistency loss (Choudhury et al. 2021, NeurIPS, "Unsupervised
+        # Part Discovery from Contrastive Reconstruction", eq. 4): per-channel
+        # pixel-color homogeneity -- an appearance-based interior-consistency
+        # signal that's independent of the flow-fit loss and boundary_floor
+        # weighting entirely. Discussed 260724 as a candidate fix for mask
+        # speckle (v132's boundary_floor increase didn't help, see session
+        # discussion) -- unlike boundary_floor this doesn't trade boundary
+        # sharpness for interior consistency, it's a genuinely separate signal.
+        self.w_visual_consistency = w_visual_consistency
 
         self.mask_size = tuple(mask_size)
         self.allow_mask_resize = allow_mask_resize
@@ -523,6 +534,41 @@ class RCFModel(nn.Module):
 
         return (mask_edge * (1.0 - img_edge_w)).mean()
 
+    def get_visual_consistency_loss(self, all_pred_mask, imgs):
+        """
+        Choudhury et al. 2021 (NeurIPS), "Unsupervised Part Discovery from
+        Contrastive Reconstruction", eq. (4): per-part pixel-color
+        homogeneity. For each channel k, penalizes pixel colour deviating
+        from that channel's own mask-weighted mean colour -- encourages
+        each mask channel to correspond to a visually/colour-homogeneous
+        region, independent of and complementary to the flow-fit loss.
+
+        Resolution handling (discussed 260724): mask is UPSAMPLED to image
+        (crop) resolution here -- NOT the reverse (downsampling the image to
+        mask resolution). The entire point of this loss is to exploit
+        full-resolution pixel colour information that the (low-res) mask/
+        flow-fit signal can't see; downsampling the image away would defeat
+        that purpose. Upsampling the mask via bilinear interpolation creates
+        no new information -- it's the same low-res decision smoothly
+        spread over the fine grid, which is the correct behaviour for a
+        soft mask anyway (matches the project's own resize() convention
+        used e.g. in eval, not a new pattern).
+
+        all_pred_mask: [B, I, C, Hm, Wm]  (mask resolution, softmax'd over C)
+        imgs:          [B, I, 3, H, W]    (crop resolution, post-augmentation)
+        """
+        B, I, C, Hm, Wm = all_pred_mask.shape
+        _, _, _, H, W = imgs.shape
+        mask = all_pred_mask.reshape(B * I, C, Hm, Wm)
+        mask_up = self.resize(mask, (H, W))              # [B*I, C, H, W], no info created, just smooth upsample
+        img = imgs.reshape(B * I, 3, H, W)
+
+        mask_sum = mask_up.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)               # |M_k|  [B*I, C, 1, 1]
+        weighted_img = mask_up.unsqueeze(2) * img.unsqueeze(1)                          # [B*I, C, 3, H, W]
+        mean_color = weighted_img.sum(dim=(3, 4), keepdim=True) / mask_sum.unsqueeze(2)  # [B*I, C, 3, 1, 1]
+        diff2 = ((img.unsqueeze(1) - mean_color) ** 2).sum(dim=2)                        # [B*I, C, H, W]
+        return (mask_up * diff2).mean()
+
     def get_pl_loss(self, all_pred_mask, pl_masks):
         # all_pred_mask: [B, I, C=5, 48, 48]
         # pl_masks (range from 0 to 1): [B, I, 48, 48]
@@ -553,7 +599,7 @@ class RCFModel(nn.Module):
         crf_loss = crf_loss_pos.mean() * self.crf_pos_weight + crf_loss_neg.mean() * self.crf_neg_weight
         return crf_loss
 
-    def forward_train(self, imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks):
+    def forward_train(self, imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks, gaps=None):
         # Usually, _h: 384, _w: 384 (random crop) (same for the flows)
         batch_size, im_num, num_channels, _h, _w = imgs.shape
         # Usually `I - 1` (I is im_num)
@@ -594,7 +640,7 @@ class RCFModel(nn.Module):
         gt_bw_flows = gt_bw_flows.view(batch_size, flow_num, 2, *self.mask_size)
 
         # Get flow from the flow head (pred_flows is normalized for visualization)
-        pred_flows, loss_flow = self.decode_head(imgs, all_pred_mask, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw, seq_names=seq_names)
+        pred_flows, loss_flow = self.decode_head(imgs, all_pred_mask, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw, seq_names=seq_names, gaps=gaps)
         assert len(pred_flows['gt_flow']) == 1 and len(pred_flows['pred_flow']) == 1
         pred_flows_resize = [self.resize(it, all_pred_mask.shape[-2:]) for it in pred_flows['pred_flow']][0]
         agg_flow_resize = [self.resize(it, all_pred_mask.shape[-2:]) for it in pred_flows['agg_flow']][0]
@@ -636,6 +682,11 @@ class RCFModel(nn.Module):
             loss_boundary_align = self.get_boundary_align_loss(all_pred_mask, imgs)
             loss = loss + loss_boundary_align * self.w_boundary_align
             losses["loss_boundary_align"] = loss_boundary_align
+
+        if self.w_visual_consistency > 0:
+            loss_visual_consistency = self.get_visual_consistency_loss(all_pred_mask, imgs)
+            loss = loss + loss_visual_consistency * self.w_visual_consistency
+            losses["loss_visual_consistency"] = loss_visual_consistency
 
         if self.compactness_head:
             loss_compactness = self.compactness_head.get_compactness_loss(all_pred_mask)
@@ -778,6 +829,7 @@ class RCFModel(nn.Module):
                 pl_masks = torch.stack(pl_masks, dim=1)
             else:
                 pl_masks = None
-            return self.forward_train(imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks)
+            gaps = x.get('gap', None)  # per-sample actual frame gap (VideoDataset's random-gap mechanism); None for datasets/collates that don't provide it
+            return self.forward_train(imgs, seq_ids, seq_names, paths, gt_fw_flows, gt_bw_flows, pl_masks, gaps=gaps)
         else:
             return self.forward_eval(imgs, seq_ids, seq_names, paths, return_pred_vis_list=return_pred_vis_list)

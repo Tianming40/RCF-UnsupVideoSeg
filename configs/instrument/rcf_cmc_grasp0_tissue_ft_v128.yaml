@@ -1,0 +1,312 @@
+# rcf_cmc_grasp0_tissue_ft_v128.yaml
+#
+# v128 = "the 4-scale version of v127" (explicit request, 260720): extends
+# v127's feat0-only triplet joint feature to all FOUR backbone scales,
+# mirroring how v123 extended v121's feat0-only 2-frame joint feature to
+# 4 scales. Same 3-frame/3-pairwise-flow-loss orchestration as v126/v127
+# (TripletVideoDataset, decode_head2/decode_head3/decode_head called/reused
+# exactly as v126/v127 do).
+#
+#   model_cls: RCFTripletJointMaskModel -> RCFTripletJointMaskV2Model
+#     (models/rcf_triplet_joint_mask_v2_model.py, new file, subclasses
+#     RCFTripletModel directly (sibling of RCFTripletJointMaskModel, not a
+#     further subclass), overrides ONLY _decode_head_forward -- same
+#     injection point every joint-mask variant this session uses)
+#   decode_head2.type: MultiScaleSegHead -> MultiScaleSegHeadJoint4
+#     (models/multi_scale_seg_head_joint4.py, reused UNCHANGED from v123 --
+#     its forward() contract doesn't care whether the joint tensors were
+#     built from 2 or 3 frames)
+#   decode_head2: + feat1_joint_in_channels/feat2_joint_in_channels/
+#     feat3_joint_in_channels: 64 each (matching v123's pattern)
+#
+# Joint feature mechanism: RCFTripletJointMaskV2Model computes 4 separate
+# 3-way-concat joint features (one per scale: feat0/1/2/3, each 3x that
+# scale's channel count -> projected to 64 channels), broadcast IDENTICALLY
+# to mask_i/mask_j/mask_k's computation (symmetric, same as v127's feat0-only
+# version). flow_feat slot carries the feat0-level joint feature (same name/
+# slot as v127); the 3 new feat1_joint/feat2_joint/feat3_joint kwargs carry
+# the deeper-scale joint features into MultiScaleSegHeadJoint4's 3 new
+# additive-skip injection points (before fuse_conv, at H/8).
+#
+# NEW ENTRY POINT (same as v126/v127): run via main_triplet.py, NOT
+# main_tissue.py (script/run_grasp0_triplet_train.sh) -- RCFTripletModel
+# subclasses need the custom train_dataloader main.py's standard Model
+# class can't provide.
+#
+# Training data: identical to v126/v127 (CMC/grasp-0/train_multigap_triplet.txt,
+# 376 cases x 6 consecutive-triplet positions = 2256 samples, exhaustive/
+# deterministic, no random-gap-sampling involved).
+#
+# No DINO auxiliary loss (same simplification as v126/v127).
+#
+# Eval: identical to v127 (frame_num: 3, gap_options: [1], val_triplet.txt --
+# see test_dataset_kwargs/val_dataset_list below), NOT single-frame -- eval
+# must go through the same 3-frame path as training since
+# RCFTripletJointMaskV2Model._decode_head_forward asserts im_num==3 whenever
+# decode_head2.use_flow_feat is set.
+#
+# Everything else (model_kwargs, decode_head, decode_head3, etc.) is
+# identical to v126/v127/v102. The flow-flip-sign-fix from this session also
+# applies here automatically (dataset/transforms.py's RandomFlip, used by
+# build_triplet_transform too).
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v128
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFTripletJointMaskV2Model
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC/grasp-0/train_multigap_triplet.txt
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+dataset_kwargs: {}
+
+# train_dataset_kwargs is NOT used for RCFTripletModel -- main_triplet.py's
+# TripletModel.train_dataloader builds TripletVideoDataset directly from
+# data_path (the split .txt file itself, tools/build_multigap_triplet_split.py)
+# + train_transform_kwargs below. Kept empty rather than removed so the
+# shared config schema stays uniform across model_cls values.
+train_dataset_kwargs: {}
+
+test_dataset_kwargs:
+  # frame_num=3 + gap_options=[1] required: RCFTripletJointMaskModel._decode_head_forward
+  # asserts im_num==3 whenever decode_head2.use_flow_feat is set. gap_options=[1]
+  # (deterministic, not the default [1,2,3]) matters here specifically because
+  # frame_num=3 no longer gets the accidental "overflow -> fallback to gap=1"
+  # safety net a frame_num=2 split gets for free -- see tools/build_triplet_eval_split.py
+  # and main_tissue.py's _make_val_loader comment for why.
+  frame_num: 3
+  load_flow: false
+  split: ImageSets/val_triplet.txt
+  zero_ann: false
+  gap_options: [1]
+  gap_probabilities: [1.0]
+  gap_flow_suffixes: ["_NewCT"]  # unused (load_flow=false), only needed to satisfy VideoDataset's length assertion
+
+val_dataset_list:
+  # frame_num: 3 + gap_options: [1] (main_tissue.py's _make_val_loader/val_dataloader,
+  # extended this session) + val_triplet.txt (tools/build_triplet_eval_split.py,
+  # frame0=annotated, frame1/frame2=gap1 neighbours) -- same reasoning as
+  # test_dataset_kwargs above.
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_instrument
+    split: ImageSets/val_triplet.txt
+    name: instrument
+    frame_num: 3
+    gap_options: [1]
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+    split: ImageSets/val_triplet.txt
+    name: tissue
+    frame_num: 3
+    gap_options: [1]
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHeadJoint4
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+    use_flow_feat: true     # ← v128: mask branch receives RCFTripletJointMaskV2Model's
+    flow_in_channels: 64    #   feat0-level 3-frame joint feature (all 3 frames' feat0 concatenated)
+    flow_drop_p: 0.0        # ← set correctly from the start this time (v121's bug: default
+                             #   0.5 randomly drops the joint feature ~half of training steps;
+                             #   doesn't apply here since eval/train both always have all 3
+                             #   frames available by construction -- see v122's history)
+    feat1_joint_in_channels: 64  # ← new in v128: feat1/feat2/feat3-level joint features too
+    feat2_joint_in_channels: 64
+    feat3_joint_in_channels: 64
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

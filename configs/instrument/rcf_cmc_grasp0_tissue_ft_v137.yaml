@@ -1,0 +1,477 @@
+# rcf_cmc_grasp0_tissue_ft_v137.yaml
+#
+# v137 = v134 (attention+PE architecture, gap123-exhaustive g0 + grasp10
+# data) + model_kwargs.w_visual_consistency: 10.0 (discussed 260724, see
+# v135's header for the full design rationale -- identical mechanism,
+# applied on top of v134 instead of v102). NOT SUBMITTED YET -- written
+# for review.
+#
+# ────────────────────────────────────────────────────────────────────────
+# v134 = v130's exact architecture (RCFJointMaskV4SoftTissueModel,
+# DeformableCrossFrameAttentionPE, attention + learned query-side position
+# embedding) + a data change discussed 260724: grasp0 gap1+2+3 EXHAUSTIVE
+# (v131's data mechanism, not v130's own random gap_options sampling) PLUS
+# grasp10 (v133's data mechanism, 500 pairs -- see CORRECTION below).
+# Combines two previously-separate single-variable experiments (v131:
+# gap123 exhaustive on v124's architecture; v133: +grasp10 on v123's
+# architecture) onto v130's attention+PE architecture specifically,
+# motivated by the working hypothesis that grasp10's richer/more diverse
+# instrument motion signal might help the attention offset predictor learn
+# better cross-frame correspondence for the moving instrument specifically
+# (v130's own training curve showed tissue improving but instrument
+# declining relative to the naive-concat baselines -- see session
+# discussion).
+#
+# Training data built by physically symlinking grasp10's pair-dirs
+# (JPEGImages + Flows_NewCT + BackwardFlows_NewCT) into
+# CMC_grasp0_multigap_paired (v131's gap123 dataset root) so ONE split file
+# (train_gap123_plus_g10500.txt, 7268 lines = 6768 g0 + 500 g10) can
+# reference both sources under a single data_path -- see train_dataset_kwargs
+# below for the full leakage-check writeup.
+#
+# CORRECTION (260724): initially built with only 287 grasp10 pairs (601
+# total _g10 pairs, minus 101 reserved for eval, minus a further 101 that
+# were assumed to share a case ID with grasp0's eval set due to grasp0/
+# grasp10 supposedly being the same surgeries at different temporal
+# offsets). The user confirmed this assumption is WRONG -- grasp0 and
+# grasp10 are two separate, non-overlapping datasets that merely share a
+# case-ID naming convention; a matching ID string does not imply the same
+# patient. That extra exclusion was removed -- grasp10's training set is
+# the full 500 (601-101, same 101 as v133), not 287.
+#
+# Eval is IDENTICAL to v133 (same 4 val_dataset_list entries, same data
+# sources) so results are directly comparable.
+#
+# ────────────────────────────────────────────────────────────────────────
+# v130 = v124 + a learned 2D position embedding added to the QUERY side of
+# offset/weight prediction in each scale's attention module (discussed
+# 260720, after noticing v121/v122's naive joint-mask mechanism doesn't
+# show the expected mIoU improvement -- see models/
+# deformable_cross_frame_attention_pe.py's docstring for the full design
+# rationale). offset_weight_proj currently predicts sampling offsets purely
+# from the query position's own content via a 1x1 conv -- translation-
+# equivariant, so identical content anywhere in the frame predicts an
+# identical offset, with no notion of WHERE in the frame it is. Adding a
+# position embedding lets the offset predictor learn location-conditioned
+# priors (e.g. this dataset's camera framing / instrument-entry
+# conventions) on top of the existing content-conditioned regression.
+#
+# Learned (not sinusoidal): resolution is fixed throughout this project
+# (crop_size always [384,384], sliding_window_size: 384), so sinusoidal's
+# main advantage (extrapolation to unseen lengths/resolutions) doesn't
+# apply here -- a learned embedding can instead fit dataset-specific
+# positional bias that a fixed sinusoidal prior cannot. Implemented as
+# separable row/col nn.Embedding tables (DETR's own learned-PE convention).
+#
+# Deliberately query-side ONLY, not value-side: the sampled appearance
+# feature actually fed into the mask branch stays position-agnostic;
+# position only informs "where to look", matching Deformable DETR's own
+# convention.
+#
+#   model_cls: RCFJointMaskV3SoftTissueModel -> RCFJointMaskV4SoftTissueModel
+#     (models/rcf_joint_mask_v4_model.py, new file -- identical to v124's
+#     model except DeformableCrossFrameAttention -> DeformableCrossFrameAttentionPE,
+#     models/deformable_cross_frame_attention_pe.py, new file, subclasses
+#     DeformableCrossFrameAttention overriding ONLY _attend_one_direction to
+#     inject the position embedding into query_feat before delegating to
+#     the parent's unmodified offset/value/sampling logic -- v124 itself,
+#     which uses the base class directly, is completely unaffected)
+#   decode_head2.type: MultiScaleSegHeadJoint4 -- UNCHANGED from v123/v124.
+#
+# Everything else (data, eval, decode_head, topk, etc.) is IDENTICAL to
+# v124 -- copied verbatim, only model_cls changed below.
+#
+# ────────────────────────────────────────────────────────────────────────
+# v124 = "idea 3" from this session's discussion (260720): replace v123's
+# naive channel-concat+conv joint features (JointFrameFeatProjector) with
+# DeformableCrossFrameAttention (models/deformable_cross_frame_attention.py,
+# Deformable-DETR-style, Zhu et al. 2020) at each of the 4 scales.
+#
+# Design rationale worked through in conversation, not re-derived here:
+#   - same-scale cross-frame only (feat0_i<->feat0_j, etc.) — no cross-scale
+#     mixing (feat0_i to feat2_j etc.), since cross-scale fusion is already
+#     ASPP's job inside MultiScaleSegHead; mixing the two would duplicate/
+#     conflict with an existing, working mechanism.
+#   - full O(N^2) attention at feat0 (96x96=9216 positions) costs ~43GB
+#     estimated (multi-head, bidirectional, train-time activations) — not
+#     feasible on this node's 49GB cards, especially shared with other jobs.
+#     Deformable attention avoids this: each query predicts K=4 learned
+#     sampling offsets (fractional, via grid_sample) into the other frame,
+#     no fixed window, no external signal — cost scales with N*K, not N^2.
+#   - explicitly NOT flow-guided (user's explicit call): offsets come only
+#     from the query feature itself, learned end-to-end. No dependency on
+#     RAFT flow at train OR eval time (unlike an earlier flow-guided-window
+#     variant considered and rejected in discussion).
+#   - offset_weight_proj initialized to all-zero (Deformable DETR's own
+#     init) — at the start of training every query looks at its OWN
+#     position in the other frame first, then learns to look elsewhere.
+#
+#   model_cls: RCFJointMaskV2SoftTissueModel -> RCFJointMaskV3SoftTissueModel
+#     (models/rcf_joint_mask_v3_model.py, new file — instantiates 4
+#     DeformableCrossFrameAttention modules, one per scale, in place of
+#     v123's 4 JointFrameFeatProjector instances)
+#   decode_head2.type: MultiScaleSegHeadJoint4 — UNCHANGED from v123, zero
+#     code changes needed (its forward() contract — 4 optional joint-feature
+#     kwargs, same shapes — doesn't care how those tensors were computed)
+#
+# Zero edits to RCFModel/RCFDinoModel/RCFSoftTissueModel/MultiScaleSegHead/
+# MultiScaleSegHeadJoint4/RCFJointMaskSoftTissueModel/RCFJointMaskV2SoftTissueModel
+# — v121/v122/v123 are completely unaffected by this config.
+#
+# Verified end-to-end this session: (1) DeformableCrossFrameAttention in
+# isolation — output shape correct ([B*2,64,H,W]), all three internal conv
+# layers (value_proj/offset_weight_proj/out_proj) receive real nonzero
+# gradient; (2) full model forward_train + backward (synthetic 2-frame
+# batch) — all 4 scale-specific attention modules' out_proj receive real
+# gradient, decode_head2's all 47 params get gradient (same count as v123,
+# confirming MultiScaleSegHeadJoint4 is genuinely unmodified); (3) a direct
+# extract_feat + _decode_head_forward call matching _sliding_window_eval's
+# exact pattern (im_num=2) runs correctly, output shape [2,5,96,96].
+#
+# Motivation (discussed at length 260717, see README): mask prediction
+# (decode_head2) has ALWAYS been completely per-frame in its forward
+# computation for this entire project — frame_i and frame_j's backbone
+# features never interact (batched, not concatenated), so mask_i's
+# prediction has zero forward-pass access to frame_j's content, no matter
+# how well trained. The only place two-frame information has ever entered
+# this architecture is the residual branch (decode_head3, pair-conditioned)
+# and, indirectly, mask's TRAINING GRADIENT (via the rigid/affine flow-fit
+# loss) — never mask's own forward computation. This matters because some
+# appearance ambiguity (specular highlights, low-texture drift — exactly
+# the RAFT failure modes visually confirmed in this session's flow-quality
+# analysis) can only be resolved by looking at the OTHER frame; pure
+# single-frame appearance structurally cannot resolve it regardless of
+# training.
+#
+# RCFJointMaskSoftTissueModel gives mask genuine forward-pass access to the
+# paired frame for the first time: a new JointFrameFeatProjector
+# (models/joint_frame_feat.py) takes feat0 (backbone's first/highest-res
+# output scale) for BOTH frames, channel-concatenated, and projects it down
+# to a [B, 64, H, W] feature — fed into MultiScaleSegHead's existing (but,
+# until now, never-actually-used-by-any-config) use_flow_feat additive-skip
+# slot (`fused = fused + flow_proj(flow_feat)`). That slot previously only
+# ever carried a feature derived from GT optical flow — never raw
+# cross-frame appearance.
+#
+# Implementation is a NEW model subclass overriding ONLY
+# _decode_head_forward — found to be the single method common to all THREE
+# real call paths: forward_train, forward_eval, AND _sliding_window_eval
+# (main.py's Model, used by every real config here since they all set
+# use_sliding_window: true, which makes test_step bypass forward_eval
+# entirely — an earlier version of this file overrode forward_eval
+# separately and would have silently never engaged during real training
+# runs). x (== all_feat, containing feat0 with the real cross-frame
+# content) is already passed into _decode_head_forward directly, so no
+# forward-hook capture trick is needed. Zero edits to RCFModel/
+# RCFDinoModel/RCFSoftTissueModel/MultiScaleSegHead — every existing config
+# (v102, v116-v120, etc.) is completely unaffected.
+# _sliding_window_eval itself needed NO changes either — it already crops
+# ALL frames in imgs ([B, im_num, C, H, W]) at the same (y, x) window
+# position per iteration (only the H/W dims are sliced), so it was already
+# "slide both frames together" for any im_num, this whole time.
+#
+# Verified this session: (1) synthetic forward_train + backward pass
+# (2-frame random batch): loss computes correctly (loss_warp_seg/loss/
+# loss_dino all present, DINO subclass chain intact), joint_feat_proj
+# receives real nonzero gradient, decode_head2 still receives its own
+# gradient as before; (2) a direct extract_feat + _decode_head_forward call
+# matching _sliding_window_eval's exact call pattern (im_num=2, no
+# forward_eval/forward_train involved) runs correctly end-to-end.
+#
+# Deliberately isolated to ONE variable at a time: same small-gap (1,2,3)
+# data/mechanism as v117, so any miou delta vs v117 is attributable to the
+# joint-mask architecture change alone, not conflated with a different gap
+# mix (contrast with v118/v119/v120's larger gap ranges).
+#
+# Inference contract: RCFJointMaskSoftTissueModel._decode_head_forward
+# asserts im_num==2 whenever decode_head2.use_flow_feat is set (no graceful
+# single-frame fallback) — every eval path below (test_dataset_kwargs AND
+# val_dataset_list) is wired to a paired split (val_paired.txt,
+# tools/build_paired_eval_split.py: frame0 = the existing annotated frame,
+# frame1 = its gap1 neighbour, symlinked in from CMC_grasp0_continuous_bwdif)
+# with frame_num: 2. dataset/data.py's VideoDataset was relaxed this
+# session (two small, backward-compatible assertion changes) to allow
+# frame_num>1 in eval mode at all — previously hard-blocked at frame_num==1
+# unconditionally. main_tissue.py's Model._make_val_loader/val_dataloader
+# was similarly extended to read an optional per-entry `frame_num` from
+# val_dataset_list (default 1, backward compatible).
+#
+# Everything else (model_kwargs, decode_head, decode_head3, etc.) is
+# identical to v117/v102.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v137
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFJointMaskV4SoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_multigap_paired
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train_gap123_plus_g10500.txt
+  zero_ann: false
+  # v134: grasp0 gap1+2+3 EXHAUSTIVE (not random gap_options sampling like
+  # v121-v130) -- same 6768-line train_multigap_gap123.txt v131 uses,
+  # verified 0 overlap against the grasp0 eval stems used below (376
+  # training cases vs 220-stem eval union, reverified this session) --
+  # PLUS 287 grasp10 pairs symlinked in from CMC_grasp0_5_10_merged_bwdif's
+  # _g10 pair-dirs (same 287-case set v133 already leakage-checked: 388
+  # original "both instrument+tissue annotated" g10 cases minus 101 that
+  # share a case ID with the grasp0 eval set below -- see v133's config for
+  # the full leakage-check writeup, identical logic reused verbatim here).
+  # Symlinked (JPEGImages + Flows_NewCT + BackwardFlows_NewCT, all 287)
+  # directly into CMC_grasp0_multigap_paired so ONE split file can combine
+  # both sources under one data_path -- v131's gap123 data and v133's g10
+  # data previously lived under two different dataset roots (Structure A
+  # multigap vs the old grasp0_5_10_merged convention) and couldn't be
+  # referenced by a single VideoDataset without this.
+  # 6768 (g0) + 287 (g10) = 7055 lines total.
+
+test_dataset_kwargs:
+  # frame_num=2 required: RCFJointMaskV4SoftTissueModel._decode_head_forward
+  # asserts im_num==2 whenever decode_head2.use_flow_feat is set -- this is
+  # the final post-training test pass (main.py's trainer.test(), runs once
+  # after trainer.fit() completes), not per-epoch validation (val_dataset_list
+  # below).
+  frame_num: 2
+  load_flow: false
+  split: ImageSets/val_paired.txt
+  zero_ann: false
+
+val_dataset_list:
+  # Identical to v133's eval setup (same 4 named entries, same data
+  # sources) -- v134 only changes TRAINING data/architecture, eval stays
+  # the exact same protocol so results are directly comparable to v133.
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
+    split: ImageSets/val_paired.txt
+    name: instrument
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+    split: ImageSets/val_paired.txt
+    name: tissue
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_instrument
+    split: ImageSets/val_paired_both101.txt
+    name: instrument_g10
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_tissue
+    split: ImageSets/val_paired_both101.txt
+    name: tissue_g10
+    frame_num: 2
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_visual_consistency: 10.0   # NEW (260724): Choudhury et al. 2021 per-part pixel-color homogeneity loss, see models/rcf_model.py:get_visual_consistency_loss
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHeadJoint4   # ← v123: 4-scale joint fusion (models/multi_scale_seg_head_joint4.py)
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+    use_flow_feat: true     # feat0-level joint feature (same slot as v121/v122)
+    flow_in_channels: 64
+    feat1_joint_in_channels: 64  # ← new in v123: feat1/feat2/feat3-level joint features too
+    feat2_joint_in_channels: 64
+    feat3_joint_in_channels: 64
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

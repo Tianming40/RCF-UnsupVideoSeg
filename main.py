@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import itertools
 import os
 from datetime import datetime
 from glob import glob
@@ -311,13 +312,44 @@ class Model(pl.LightningModule):
 
     @torch.no_grad()
     def _sliding_window_eval(self, x, window_size=384, stride=192):
-        """Forward eval via sliding window so BN always sees window_size crops."""
+        """Forward eval via sliding window so BN always sees window_size crops.
+
+        Two opt-in mechanism variants (both default OFF so any config that
+        doesn't set them reproduces the exact prior behaviour bit-for-bit —
+        safe to land without re-running/affecting any in-flight job):
+
+          sw_taper (bool, default False via getattr) — weight each window's
+            contribution by a 2D Hann-like taper (1.0 at window centre,
+            floored at 0.1 near the edges) instead of uniform weight 1. A
+            pixel near a window's crop boundary has a truncated receptive
+            field (context outside the crop is missing) so its prediction is
+            less reliable than the same pixel predicted when it happened to
+            land near a different window's centre; uniform weighting treats
+            both equally. Floored (not exactly 0) so image corners/edges
+            covered by only one window never divide by zero.
+
+          sw_logit_avg (bool, default False via getattr) — accumulate
+            pre-softmax logits and apply softmax once at the end, instead of
+            accumulating post-softmax per-window probabilities. These are not
+            equivalent: probability-space averaging is more "conservative"
+            (pulls disagreeing windows toward uncertainty), logit-space
+            averaging preserves more of each confident window's signal.
+        """
         imgs = torch.stack(x['imgs'], dim=1)   # [B, im_num, C, H, W]
         B, im_num, C, H, W = imgs.shape
 
         mask_layer = self.args.model_kwargs['mask_layer']
         pred_accum = torch.zeros(B, mask_layer, H, W, device=imgs.device)
         count_map  = torch.zeros(1, 1, H, W, device=imgs.device)
+
+        use_taper = getattr(self.args, 'sw_taper', False)
+        use_logit_avg = getattr(self.args, 'sw_logit_avg', False)
+
+        if use_taper:
+            taper_floor = 0.1
+            hann = torch.hann_window(window_size, periodic=False, device=imgs.device)  # 0 at edges, 1 at centre
+            wy = taper_floor + (1.0 - taper_floor) * hann  # floor 0.1 at edges, 1.0 at centre
+            weight_2d = wy.view(-1, 1) * wy.view(1, -1)  # [window_size, window_size]
 
         # Window positions — always include right/bottom edge for full coverage
         def _positions(length):
@@ -344,13 +376,22 @@ class Model(pl.LightningModule):
                 feat = self.model.extract_feat(img3, backbone)
                 pred = self.model._decode_head_forward(feat, head)
                 pred = pred.view(B, im_num, mask_layer, *pred.shape[-2:])
-                pred = F.softmax(pred, dim=2)[:, 0]   # [B, C, fH, fW]
+                pred = pred[:, 0] if use_logit_avg else F.softmax(pred, dim=2)[:, 0]   # [B, C, fH, fW]
                 pred = F.interpolate(pred, size=(window_size, window_size),
                                      mode='bilinear', align_corners=False)
-                pred_accum[:, :, y:y2, xp:x2] += pred[:, :, :ch, :cw]
-                count_map[:, :, y:y2, xp:x2] += 1
 
-        return pred_accum / count_map.clamp(min=1)
+                if use_taper:
+                    w = weight_2d[:ch, :cw]
+                    pred_accum[:, :, y:y2, xp:x2] += pred[:, :, :ch, :cw] * w
+                    count_map[:, :, y:y2, xp:x2] += w
+                else:
+                    pred_accum[:, :, y:y2, xp:x2] += pred[:, :, :ch, :cw]
+                    count_map[:, :, y:y2, xp:x2] += 1
+
+        result = pred_accum / count_map.clamp(min=1e-6 if use_taper else 1)
+        if use_logit_avg:
+            result = F.softmax(result, dim=1)
+        return result
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
@@ -477,28 +518,33 @@ class Model(pl.LightningModule):
             if _in_oracle_mode:
                 frame_ious = [
                     utils.iou(pred_mask_resize_item, ann, num_classes=2, ignore_index=-1)[1] for pred_mask_resize_item in pred_mask_resize]
-                # Greedy union oracle: start with best single channel, greedily add
-                # channels (in descending IoU order) if they improve the union IoU.
-                # This correctly identifies all instrument channels even when one
-                # instrument rarely "wins" head-to-head against another.
-                # 可选：贪心 union 时排除某些 channel
+                # Exhaustive union oracle: try every non-empty subset of the
+                # candidate channels and keep the one with the highest union
+                # IoU. Replaces an earlier greedy version (start from the
+                # single best channel, only ever add -- never drop -- other
+                # channels in descending-IoU order) that was path-dependent
+                # and not guaranteed optimal: whichever channel got greedily
+                # accepted first could never be reconsidered, so a genuinely
+                # better subset that excluded it was never even evaluated.
+                # With num_classes=5 (<=4-5 candidates after exclusion) this
+                # is at most 2^5-1=31 unions per frame -- negligible cost,
+                # no reason to approximate.
+                # 可选：union 时排除某些 channel
                 # （tissue 评估排除 instrument ch1，避免器械区域被并进 tissue）
                 _excl = set(getattr(self.args, 'oracle_exclude_channels', None) or [])
                 _cand = [k for k in range(num_channels) if k not in _excl]
                 best_ch = int(max(_cand, key=lambda k: frame_ious[k]))
                 active_channels = [best_ch]
                 best_iou = frame_ious[best_ch]
-                remaining = sorted(
-                    [k for k in _cand if k != best_ch],
-                    key=lambda k: frame_ious[k], reverse=True)
-                for ch in remaining:
-                    candidate_mask = np.any(
-                        np.stack([pred_mask_resize[c] for c in active_channels + [ch]]), axis=0
-                    ).astype(pred_mask_resize.dtype)
-                    candidate_iou = utils.iou(candidate_mask, ann, num_classes=2, ignore_index=-1)[1]
-                    if candidate_iou > best_iou + 0.01:
-                        active_channels.append(ch)
-                        best_iou = candidate_iou
+                for r in range(1, len(_cand) + 1):
+                    for subset in itertools.combinations(_cand, r):
+                        candidate_mask = np.any(
+                            np.stack([pred_mask_resize[c] for c in subset]), axis=0
+                        ).astype(pred_mask_resize.dtype)
+                        candidate_iou = utils.iou(candidate_mask, ann, num_classes=2, ignore_index=-1)[1]
+                        if candidate_iou > best_iou:
+                            active_channels = list(subset)
+                            best_iou = candidate_iou
                 seq_freq = self.seq_channel_freq.setdefault(seq_name, np.zeros(num_channels, dtype=int))
                 for ch in active_channels:
                     self.max_channel_freq[ch] += 1

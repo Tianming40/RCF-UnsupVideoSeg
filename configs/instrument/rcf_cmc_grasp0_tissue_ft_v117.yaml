@@ -1,0 +1,290 @@
+# rcf_cmc_grasp0_tissue_ft_v117.yaml
+#
+# v117 = multi-gap "variant 1": native random-gap sampling mechanism
+#        (dataset/data.py __getitem__, options=[1,2,3] @ [0.7,0.2,0.1]),
+#        used AS-IS with zero code changes — this is the same mechanism
+#        data_medical (EndoVis-style, 225-frame continuous sequences) has
+#        used in production all along; it was previously dead on CMC
+#        because every CMC config set flow_suffix==flow_suffix2==
+#        flow_suffix3 (all "_NewCT") on 2-frame pair-dirs, so gap>1 always
+#        overflowed and silently fell back to gap=1.
+#
+# Trains on CMC_grasp0_multigap_seq: 376 unannotated grasp0 cases, each
+# listed as ONE split line with all 8 frames in temporal order (pre +
+# post_1..post_7), matching data_medical's "one sequence = one line" layout
+# (tools/build_multigap_seq_dataset.py). Each __getitem__ call independently
+# draws a random anchor position (via the sampler/index, deterministic) and
+# a random gap in {1,2,3} (via np.random.choice, fresh every call) — NOT an
+# exhaustive enumeration like v116's 28-pairs-per-case split. gap=4..7 are
+# never drawn (options=[1,2,3]), but post_4..post_7 frames are still used
+# whenever they land as the TARGET of a small-gap pair from a later anchor
+# (e.g. anchor=4, gap=3 -> target=post_7) — only large jumps (gap>=4) are
+# excluded, not those frames themselves.
+#
+# Flow: Flows_gap1/2/3 + BackwardFlows_gap1/2/3 under CMC_grasp0_multigap_seq,
+# symlinked from the already-generated CMC_grasp0_multigap_flows (same
+# source as v116, just re-keyed by target-frame filename to match
+# data_medical's Flows_NewCT2/0002.npy-style convention instead of v116's
+# per-pair-directory convention).
+#
+# train_dataset_kwargs deliberately leaves gap_options/gap_probabilities/
+# gap_flow_suffixes UNSET (None) -- dataset/data.py's VideoDataset defaults
+# them to exactly [1,2,3] / [0.7,0.2,0.1] / [flow_suffix,flow_suffix2,
+# flow_suffix3], i.e. this config is indistinguishable in behavior from
+# just wiring flow_suffix/_2/_3 the old way. Verified this session (400
+# sampled __getitem__ calls, seeded) to reproduce the exact same gap
+# distribution {1: 320, 2: 53, 3: 27} before and after the dataset/data.py
+# refactor that added the new gap_options mechanism (see v118 for the
+# generalized 7-gap variant, which DOES need the new params).
+#
+# Eval: train images come from CMC_grasp0_continuous_bwdif (via
+# CMC_grasp0_multigap_seq/JPEGImages, which is a directory-level symlink
+# back to it) -- eval MUST use images from that same deinterlace run, not
+# CMC_grasp0_deinterlaced or CMC_grasp0_5_10_merged_bwdif (different bwdif
+# passes). Reuses the exact same eval_instrument/eval_tissue built for v116
+# (tools/build_multigap_matched_eval.py): images symlinked from
+# CMC_grasp0_continuous_bwdif, masks reused as-is from CMC_grasp0_deinterlaced
+# (labels don't depend on deinterlace method). 212/213 instrument, 207/209
+# tissue eval cases covered.
+#
+# Everything else (model_kwargs, decode_head, etc.) is identical to v102.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v117
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_multigap_seq
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_gap1"
+  flow_suffix2: "_gap2"
+  flow_suffix3: "_gap3"
+  split: ImageSets/train_multigap_seq8_unannotated.txt
+  zero_ann: false
+  # gap_options / gap_probabilities / gap_flow_suffixes intentionally unset
+  # -> VideoDataset defaults to [1,2,3] @ [0.7,0.2,0.1] using flow_suffix/_2/_3
+  #    above (see header comment).
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/val.txt
+  zero_ann: false
+
+val_dataset_list:
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_instrument
+    split: ImageSets/val.txt
+    name: instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+    split: ImageSets/val.txt
+    name: tissue
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHead
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

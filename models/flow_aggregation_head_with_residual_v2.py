@@ -84,6 +84,36 @@ optional improvements to flow guidance signal quality:
                                                  conflict-free path instead of
                                                  discarding it.
 
+  detach_mask_gaps (list, default=None)        – same mechanism as
+                                                 detach_mask_patterns, but
+                                                 keyed by the actual
+                                                 per-sample frame gap (int)
+                                                 instead of a seq_name
+                                                 substring. Needed for
+                                                 CMC_grasp0_multigap_seq
+                                                 (VideoDataset's random-gap
+                                                 mechanism, dataset/data.py):
+                                                 seq_names there is just the
+                                                 case stem, carrying no gap
+                                                 info (gap is drawn fresh
+                                                 each __getitem__ call), so
+                                                 detach_mask_patterns cannot
+                                                 distinguish e.g. a gap=1 draw
+                                                 from a gap=7 draw. Requires
+                                                 forward()'s new `gaps`
+                                                 argument (per-sample int
+                                                 tensor, threaded from
+                                                 VideoDataset's `ret['gap']`
+                                                 through forward_train). Both
+                                                 mechanisms can be set
+                                                 simultaneously (independent
+                                                 OR conditions) — e.g.
+                                                 detach_mask_patterns for
+                                                 bridge pairs and
+                                                 detach_mask_gaps for
+                                                 large-gap multigap samples
+                                                 in the same run.
+
   topk_scale_normalize (bool, default=False)   – rank samples for topk
                                                  selection by GT-flow-scale-
                                                  normalised loss instead of
@@ -111,6 +141,32 @@ optional improvements to flow guidance signal quality:
                                                  gradient magnitude semantics
                                                  for whichever samples get
                                                  selected are unchanged.
+
+  affine_order (int, default=1)                – order of the per-channel
+                                                 demeaned motion model fit in
+                                                 get_demean_affine_flow.
+                                                 1: linear affine (2x2 A,
+                                                 closed-form 2x2 inverse —
+                                                 the only behaviour that
+                                                 existed before this option
+                                                 was added; default preserves
+                                                 it exactly).
+                                                 2: quadratic — coord feature
+                                                 basis becomes [dx, dy, dx^2,
+                                                 dy^2, dx*dy] (5-dim), fit via
+                                                 a generic batched
+                                                 torch.linalg.solve (verified
+                                                 not to hit the 2x2-specific
+                                                 CUDA MAGMA misalignment bug
+                                                 the closed-form 2x2 path
+                                                 exists to avoid). Intended to
+                                                 capture non-rigid motion
+                                                 (e.g. instrument joint
+                                                 articulation) a pure affine
+                                                 model cannot represent — only
+                                                 takes effect when
+                                                 free_residual_with_affine is
+                                                 also True.
 
   use_bg_affine_removal (bool, default=False)  – subtract a robust background
                                                  flow estimate (spatial median
@@ -169,7 +225,9 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
                  cycle_conf_sigma: float = 1.0,
                  cycle_conf_sigma_overrides: dict = None,
                  detach_mask_patterns: list = None,
+                 detach_mask_gaps: list = None,
                  topk_scale_normalize: bool = False,
+                 affine_order: int = 1,
                  use_bg_affine_removal: bool = False,
                  bg_removal_affine: bool = False,
                  use_per_channel_residual_scale: bool = False,
@@ -208,9 +266,35 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         self.cycle_conf_sigma = cycle_conf_sigma
         self.cycle_conf_sigma_overrides = cycle_conf_sigma_overrides
         self.detach_mask_patterns = detach_mask_patterns
+        self.detach_mask_gaps = detach_mask_gaps
         self.topk_scale_normalize = topk_scale_normalize
         self.use_bg_affine_removal = use_bg_affine_removal
         self.bg_removal_affine = bg_removal_affine
+
+        # affine_order=1 (default): exactly the parent's linear demeaned
+        # affine model (2x2 A, closed-form 2x2 inverse — see
+        # _demean_affine_flow_per_channel's docstring for why: avoids a CUDA
+        # MAGMA batched-LU misalignment bug for 2x2 specifically). Untouched
+        # when affine_order==1, so every existing config's behaviour is
+        # bit-for-bit unchanged.
+        # affine_order=2: quadratic per-channel motion model — the coord
+        # feature basis becomes [dx, dy, dx^2, dy^2, dx*dy] (5-dim) instead
+        # of [dx, dy] (2-dim), fit via a generic torch.linalg.solve (verified
+        # on GPU: 5x5 batched solve does NOT hit the 2x2 MAGMA bug). Intended
+        # to capture non-rigid articulation (e.g. instrument joint rotation)
+        # that a pure affine model cannot represent — same motivation as the
+        # QVI-style quadratic motion discussion, but fit directly from a
+        # single frame pair's flow field rather than extrapolated across
+        # multiple temporal samples.
+        self.affine_order = affine_order
+        assert affine_order in (1, 2), f"affine_order must be 1 or 2, got {affine_order}"
+        if self.free_residual_with_affine and affine_order == 2:
+            H, W = self.mask_size
+            yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+            quad_coord_map = torch.stack(
+                (xx, yy, xx * xx, yy * yy, xx * yy), dim=2
+            ).view((-1, 5)).float().cuda()
+            self.coord_map = quad_coord_map
 
         self.use_per_channel_residual_scale = use_per_channel_residual_scale
         if use_per_channel_residual_scale:
@@ -332,6 +416,26 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         if not any(flags):
             return mask
         flag_tensor = torch.tensor(flags, device=mask.device).view(B, 1, 1, 1)
+        return torch.where(flag_tensor, mask.detach(), mask)
+
+    def _maybe_detach_mask_by_gap(self, mask, gaps):
+        """
+        Same mechanism as _maybe_detach_mask, keyed by the actual per-sample
+        frame gap (VideoDataset's random-gap mechanism, dataset/data.py)
+        instead of a seq_name substring — needed because seq_names for
+        multi-gap sequence datasets (CMC_grasp0_multigap_seq) is just the
+        case stem and carries no gap information (the gap is drawn fresh
+        per __getitem__ call). Samples whose gap is in detach_mask_gaps get
+        mask.detach() (zero gradient into decode_head2); others pass
+        through unchanged.
+        """
+        gaps_t = gaps if torch.is_tensor(gaps) else torch.as_tensor(gaps)
+        gaps_t = gaps_t.to(mask.device)
+        detach_set = torch.as_tensor(self.detach_mask_gaps, device=mask.device)
+        flag_tensor = (gaps_t.view(-1, 1) == detach_set.view(1, -1)).any(dim=1)
+        if not flag_tensor.any():
+            return mask
+        flag_tensor = flag_tensor.view(-1, 1, 1, 1)
         return torch.where(flag_tensor, mask.detach(), mask)
 
     @staticmethod
@@ -568,19 +672,31 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         sigma_omega_omega = torch.einsum(
             'b i j, b i j k l -> b i k l', img_preds_1d, u_demean_u_demean_T)
 
-        # Analytical 2×2 solve: A_star = (sigma_omega_omega^{-1} @ sigma_F_omega^T)^T
-        # For A = [[a,b],[c,d]]:  A^{-1} = [[d,-b],[-c,a]] / det(A)
-        A = sigma_omega_omega.float()                                  # [B, C, 2, 2]
-        a, b = A[..., 0, 0], A[..., 0, 1]
-        c, d = A[..., 1, 0], A[..., 1, 1]
-        det = (a * d - b * c).clamp(min=1e-6).unsqueeze(-1).unsqueeze(-1)
-        A_inv = torch.stack(
-            [torch.stack([d, -b], dim=-1),
-             torch.stack([-c, a], dim=-1)], dim=-2
-        ) / det                                                        # [B, C, 2, 2]
-        # X = A_inv @ sigma_F_omega^T  →  A_star = X^T
-        RHS = sigma_F_omega.permute(0, 1, 3, 2).float()               # [B, C, 2, 2]
-        A_star = torch.matmul(A_inv, RHS).permute(0, 1, 3, 2)         # [B, C, 2, 2]
+        if self.affine_order == 1:
+            # Analytical 2×2 solve: A_star = (sigma_omega_omega^{-1} @ sigma_F_omega^T)^T
+            # For A = [[a,b],[c,d]]:  A^{-1} = [[d,-b],[-c,a]] / det(A)
+            A = sigma_omega_omega.float()                                  # [B, C, 2, 2]
+            a, b = A[..., 0, 0], A[..., 0, 1]
+            c, d = A[..., 1, 0], A[..., 1, 1]
+            det = (a * d - b * c).clamp(min=1e-6).unsqueeze(-1).unsqueeze(-1)
+            A_inv = torch.stack(
+                [torch.stack([d, -b], dim=-1),
+                 torch.stack([-c, a], dim=-1)], dim=-2
+            ) / det                                                        # [B, C, 2, 2]
+            # X = A_inv @ sigma_F_omega^T  →  A_star = X^T
+            RHS = sigma_F_omega.permute(0, 1, 3, 2).float()               # [B, C, 2, 2]
+            A_star = torch.matmul(A_inv, RHS).permute(0, 1, 3, 2)         # [B, C, 2, 2]
+        else:
+            # affine_order == 2: coord_map is 5-dim ([dx,dy,dx^2,dy^2,dx*dy]),
+            # sigma_omega_omega is [B,C,5,5] — no closed-form shortcut, use a
+            # generic batched solve (verified on GPU: 5x5 does not hit the
+            # 2x2-specific MAGMA misalignment bug documented above). Ridge
+            # term guards against near-singular fits (e.g. a channel with
+            # very few assigned pixels, or near-collinear coordinates).
+            A = sigma_omega_omega.float() + torch.eye(
+                sigma_omega_omega.shape[-1], device=sigma_omega_omega.device) * 1e-4
+            RHS = sigma_F_omega.permute(0, 1, 3, 2).float()               # [B, C, 5, 2]
+            A_star = torch.linalg.solve(A, RHS).permute(0, 1, 3, 2)       # [B, C, 2, 5]
 
         F_pred_demean = torch.einsum('b i j k, b i l k -> b i l j', A_star, u_de_mean)
         return F_pred_demean.view(B, C, H, W, 2)   # per-channel, pre-collapse
@@ -666,7 +782,7 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
     # Override forward to use self.topk instead of hard-coded 2           #
     # ------------------------------------------------------------------ #
     def forward(self, imgs, masks, gt_fw_flows, gt_bw_flows,
-                all_pred_residual_fw, all_pred_residual_bw, seq_names=None):
+                all_pred_residual_fw, all_pred_residual_bw, seq_names=None, gaps=None):
 
         flow_loss = {'seg_fw': 0., 'seg_bw': 0.}
         flows = {'gt_flow': [], 'pred_flow': [], 'agg_flow': [],
@@ -690,6 +806,9 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
             if self.detach_mask_patterns and seq_names is not None:
                 mask1 = self._maybe_detach_mask(mask1, seq_names)
                 mask2 = self._maybe_detach_mask(mask2, seq_names)
+            if self.detach_mask_gaps and gaps is not None:
+                mask1 = self._maybe_detach_mask_by_gap(mask1, gaps)
+                mask2 = self._maybe_detach_mask_by_gap(mask2, gaps)
 
             gt_fw_flow = gt_fw_flows[:, i - 1, ...]
             gt_bw_flow = gt_bw_flows[:, i - 1, ...]

@@ -257,11 +257,21 @@ class RandomFlip(object):
         flip_ratio (float, optional): The flipping probability. Default: None.
         direction(str, optional): The flipping direction. Options are
             'horizontal' and 'vertical'. Default: 'horizontal'.
+        flow_fields (Sequence[str], optional): names (within seg_fields) that
+            hold optical-flow vector data (last dim = (x, y) displacement),
+            as opposed to plain scalar/label maps (e.g. pl_masks). Mirroring
+            an array only rearranges pixel POSITIONS; a flow field's VECTOR
+            VALUES must also be corrected -- horizontal flip negates the x
+            (first) channel, vertical flip negates the y (second) channel.
+            Fields not listed here (default: none) are mirrored positionally
+            only, matching the original behaviour exactly -- this is correct
+            for plain masks, which have no directional semantics.
     """
 
-    def __init__(self, flip_ratio=None, direction='horizontal'):
+    def __init__(self, flip_ratio=None, direction='horizontal', flow_fields=()):
         self.flip_ratio = flip_ratio
         self.direction = direction
+        self.flow_fields = set(flow_fields)
         if flip_ratio is not None:
             assert flip_ratio >= 0 and flip_ratio <= 1
         assert direction in ['horizontal', 'vertical']
@@ -297,8 +307,18 @@ class RandomFlip(object):
             for key in results.get('seg_fields', []):
                 # use copy() to make numpy stride positive
                 for i in range(len(results[key])):
-                    results[key][i] = mmcv.imflip(
+                    flipped = mmcv.imflip(
                         results[key][i], direction=results['flip_direction']).copy()
+                    if key in self.flow_fields:
+                        # Mirroring only rearranges pixel positions -- a flow
+                        # vector's VALUE must also be negated along the
+                        # mirrored axis (horizontal flip -> negate x/channel 0,
+                        # vertical flip -> negate y/channel 1), or the
+                        # supervision points in the wrong direction for every
+                        # flipped sample.
+                        chan = 0 if results['flip_direction'] == 'horizontal' else 1
+                        flipped[..., chan] *= -1
+                    results[key][i] = flipped
         return results
 
     def __repr__(self):
@@ -1094,7 +1114,8 @@ class Transform(object):
                 *([AttnTransform()] if has_attn else []),
                 *resize_crop,
                 *([
-                    RandomFlip(flip_ratio=0.5, direction='horizontal'),
+                    RandomFlip(flip_ratio=0.5, direction='horizontal',
+                              flow_fields=['gt_fw_flows', 'gt_bw_flows'] if has_flow else ()),
                     PhotoMetricDistortion()
                 ] if strong_aug else []),
                 *([FlowTransform(['gt_fw_flows', 'gt_bw_flows'], scale_flow=scale_flow)] if has_flow else []),

@@ -7,8 +7,27 @@ from PIL import Image
 import random
 
 class VideoDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None, grasp_ann_dir=None):
+    def __init__(self, root, split, training, frame_num=2, load_flow=False, load_pl=False, transform=None, subsample_frame_interval=None, flow_suffix="",flow_suffix2="",flow_suffix3="", zero_ann=False, pl_root=None, pl_root2=None, grasp_ann_dir=None,
+                 gap_options=None, gap_probabilities=None, gap_flow_suffixes=None):
         super().__init__()
+
+        # Random-gap sampling (see __getitem__): which frame-gap values a
+        # training pair can be drawn at, with what probability, and which
+        # Flows(+suffix)/BackwardFlows(+suffix) directory to read for each.
+        # Default (None) reproduces the original hardcoded gap-1/2/3
+        # behavior EXACTLY (same options/probabilities, same 3 suffix slots
+        # sourced from flow_suffix/flow_suffix2/flow_suffix3) — every
+        # existing caller (data_medical configs, CMC pair-dir configs) is
+        # unaffected. Pass all three explicitly (matching lengths, probs
+        # summing to 1) to use more/fewer/different gap values, e.g. the
+        # CMC grasp0 multi-gap sequences which have real flow for gap 1..7.
+        self.gap_options = gap_options if gap_options is not None else [1, 2, 3]
+        self.gap_probabilities = gap_probabilities if gap_probabilities is not None else [0.7, 0.2, 0.1]
+        self.gap_flow_suffixes = gap_flow_suffixes if gap_flow_suffixes is not None else [flow_suffix, flow_suffix2, flow_suffix3]
+        assert len(self.gap_options) == len(self.gap_probabilities) == len(self.gap_flow_suffixes), \
+            "gap_options / gap_probabilities / gap_flow_suffixes must have matching lengths"
+        assert abs(sum(self.gap_probabilities) - 1.0) < 1e-6, "gap_probabilities must sum to 1"
+        assert 1 in self.gap_options, "gap=1 must always be an option (used as the boundary-overflow fallback)"
 
         file_path = os.path.join(root, split)
         with open(file_path, 'r') as f:
@@ -75,7 +94,14 @@ class VideoDataset(torch.utils.data.Dataset):
             assert self.transform.has_pl, "load_pl needs to match with has_pl in transform"
 
         if not self.training:
-            assert self.frame_num == 1, f"You need single frames for evaluaion but have {self.frame_num} frames"
+            # frame_num==1 is the normal case (scored frame only). frame_num>1
+            # is allowed for eval variants that need an auxiliary neighbour
+            # frame available at inference time (e.g. RCFJointMaskSoftTissueModel,
+            # models/rcf_joint_mask_model.py) -- only current_seq[frame_ind]
+            # (the first frame) is ever scored/annotated; extra frames are
+            # loaded but never receive their own annotation lookup (see the
+            # `assert i == 0` site below, relaxed for the same reason).
+            assert self.frame_num >= 1, f"frame_num must be >= 1, got {self.frame_num}"
 
     def load_image(self, path, convert_format="RGB"):
         with open(path, "rb") as f:
@@ -94,8 +120,17 @@ class VideoDataset(torch.utils.data.Dataset):
 
         # We don't get the last `self.frame_num - 1` frame(s) since we need current and next frame
         if frame_ind >= self.seq_lens[seq_ind_within_subset] - (self.frame_num - 1):
+            # This shift-back makes __len__ (== sum(seq_lens), not sum(seq_lens
+            # - (frame_num-1))) slightly overcount valid starts for any line
+            # with frame_num>1 -- harmless for training (just an extra
+            # stochastic duplicate draw across epochs, always allowed here)
+            # and, since dataset/data.py's eval mode was relaxed this session
+            # to allow frame_num>1 (see the __init__ assert above,
+            # RCFJointMaskSoftTissueModel's paired eval), also harmless for
+            # eval: the duplicate index resolves to the SAME frame_ind as an
+            # earlier index, so it just re-scores an already-scored frame
+            # (wasted compute, not a correctness issue -- doesn't skew miou).
             frame_ind -= self.frame_num - 1
-            assert self.training, f"In evaluation, we should use single frame to evaluate. Index: {index}, frame index: {frame_ind}."
 
         current_seq = self.seq_frames_path_all[seq_ind_within_subset]
 
@@ -106,9 +141,7 @@ class VideoDataset(torch.utils.data.Dataset):
         #     images.append(image)
         
         # Randomly select whether to acquire the next frame or two frames apart
-        options = [1, 2, 3]
-        probabilities = [0.7, 0.2, 0.1]
-        frame_gap = np.random.choice(options, p=probabilities)  # 1 means next frame, 2 means two frames apart.
+        frame_gap = np.random.choice(self.gap_options, p=self.gap_probabilities)  # 1 means next frame, 2 means two frames apart.
 
         images = []
         flag_gap = 0
@@ -148,11 +181,13 @@ class VideoDataset(torch.utils.data.Dataset):
             'seg_fields': [],
             'grasp_xy':   grasp_xy,    # normalised (x,y), (-1,-1) if unavailable
             'dissect_xy': dissect_xy,  # normalised (x,y), (-1,-1) if unavailable
+            'gap': flag_gap,  # actual frame gap used for this sample (post boundary-fallback) — always 1 for eval/frame_num=1
         }
 
         if not self.training:
-            # Assume we have only one frame
-            assert i == 0, "In eval, we should have one frame only."
+            # Annotation always belongs to the FIRST frame (current_seq[frame_ind]),
+            # regardless of frame_num -- extra frames (frame_num>1, see the
+            # __init__ assert above) are auxiliary and never separately annotated.
             if not self.zero_ann:
                 path = current_seq[frame_ind].replace(
                     "JPEGImages", "Annotations").replace(".png", ".jpg")    # rewrite by wpr
@@ -165,66 +200,31 @@ class VideoDataset(torch.utils.data.Dataset):
             ret['ann'] = ann
 
         if self.load_flow:
-            if flag_gap == 1:
-                gt_fw_flows = []
-                gt_bw_flows = []
-                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "Flows" + self.flow_suffix)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "BackwardFlows" + self.flow_suffix)[:-4] + ".npy"
-                    if False: # debug
-                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
-                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
-                    gt_fw_flow = np.load(fw_flow_path)
-                    gt_bw_flow = np.load(bw_flow_path)
+            # flag_gap always lands on one of self.gap_options (fallback path
+            # above forces it to 1, which is always index 0 by construction —
+            # see the assert in __init__). Each gap value reads flow from its
+            # own Flows(+suffix)/BackwardFlows(+suffix) directory, keyed by
+            # the SECOND frame's path (matches data_medical's Flows_NewCT2/
+            # 0002.npy convention: the flow file is named after its target
+            # frame, which uniquely determines the source frame given a
+            # fixed gap).
+            flow_suffix_for_gap = self.gap_flow_suffixes[self.gap_options.index(flag_gap)]
+            gt_fw_flows = []
+            gt_bw_flows = []
+            for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
+                fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
+                    "JPEGImages", "Flows" + flow_suffix_for_gap)[:-4] + ".npy"
+                bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
+                    "JPEGImages", "BackwardFlows" + flow_suffix_for_gap)[:-4] + ".npy"
+                gt_fw_flow = np.load(fw_flow_path)
+                gt_bw_flow = np.load(bw_flow_path)
 
-                    ### Data format modification
-                    gt_fw_flow = gt_fw_flow.astype(np.float32)
-                    gt_bw_flow = gt_bw_flow.astype(np.float32)
-                    
-                    gt_fw_flows.append(gt_fw_flow)
-                    gt_bw_flows.append(gt_bw_flow)
-            elif flag_gap == 2:
-                gt_fw_flows = []
-                gt_bw_flows = []
-                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "Flows" + self.flow_suffix2)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "BackwardFlows" + self.flow_suffix2)[:-4] + ".npy"
-                    if False: # debug
-                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
-                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
-                    gt_fw_flow = np.load(fw_flow_path)
-                    gt_bw_flow = np.load(bw_flow_path)
+                ### Data format modification
+                gt_fw_flow = gt_fw_flow.astype(np.float32)
+                gt_bw_flow = gt_bw_flow.astype(np.float32)
 
-                    ### Data format modification
-                    gt_fw_flow = gt_fw_flow.astype(np.float32)
-                    gt_bw_flow = gt_bw_flow.astype(np.float32)
-                    
-                    gt_fw_flows.append(gt_fw_flow)
-                    gt_bw_flows.append(gt_bw_flow)
-            elif flag_gap == 3:
-                gt_fw_flows = []
-                gt_bw_flows = []
-                for i in range(1, self.frame_num): # 00001.jpg in Flow is the flow from 0 to 1
-                    fw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "Flows" + self.flow_suffix3)[:-4] + ".npy"
-                    bw_flow_path = current_seq[frame_ind + i * flag_gap].replace(
-                        "JPEGImages", "BackwardFlows" + self.flow_suffix3)[:-4] + ".npy"
-                    if False: # debug
-                        fw_flow_path = "/home/l/lo/longlian/00001.npy"
-                        bw_flow_path = "/home/l/lo/longlian/00001.npy"
-                    gt_fw_flow = np.load(fw_flow_path)
-                    gt_bw_flow = np.load(bw_flow_path)
-
-                    ### Data format modification
-                    gt_fw_flow = gt_fw_flow.astype(np.float32)
-                    gt_bw_flow = gt_bw_flow.astype(np.float32)
-                    
-                    gt_fw_flows.append(gt_fw_flow)
-                    gt_bw_flows.append(gt_bw_flow)
+                gt_fw_flows.append(gt_fw_flow)
+                gt_bw_flows.append(gt_bw_flow)
 
             ret['gt_fw_flows'] = gt_fw_flows
             ret['gt_bw_flows'] = gt_bw_flows

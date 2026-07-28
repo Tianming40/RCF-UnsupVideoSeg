@@ -1,0 +1,458 @@
+# rcf_cmc_grasp0_tissue_ft_v133.yaml
+#
+# v133 = v123's exact architecture (RCFJointMaskV2SoftTissueModel,
+# MultiScaleSegHeadJoint4, 4-scale joint concat) + grasp10 added into
+# training data (discussed 260721). Single isolated variable: only
+# train_dataset_kwargs/data_path change below -- decode_head2, eval
+# (val_paired.txt, frame_num: 2, both val_dataset_list entries), model_cls,
+# etc. are IDENTICAL to v123, copied verbatim. See train_dataset_kwargs
+# below for the full data-construction/leakage-check writeup.
+#
+# IMPORTANT (explicit reminder this session, easy to get wrong): eval MUST
+# stay 2-frame here too -- RCFJointMaskV2SoftTissueModel._decode_head_forward
+# still asserts im_num==2 whenever decode_head2.use_flow_feat is set,
+# completely independent of what changed in training data. Verified below
+# that test_dataset_kwargs.frame_num/val_dataset_list's frame_num are both
+# still 2 and split is still val_paired.txt.
+#
+# UPDATE (260721): grasp0 eval image source repointed from
+# CMC_grasp0_continuous_bwdif -> CMC_grasp0_5_10_merged_bwdif/eval_instrument,
+# eval_tissue (both test_dataset_kwargs.data_path/test_data_path and the two
+# grasp0 val_dataset_list entries below). Found via direct md5 comparison
+# (not assumed) that CMC_grasp0_continuous_bwdif and
+# CMC_grasp0_5_10_merged_bwdif's _g0 pairs run bwdif with DIFFERENT temporal
+# windows (tools/deinterlace_cmc_grasp0_multigap.py concats the full ~8-frame
+# sequence; tools/deinterlace_cmc_bwdif.py concats only 2) -- frame0 happened
+# to match byte-for-byte across all 212/207 cases, but frame1 (the neighbour
+# actually used as the joint-mask model's second input) did NOT: 105/212 and
+# 105/207 mismatches. Since training now reads grasp0 frames from the
+# 2-frame-window pipeline (CMC_grasp0_5_10_merged_bwdif), eval needs to see
+# the SAME pipeline's output, not a different one, even though annotations
+# (GT masks) are unaffected by which deinterlace pass was used and were
+# reused as-is. Discovered CMC_grasp0_5_10_merged_bwdif/eval_instrument,
+# eval_tissue already existed (predates this session, Jul 14) with 601 cases
+# already correctly matching the _g0/_g10 training pairs byte-for-byte
+# (spot-verified) -- reused that directory directly rather than building a
+# new one; only added a val_paired.txt there (had none before, only a
+# single-frame val.txt) restricted to the same 212/207 stems v123 evaluated.
+#
+# ────────────────────────────────────────────────────────────────────────
+# v123 = "idea 1" from this session's discussion (260720): extend v121/v122's
+# single feat0-level joint two-frame feature to ALL FOUR backbone scales.
+# Each frame's mask now gets its own 4 features PLUS 4 joint (cross-frame
+# concatenated) features, one per scale, instead of just feat0.
+#
+#   model_cls: RCFJointMaskSoftTissueModel -> RCFJointMaskV2SoftTissueModel
+#     (models/rcf_joint_mask_v2_model.py, new file)
+#   decode_head2.type: MultiScaleSegHead -> MultiScaleSegHeadJoint4
+#     (models/multi_scale_seg_head_joint4.py, new file, subclasses
+#     MultiScaleSegHead — adds feat1_joint/feat2_joint/feat3_joint additive-
+#     skip slots at the H/8 stage, alongside the existing feat0-level
+#     flow_feat slot at H/4)
+#   decode_head2: + feat1_joint_in_channels/feat2_joint_in_channels/
+#     feat3_joint_in_channels: 64 each
+#
+# Also carries over v122's flow_drop_p: 0.0 fix (v121 was accidentally left
+# at the MultiScaleSegHead default of 0.5, randomly dropping the joint
+# feature half of training steps — doesn't apply here since
+# MultiScaleSegHeadJoint4's forward has no drop logic for any of its joint
+# slots at all, by design, same rationale as v122's comment below).
+#
+# Zero edits to RCFModel/RCFDinoModel/RCFSoftTissueModel/MultiScaleSegHead/
+# RCFJointMaskSoftTissueModel — v121/v122 (which use the base classes) are
+# completely unaffected by this config.
+#
+# Verified end-to-end this session (synthetic 2-frame batch): forward_train
+# + backward — all four joint projectors (feat0/1/2/3) receive real nonzero
+# gradient, decode_head2's all 47 params (vs v121's 38 — 3 extra projector
+# submodules) get gradient; a direct extract_feat + _decode_head_forward
+# call matching _sliding_window_eval's exact pattern (im_num=2) runs
+# correctly end-to-end, output shape [2, 5, 96, 96] as expected.
+#
+# Motivation (discussed at length 260717, see README): mask prediction
+# (decode_head2) has ALWAYS been completely per-frame in its forward
+# computation for this entire project — frame_i and frame_j's backbone
+# features never interact (batched, not concatenated), so mask_i's
+# prediction has zero forward-pass access to frame_j's content, no matter
+# how well trained. The only place two-frame information has ever entered
+# this architecture is the residual branch (decode_head3, pair-conditioned)
+# and, indirectly, mask's TRAINING GRADIENT (via the rigid/affine flow-fit
+# loss) — never mask's own forward computation. This matters because some
+# appearance ambiguity (specular highlights, low-texture drift — exactly
+# the RAFT failure modes visually confirmed in this session's flow-quality
+# analysis) can only be resolved by looking at the OTHER frame; pure
+# single-frame appearance structurally cannot resolve it regardless of
+# training.
+#
+# RCFJointMaskSoftTissueModel gives mask genuine forward-pass access to the
+# paired frame for the first time: a new JointFrameFeatProjector
+# (models/joint_frame_feat.py) takes feat0 (backbone's first/highest-res
+# output scale) for BOTH frames, channel-concatenated, and projects it down
+# to a [B, 64, H, W] feature — fed into MultiScaleSegHead's existing (but,
+# until now, never-actually-used-by-any-config) use_flow_feat additive-skip
+# slot (`fused = fused + flow_proj(flow_feat)`). That slot previously only
+# ever carried a feature derived from GT optical flow — never raw
+# cross-frame appearance.
+#
+# Implementation is a NEW model subclass overriding ONLY
+# _decode_head_forward — found to be the single method common to all THREE
+# real call paths: forward_train, forward_eval, AND _sliding_window_eval
+# (main.py's Model, used by every real config here since they all set
+# use_sliding_window: true, which makes test_step bypass forward_eval
+# entirely — an earlier version of this file overrode forward_eval
+# separately and would have silently never engaged during real training
+# runs). x (== all_feat, containing feat0 with the real cross-frame
+# content) is already passed into _decode_head_forward directly, so no
+# forward-hook capture trick is needed. Zero edits to RCFModel/
+# RCFDinoModel/RCFSoftTissueModel/MultiScaleSegHead — every existing config
+# (v102, v116-v120, etc.) is completely unaffected.
+# _sliding_window_eval itself needed NO changes either — it already crops
+# ALL frames in imgs ([B, im_num, C, H, W]) at the same (y, x) window
+# position per iteration (only the H/W dims are sliced), so it was already
+# "slide both frames together" for any im_num, this whole time.
+#
+# Verified this session: (1) synthetic forward_train + backward pass
+# (2-frame random batch): loss computes correctly (loss_warp_seg/loss/
+# loss_dino all present, DINO subclass chain intact), joint_feat_proj
+# receives real nonzero gradient, decode_head2 still receives its own
+# gradient as before; (2) a direct extract_feat + _decode_head_forward call
+# matching _sliding_window_eval's exact call pattern (im_num=2, no
+# forward_eval/forward_train involved) runs correctly end-to-end.
+#
+# Deliberately isolated to ONE variable at a time: same small-gap (1,2,3)
+# data/mechanism as v117, so any miou delta vs v117 is attributable to the
+# joint-mask architecture change alone, not conflated with a different gap
+# mix (contrast with v118/v119/v120's larger gap ranges).
+#
+# Inference contract: RCFJointMaskSoftTissueModel._decode_head_forward
+# asserts im_num==2 whenever decode_head2.use_flow_feat is set (no graceful
+# single-frame fallback) — every eval path below (test_dataset_kwargs AND
+# val_dataset_list) is wired to a paired split (val_paired.txt,
+# tools/build_paired_eval_split.py: frame0 = the existing annotated frame,
+# frame1 = its gap1 neighbour, symlinked in from CMC_grasp0_continuous_bwdif)
+# with frame_num: 2. dataset/data.py's VideoDataset was relaxed this
+# session (two small, backward-compatible assertion changes) to allow
+# frame_num>1 in eval mode at all — previously hard-blocked at frame_num==1
+# unconditionally. main_tissue.py's Model._make_val_loader/val_dataloader
+# was similarly extended to read an optional per-entry `frame_num` from
+# val_dataset_list (default 1, backward compatible).
+#
+# Everything else (model_kwargs, decode_head, decode_head3, etc.) is
+# identical to v117/v102.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v133
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFJointMaskV2SoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train_g0378_g10500.txt
+  zero_ann: false
+  # v133: grasp0 pre/post pairs (378, single "gap1"-equivalent pair per
+  # case, same _g0 convention CMC_grasp0_5_10_merged_bwdif has used since
+  # before this session) + grasp10 pre/post pairs (500) -- discussed
+  # 260721, motivated by the historical champions v83/v102 training on
+  # grasp0+grasp10 MERGED data (CMC_grasp0_5_10_merged, 379+601 pairs) for
+  # "richer warp_seg training signal for instrument channel assignment"
+  # (README Phase 3) -- something the entire v116-v132 multigap line
+  # dropped (grasp0-only). This restores grasp10 for v123's architecture
+  # specifically, as a single isolated variable on top of the current
+  # joint-mask line, rather than a wholesale reversion.
+  #
+  # train_g0378_g10500.txt (built this session, dataset/ImageSets/, 878
+  # lines): grasp0's 378 stems are the project's pre-existing holdout
+  # (already clean vs grasp0 eval, 0 overlap, reverified). grasp10's 500 =
+  # ALL 601 _g10 pairs in CMC_grasp0_5_10_merged_bwdif MINUS the 101 cases
+  # that have BOTH instrument+tissue COCO annotations (those 101 are
+  # reserved for the instrument_g10/tissue_g10 eval entries below, via
+  # val_paired_both101.txt -- excluding them here is a plain same-source
+  # train/eval split, nothing more).
+  #
+  # CORRECTION (260724): an earlier version of this exclusion additionally
+  # dropped 101 more g10 stems that happened to share a case-ID string with
+  # grasp0's eval set (388 -> 287), on the assumption that grasp0/grasp10
+  # case IDs referred to the same underlying surgeries at different
+  # temporal offsets. Confirmed directly by the user that this assumption
+  # is WRONG -- grasp0 and grasp10 are two separate, non-overlapping
+  # datasets that merely share a case-ID naming convention; a matching ID
+  # string between the two pools does not imply the same patient/surgery.
+  # That cross-dataset exclusion was therefore unnecessary and has been
+  # removed -- grasp10's training set is back up to the full 500 (601-101),
+  # not 287.
+  #
+  # No multigap/gap_options mechanism here -- grasp0_5_10_merged_bwdif's
+  # pair-dirs (_g0/_g10, both single-pair, same convention as this
+  # session's Structure A) each carry exactly one flow via "_NewCT",
+  # identical to how v116/v125/v131 use CMC_grasp0_multigap_paired.
+
+test_dataset_kwargs:
+  # frame_num=2 required: RCFJointMaskSoftTissueModel._decode_head_forward
+  # asserts im_num==2 whenever decode_head2.use_flow_feat is set (see
+  # models/rcf_joint_mask_model.py) -- this is the final post-training test
+  # pass (main.py's trainer.test(), runs once after trainer.fit() completes),
+  # not per-epoch validation (that's val_dataset_list below).
+  frame_num: 2
+  load_flow: false
+  split: ImageSets/val_paired.txt
+  zero_ann: false
+
+val_dataset_list:
+  # frame_num: 2 (main_tissue.py's _make_val_loader/val_dataloader, extended
+  # this session, default 1 elsewhere) + val_paired.txt (tools/
+  # build_paired_eval_split.py) -- both required for the same reason as
+  # test_dataset_kwargs above.
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_instrument
+    split: ImageSets/val_paired.txt
+    name: instrument
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged_bwdif/eval_tissue
+    split: ImageSets/val_paired.txt
+    name: tissue
+    frame_num: 2
+  # grasp10 monitoring entries (discussed 260721): 101 grasp10 cases with
+  # BOTH instrument+tissue COCO annotations (of 108 originally exported,
+  # 101 actually annotated -- verified via annotations/instances_default.json,
+  # the OTHER json batch annotations_108/ is instrument-only, 101 cases,
+  # deliberately NOT used here). Reported as SEPARATE named metrics
+  # (val_miou_instrument_g10/val_miou_tissue_g10), same pattern as the
+  # instrument/tissue split above -- NOT physically merged into one pooled
+  # number, since 99/101 of these share a case ID with the grasp0 eval
+  # above (same surgeries, different temporal offset -- confirmed
+  # genuinely different frames, not duplicate images, byte-verified via
+  # md5sum against CMC_grasp0_5_10_merged_bwdif's copy) and merging would
+  # double-count those patients into a single figure.
+  # frame1 (neighbour) symlinked in from CMC_grasp0_5_10_merged_bwdif's
+  # _g10_1.png (verified byte-identical annotated frame0 via md5sum against
+  # CMC_grasp10_bwdif's own copy) -- CMC_grasp10_bwdif/eval_instrument,
+  # eval_tissue only ever shipped the single annotated frame, no neighbour.
+  # Zero overlap with v133's training data (both g0's 378 and g10's 287
+  # training stems checked against these 101 -- clean).
+  # NOTE: val_miou_sum (checkpoint-selection metric) becomes a 4-way sum
+  # with this addition, not directly comparable to v121-v132's 2-way sum.
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_instrument
+    split: ImageSets/val_paired_both101.txt
+    name: instrument_g10
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_tissue
+    split: ImageSets/val_paired_both101.txt
+    name: tissue_g10
+    frame_num: 2
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head ──────────────────────────────────────────────────────────────
+  decode_head2:
+    type: MultiScaleSegHeadJoint4   # ← v123: 4-scale joint fusion (models/multi_scale_seg_head_joint4.py)
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+    use_flow_feat: true     # feat0-level joint feature (same slot as v121/v122)
+    flow_in_channels: 64
+    feat1_joint_in_channels: 64  # ← new in v123: feat1/feat2/feat3-level joint features too
+    feat2_joint_in_channels: 64
+    feat3_joint_in_channels: 64
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

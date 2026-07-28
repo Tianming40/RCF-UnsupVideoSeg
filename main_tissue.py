@@ -26,19 +26,35 @@ from torch.utils.data import DataLoader, SequentialSampler
 import dataset as _ds_mod
 from metrics import empty_prf_bucket, mean_prf as _mean_prf
 
-# ── 1. Register V2 flow head ──────────────────────────────────────────────────
+# ── 1. Register V2 flow head + MultiScaleSegHeadJoint4 ─────────────────────────
 import models.rcf_model as _rcf_mod
 from models.flow_aggregation_head_with_residual_v2 import FlowAggregationHeadWithResidualV2
+from models.multi_scale_seg_head_joint4 import MultiScaleSegHeadJoint4
 _rcf_mod.FlowAggregationHeadWithResidualV2 = FlowAggregationHeadWithResidualV2
+_rcf_mod.MultiScaleSegHeadJoint4 = MultiScaleSegHeadJoint4  # decode_head2.type: MultiScaleSegHeadJoint4 (v123+)
 
 # ── 2. Register RCFDinoModel + RCFSoftTissueModel ─────────────────────────────
 import models as _models_pkg
 from models.rcf_dino_model import RCFDinoModel
 from models.rcf_soft_tissue_model import RCFSoftTissueModel
+from models.rcf_joint_mask_model import RCFJointMaskSoftTissueModel
+from models.rcf_joint_mask_v2_model import RCFJointMaskV2SoftTissueModel
+from models.rcf_joint_mask_v3_model import RCFJointMaskV3SoftTissueModel
+from models.rcf_joint_mask_v4_model import RCFJointMaskV4SoftTissueModel
+from models.rcf_joint_mask_v5_model import RCFJointMaskV5SoftTissueModel
+from models.rcf_joint_mask_v6_model import RCFJointMaskV6SoftTissueModel
+from models.rcf_triplet_model import RCFTripletModel
 
-_models_pkg.RCFDinoModel       = RCFDinoModel        # type: ignore[attr-defined]
-_models_pkg.RCFSoftTissueModel = RCFSoftTissueModel  # type: ignore[attr-defined]
-_models_pkg.RCFTissueModel     = RCFSoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFDinoModel              = RCFDinoModel               # type: ignore[attr-defined]
+_models_pkg.RCFSoftTissueModel        = RCFSoftTissueModel         # type: ignore[attr-defined]
+_models_pkg.RCFTissueModel            = RCFSoftTissueModel         # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskV2SoftTissueModel = RCFJointMaskV2SoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskV3SoftTissueModel = RCFJointMaskV3SoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskV4SoftTissueModel = RCFJointMaskV4SoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskV5SoftTissueModel = RCFJointMaskV5SoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskV6SoftTissueModel = RCFJointMaskV6SoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFJointMaskSoftTissueModel = RCFJointMaskSoftTissueModel  # type: ignore[attr-defined]
+_models_pkg.RCFTripletModel            = RCFTripletModel           # type: ignore[attr-defined]
 
 # ── 3. Subclass Model to track epoch-level train loss ─────────────────────────
 import main as _main_module
@@ -88,24 +104,79 @@ class TissueModel(_BaseModel):
         return loss
 
     # ── 双 val：instrument + tissue，各自 oracle，mIoU 相加 ────────────────────
-    def _make_val_loader(self, data_path, split):
+    def _make_val_loader(self, data_path, split, frame_num=1, gap_options=None):
+        # gap_options (e.g. [1]) forces a deterministic gap for frame_num>1 eval
+        # splits -- needed once frame_num>=2: VideoDataset.__getitem__ draws a
+        # random gap UNCONDITIONALLY (training or not); without pinning it,
+        # eval would sometimes select frames at the wrong spacing (e.g. 0,2,4
+        # instead of 0,1,2), inconsistent with what training actually used.
+        extra = {}
+        if gap_options is not None:
+            extra['gap_options'] = gap_options
+            extra['gap_probabilities'] = [1.0 / len(gap_options)] * len(gap_options)
+            extra['gap_flow_suffixes'] = ['_NewCT'] * len(gap_options)  # unused (load_flow=False), only needed to satisfy VideoDataset's length assertion
+
         ds = self.dataset_cls(
             data_path, training=False,
             transform=_ds_mod.get_transform(self.args, training=False),
             subsample_frame_interval=None,
-            frame_num=1, load_flow=False, split=split, zero_ann=False,
-            **self.args.dataset_kwargs,
+            frame_num=frame_num, load_flow=False, split=split, zero_ann=False,
+            **extra, **self.args.dataset_kwargs,
         )
+
+        if frame_num > 1:
+            # VideoDataset's __len__ visits sum(seq_lens) raw indices per split
+            # (e.g. 3 per case for a 3-frame split line), but only the FIRST raw
+            # index of each case is guaranteed to resolve to frame_ind=0 (the
+            # boundary-shift formula `frame_ind -= (frame_num-1)` only
+            # self-corrects exactly for frame_num==2; for frame_num==3 with a
+            # tight 3-frame split line it produces frame_ind=-1 for the middle
+            # raw index -- verified this session, silently reads the wrong
+            # annotation file). Restrict to each case's first raw index
+            # (seq_len_cumsum's own start offsets) -- always safe regardless of
+            # frame_num, and as a side effect also removes the harmless-but-
+            # wasteful ~2x duplicate-visit overhead frame_num=2 splits had.
+            import torch as _torch
+            first_indices = ds.seq_len_cumsum[:-1].tolist()
+            ds = _torch.utils.data.Subset(ds, first_indices)
+
         return DataLoader(ds, batch_size=1, num_workers=self.args.workers,
                           pin_memory=True, sampler=SequentialSampler(ds), shuffle=False)
 
+    def test_dataloader(self):
+        # Same frame_num>1 fix as _make_val_loader above, applied to the
+        # POST-TRAINING final test pass (main.py's own test_dataloader,
+        # used by trainer.test()/_two_pass_test()) -- this path is separate
+        # from val_dataset_list/_make_val_loader and would otherwise hit the
+        # exact same frame_ind=-1 bug for frame_num>=3 test_dataset_kwargs
+        # (e.g. v127's val_triplet.txt).
+        test_kw = dict(self.args.test_dataset_kwargs)
+        frame_num = test_kw.get('frame_num', 1)
+        test_data_path = self.args.test_data_path if getattr(self.args, 'test_data_path', None) else self.args.data_path
+        ds = self.dataset_cls(
+            test_data_path, training=False,
+            transform=_ds_mod.get_transform(self.args, training=False),
+            **self.args.dataset_kwargs, **test_kw,
+        )
+        if frame_num > 1:
+            import torch as _torch
+            first_indices = ds.seq_len_cumsum[:-1].tolist()
+            ds = _torch.utils.data.Subset(ds, first_indices)
+        val_batch_size = getattr(self.hparams, 'val_batch_size', self.hparams.batch_size)
+        return DataLoader(ds, batch_size=val_batch_size, num_workers=self.args.workers,
+                          pin_memory=True, sampler=SequentialSampler(ds), shuffle=False)
+
     def val_dataloader(self):
-        # config 里 val_dataset_list: [{data_path, split, name}, ...]；没配则退回单 val
+        # config 里 val_dataset_list: [{data_path, split, name, frame_num?}, ...]；没配则退回单 val
+        # frame_num 默认 1（向后兼容，所有既有 config 行为不变）；RCFJointMaskSoftTissueModel
+        # 等需要 eval 时也拿到配对帧的模型，可以在对应 entry 里显式加 frame_num: 2
+        # （配合 dataset/data.py 里放宽过的 eval frame_num>1 支持，以及一个 2 帧/行的 split 文件）。
         vlist = getattr(self.args, 'val_dataset_list', None)
         if not vlist:
             return super().val_dataloader()
         self._val_names = [v.get('name', f'val{i}') for i, v in enumerate(vlist)]
-        return [self._make_val_loader(v['data_path'], v['split']) for v in vlist]
+        return [self._make_val_loader(v['data_path'], v['split'], v.get('frame_num', 1), v.get('gap_options'))
+               for v in vlist]
 
     def _fresh_val_bucket(self):
         n = self.args.model_kwargs["mask_layer"]
@@ -131,7 +202,7 @@ class TissueModel(_BaseModel):
         # tissue val：贪心 union 排除 instrument channel(s)，避免器械并进 tissue；
         # instrument val：不排除（instrument 本就在 ch1）
         nm = self._val_names[dataloader_idx] if dataloader_idx < len(self._val_names) else None
-        if nm == 'tissue':
+        if nm is not None and 'tissue' in nm:
             self.args.oracle_exclude_channels = list(self.args.model_kwargs.get('instrument_channels', [1]))
         else:
             self.args.oracle_exclude_channels = []

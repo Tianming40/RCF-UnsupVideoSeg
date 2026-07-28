@@ -1069,7 +1069,7 @@ results in `saved/grasp0_eval_260622_111644/`.
 
 **Config:** `configs/instrument/rcf_cmc_grasp0_tissue_ft_v43.yaml`
 **Run dir:** `saved/grasp0_tissue_ft_v43_260623_111047/`
-**Key changes vs v42:** `distill_mode: one_sided → symmetric` (BCE 自适应弹簧), `w_distill: 1.0 → 2.0`
+**Key changes vs v42:** `distill_mode: one_sided → symmetric` (BCE now acts like an adaptive spring, pulling in both directions instead of one), `w_distill: 1.0 → 2.0`
 
 Instrument channel (ch1) stabilized at **0.63–0.65** instead of dropping to 0.57 (v42), enabling `val_miou_sum` monitoring to correctly track joint improvement.
 
@@ -1650,3 +1650,203 @@ Large, consistent drop across all three offsets — but not to zero. Spot-checke
 New method closes **~63% of the gap** to this dataset's own native (never-interlaced) signal level, vs. the old duplication method. Correction en route to this result: the earlier "natural photos ~1.15–1.2" reference (used above and in the original Dataset Diagnosis section) turned out not to apply here — CMC's own genuinely-progressive frames only score 0.585 on this metric, nowhere near 1.15–1.2, because endoscopic footage (macro lens, wet/specular tissue, video compression) has fundamentally different texture statistics than whatever "natural photos" the original reference was calibrated on. Comparing against the dataset's own native frames (same domain, same optics) is the fair baseline; the "natural photos" number should not be treated as a target for CMC.
 
 Net: deinterlacing quality is real, substantial, and visually confirmed — but bounded by physics, not just algorithm quality. Weave (bwdif's static-region path) recovers true full-resolution information where fields agree; in genuine motion regions half the vertical information for that specific field pair was never captured and cannot be invented by any deinterlacer, however good. The new pipeline gets close to the achievable ceiling; it does not and cannot fully erase the interlace format's inherent information loss in moving regions.
+
+## CMC Bridge Data & Eval-Set-Mismatch Bug (260714–260716)
+
+### Background: approximating a multi-gap flow signal from CMC's 3-offset structure
+
+CMC has no continuous video — each of the 601 cases is sampled at 3 discrete temporal offsets relative to a grasping event (grasp-10/grasp-5/grasp-0 = 10/5/0 frames before grasp), each a separate 2-frame (pre/post, ~1-frame) snippet. To approximate the data_medical-style multi-gap sampling mechanism (`flow_suffix`/`flow_suffix2`/`flow_suffix3`, dormant for CMC since all three always pointed at the same folder), two **cross-offset "bridge" pairs** were constructed per case by reusing existing frames: `_b105` (g10's POST frame → g5's PRE frame, ~5-frame real gap) and `_b50` (g5's POST frame → g0's PRE frame, ~5-frame real gap) — chosen as the "post→pre" pairing after empirically testing 4 candidate pairings via RAFT warp-reconstruction quality (post→pre won, 18.6% mean improvement).
+
+New training splits: `train_g0379_g5601_g10601_b105_b50_clean.txt` (1557 gap1 + 899 quality-filtered bridge pairs) and an x2-gap1-duplicated variant, both on the `CMC_grasp0_5_10_merged_bwdif` dataset.
+
+### v105–v110: mechanism development on top of the bridge data
+
+| Version | Key change | Base |
+|---------|-----------|:----:|
+| v105 | Raw bridge mix (no fixes) | bwdif |
+| v106 | + per-source `clamp_flow_t_overrides` ({"_b105":25,"_b50":25} vs global 10 — bridge flow magnitude 19-22px was being 40%+ hard-clamped at the original threshold tuned for ~5-7px gap1 flow) | bwdif |
+| v107 | + x2 gap1 duplication in the split (rebalance ratio toward ~78% gap1) | bwdif |
+| v108 | bwdif dataset alone, **no bridge pairs** — isolates re-deinterlacing from bridge data | bwdif |
+| v109 | + `use_cycle_conf` per-source gating (bridge σ=5/4, gap1 σ=50≈off) + `topk_scale_normalize` | bwdif |
+| v110 | + `detach_mask_patterns` (bridge samples' mask branch gets zero gradient, only residual branch trains) + `topk_scale_normalize` | bwdif |
+
+Two new mechanisms in `flow_aggregation_head_with_residual_v2.py`, both opt-in / default-off (verified bit-identical to prior behaviour when unset):
+- **`detach_mask_patterns`**: per-sample `torch.where`-based mask detach for samples matching a seq_name substring. Motivated by a structural finding: mask prediction is per-IMAGE, but each bridge frame is ALSO an endpoint of an adjacent gap1 pair (e.g. g5's pre-frame is also b105's post-frame) — 4 of 6 frames per case have this double identity — so the SAME image's mask gets pulled toward two motion-scale-mismatched flow targets in different training samples. Verified the bridge flow itself is reliable first (composed-vs-direct RAFT consistency: compose fw_g10+fw_b105 via warp, compare against fresh independent RAFT inference on the skipped-frame pair — cos_sim median 0.92-0.97 across AC/CE/BE/AF skip-distances, n=438-601) — the conflict is architectural, not a data-quality problem, so detach routes the signal through the (pair-conditioned, conflict-free) residual branch instead of discarding it.
+- **`topk_scale_normalize`**: ranks samples for the hard topk=4 selection by GT-flow-scale-normalised loss instead of raw squared error. Measured (real v106 dataloader + checkpoint, `topk_bridge_survival.py`): raw-loss topk gave bridge samples only ~15% survival vs ~72% for gap1 in the same batches (ResolutionGroupedBatchSampler mixes them freely) — bridge's inherently larger GT flow magnitude inflates raw MSE regardless of fit quality. Scale-normalized ranking brought bridge survival to ~40%, matching its ~37% split share. Loss actually backpropagated for selected samples is unchanged — only the sorting criterion is normalized.
+
+### The eval-set-mismatch bug (found and fixed 260716)
+
+**v105–v110 were initially evaluated against `CMC_grasp0_deinterlaced/eval_instrument,eval_tissue` — the OLD (non-bwdif) eval images — while trained on bwdif data.** This is the exact same class of bug the deinterlacing section above exists to fix, reintroduced one level up: a train/eval domain mismatch (bwdif's sharper/different pixel statistics vs the old eval set's blurrier ones) that fully explained why bwdif appeared to hurt badly (v108 first measured at inst=0.51-0.53, sum~127) — nothing to do with bridge data or re-deinterlacing quality.
+
+Fixed by building matching bwdif-processed eval sets (`CMC_grasp0_5_10_merged_bwdif/eval_instrument,eval_tissue`, 601 cases each, images extracted from the already-bwdif-processed `JPEGImages/<stem>_g0/`, Annotations/ImageSets copied verbatim — labels don't change with deinterlace method) and updating v105–v110's `val_dataset_list`/`test_data_path` accordingly, then **killing and fully re-submitting v105–v110** (checkpoint selection during training also depends on correct eval, not just the final reported number, so re-evaluating old checkpoints wasn't sufficient).
+
+**Post-fix, the picture changed substantially**: v108 (bwdif alone) climbed to inst≈0.60 by epoch~40, tracking close to v102's ≈0.61 — the "bwdif hurts" conclusion from the mismatched-eval run was an artifact, not a real finding.
+
+### `eval_pos_th` and sliding-window mechanism sweep (v102 champion checkpoint, epoch=27)
+
+Offline sweep (`script/run_grasp0_eval_v102_swmech.sh`) testing three sliding-window eval mechanisms against v102's official 139.77 baseline (`th=0.35`, uniform window blending, probability-space averaging). Two separate comparisons: a pure threshold sweep (mechanism unchanged) and a mechanism-variant comparison (threshold held fixed at 0.35), each isolating one variable.
+
+**Pure `eval_pos_th` sweep** (taper off, logit-avg off throughout):
+
+| th | Inst mIoU | Inst P | Inst R | Tissue mIoU | Tissue P | Tissue R | Sum |
+|:--:|:---------:|:------:|:------:|:-----------:|:--------:|:--------:|:---:|
+| 0.25 | 65.34 | 75.38 | 83.05 | **74.72** | 83.81 | 87.62 | 140.06 |
+| <span style="color:red">**0.30**</span> | <span style="color:red">65.62</span> | <span style="color:red">76.83</span> | <span style="color:red">81.74</span> | <span style="color:red">74.50</span> | <span style="color:red">84.20</span> | <span style="color:red">86.96</span> | <span style="color:red">**140.12**</span> |
+| 0.35 (baseline) | **65.69** | 78.12 | 80.40 | 74.07 | 84.06 | 86.41 | 139.76 |
+| 0.40 | 65.59 | 79.30 | 79.00 | 73.62 | 84.42 | 85.50 | 139.21 |
+| 0.45 | 65.35 | 80.39 | 77.54 | 72.87 | 84.80 | 84.10 | 138.22 |
+
+Classic precision/recall tradeoff as the threshold rises — precision climbs monotonically (both channels) while recall falls monotonically (both channels), exactly as expected for a probability cutoff. The two channels respond at different rates: **instrument mIoU is nearly flat across the whole 0.25–0.40 range** (65.3–65.7, peaking right at the old default 0.35) while **tissue mIoU falls off steadily and monotonically as threshold rises** (74.72 → 72.87 from 0.25 to 0.45, a much steeper, more threshold-sensitive slope). The sum's optimum at 0.30 is therefore driven almost entirely by tissue's sensitivity, not instrument's — instrument would have been equally happy anywhere in 0.25–0.40, tissue specifically wants a lower bar. (139.76 here vs the previously-reported 139.77 is rounding noise from re-running the same config twice, not a discrepancy.)
+
+**Mechanism variants** (th=0.35 fixed throughout, isolating taper/logit-avg from the threshold question):
+
+| Mechanism | Inst mIoU | Inst P | Inst R | Tissue mIoU | Tissue P | Tissue R | Sum |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| baseline (uniform blend, prob-space avg) | 65.69 | 78.12 | 80.40 | **74.07** | 84.06 | 86.41 | **139.76** |
+| + logit-space averaging | **65.85** | 78.18 | 80.55 | 73.76 | 84.58 | 85.60 | 139.61 |
+| + Hann-taper + logit-space averaging | 65.85 | 77.99 | 80.82 | 73.53 | 84.09 | 85.96 | 139.38 |
+| + Hann-taper window blend alone | 65.62 | 77.84 | 80.66 | 73.41 | 83.60 | 86.08 | 139.03 |
+
+Logit-space averaging is not simply "worse" — it actually *helps* instrument mIoU slightly (65.69→65.85, the best instrument score in this whole sweep, both with and without taper), but costs tissue mIoU more than it gains on instrument (74.07→73.76), a net loss on sum. Plausible read: instrument occupies a much smaller frame fraction (~1%) with sharper true boundaries, where preserving each confident window's full signal (logit-space) helps more than it hurts; tissue is large/diffuse, where the "conservative near disagreement" behaviour of probability-space averaging apparently suits it better. Hann-taper is a net negative on both channels individually, not just on sum — no evidence it helps anything in this sweep, on top of also being the most complex/costly of the three changes. Neither mechanism is adopted; only `eval_pos_th=0.30` is.
+
+`eval_pos_th=0.30` is a small, free (no retraining) improvement, adopted going forward. The two more elaborate mechanisms — **Hann-taper window blending** (weight each sliding-window tile's contribution by distance from window centre instead of uniform) and **logit-space averaging** (accumulate pre-softmax logits across overlapping windows, softmax once at the end, instead of averaging post-softmax probabilities) — both new opt-in flags (`sw_taper`, `sw_logit_avg`) added to `main.py`'s `_sliding_window_eval`, default off / bit-identical when unset — underperformed the simple threshold change. Not adopted.
+
+### v104–v113 batch re-eval, correct per-version datasets, `eval_pos_th=0.30` (260716, job438, 40 checkpoints)
+
+Re-ran the full v104–v113 batch (`script/run_grasp0_eval_v104_v113.sh`) with two fixes over the original `run_grasp0_eval_v97_v104.sh` pattern: **`eval_pos_th=0.30`** (see above) and **per-version eval dataset resolved from each config's own `val_dataset_list`** (not one hardcoded root — v104/v111/v112/v113 use `CMC_grasp0_deinterlaced`, v105–v110 use the bwdif eval sets) to avoid reintroducing the mismatch bug for half the batch.
+
+Best checkpoint per version:
+
+| Version | Key change | Base | mode | Inst mIoU | Tissue mIoU | Sum |
+|---------|-----------|:----:|:----:|:---------:|:-----------:|:---:|
+| <span style="color:red">**v108**</span> | <span style="color:red">bwdif dataset alone, no bridge</span> | bwdif | 1ch | 63.19 | 74.08 | <span style="color:red">**137.27**</span> |
+| v104 | (Phase 11 baseline, re-measured) | v83 | 1ch | 62.80 | 74.02 | 136.82 |
+| v106 | bwdif + bridge + clamp override | bwdif | 1ch | 62.54 | 74.00 | 136.54 |
+| v105 | bwdif + bridge, raw mix | bwdif | 1ch | 59.94 | 75.14 | 135.08 |
+| v107 | bwdif + bridge + x2 gap1 ratio | bwdif | 1ch | 60.63 | 73.45 | 134.08 |
+| v109 | bwdif + bridge + cycle-conf + topk_scale_normalize | bwdif | 1ch | 58.79 | 74.55 | 133.34 |
+| v113 | v102 + affine_order=2 (quadratic per-channel motion model) | v83 | 1ch | 57.22 | 76.05 | 133.27 |
+| v111 | v102 + topk_scale_normalize alone (no bridge, no bwdif) | v83 | 1ch | 57.56 | 73.16 | 130.72 |
+| v112 | v102 + use_per_channel_residual_scale (re-test on v102 base) | v83 | 2ch | 54.28 | 71.35 | 125.63 |
+| v110 | bwdif + bridge + detach_mask_patterns + topk_scale_normalize | bwdif | 2ch | 54.00 | 67.70 | 121.70 |
+
+> **v108 (137.27) is the best in this batch, but is a real ~2-2.5 point DECLINE vs both historical champions** (v83 139.36, v102 139.77/140.12) — not competitive, not a match. The earlier "tracking close to v102, inst≈0.60 by epoch~40" read was a mid-training online-curve observation, not the converged/best-checkpoint result; this batch's best-of-80-epochs number is the one that actually counts, and it's clearly below both historical baselines. So the corrected finding from the eval-mismatch fix is narrower than first stated: bwdif alone no longer looks *catastrophically* harmful (the mismatched-eval run showed inst=0.51-0.53, sum~127 — genuinely worse than this), but it has NOT been shown to match or beat the old dataset — it's still a net negative, just a smaller one than the buggy comparison suggested. v108 is also not a fully isolated comparison against v102 specifically (v108 sits on v83's recipe, not v102's GT-flow-downsample-area change), so the true bwdif-vs-old gap on a matched recipe is still unmeasured.
+> **v111 (topk_scale_normalize alone, isolated on v102/old-dataset with no bridge at all) drops sharply below v102's 139.77 to 130.72.** This is a genuinely surprising negative result for a mechanism that measured cleanly positive in its motivating diagnostic (fixed a real ~15%-vs-72% survival-rate imbalance). Not yet reconciled — candidate explanations (untested): the 4-checkpoint sample for this batch may not cover this version's actual peak epoch; or normalized-ranking topk selection interacts with something in the pure-gap1 loss-value distribution differently than in the bridge-mixed setting it was designed for.
+> **v112 (per-channel residual scale, re-tested on v102) confirms v87's earlier negative result on v83** — now shown on the current champion base too (125.63, reverted to 2ch split mode). Two independent tests, two bases, same negative outcome: this mechanism does not compose with the v83/v102 recipe.
+> **v113 (quadratic affine motion model) does not beat v102** (133.27) despite a sound mechanistic motivation (v103's residual-off ablation proved the linear affine+residual model's expressiveness is load-bearing for mask quality, not just flow-reconstruction fidelity) and clean unit-test verification (default `affine_order=1` bit-identical to prior behaviour; `affine_order=2` runs correctly, produces a genuinely different fit). Underperforms v102 by 6.5 points.
+> **v109/v110 (the two bridge mechanisms this session was built around) both underperform v106**, which only has the clamp fix — v109 (cycle-conf + topk_scale_normalize) at 133.34, v110 (detach + topk_scale_normalize) at 121.70, the worst full result in the batch and reverted to 2ch split. This is the opposite of what both mechanisms' motivating diagnostics predicted. **Not yet explained** — prime suspect is the same one flagged for v111: only 4 checkpoints per version in this batch, likely missing each version's true peak epoch, especially for v109/v110 which layer additional mechanisms on top of v106's already-narrow apparent peak (epoch 13). A denser checkpoint sweep (or re-running with `save_top_k` tuned higher) is needed before drawing a firm conclusion on cycle-conf/detach/topk_scale_normalize's real effect — the current numbers should be treated as provisional, not a clean refutation.
+>
+> **Net read on the bridge-data direction**: still inconclusive, and no unambiguous positive result has come out of this arc yet. Data quality is no longer in question (proven reliable via composed-vs-direct consistency). The training-time mechanisms built to fix the identified structural conflicts (mask-gradient sharing, topk scale bias) have not yet demonstrated a net win in this batch, but the checkpoint-sparsity caveat above means this isn't a confident close-out either. v108 (bwdif alone, no bridge, no new mechanisms) is the least-bad result in the batch, but is itself a real ~2-2.5 point decline vs the historical v83/v102 champions, not a win — the honest summary at this point is that re-deinterlacing to bwdif has not yet been shown to help *or* to be neutral; every version built on it so far still trails the old dataset's best recorded results.
+
+### grasp10 real-annotation eval set (260716) — first real ground truth beyond grasp0
+
+Built `CMC_grasp10_deinterlaced/eval_instrument,eval_tissue` from two COCO annotation batches (`tools/render_coco_masks_grasp10.py`, adapted from the grasp0 script — note grasp10's category IDs are swapped: cat 1=instrument, cat 2=Soft Tissue, opposite of grasp0's file):
+- `annotations/instances_default.json`: 103 images, both instrument (259 polys) and tissue (103 polys) labelled.
+- `annotations_108/instances_default.json`: 103 *different* images (zero stem overlap, verified), instrument only (245 polys, 0 tissue) — tissue labelling pending, explicit instruction to treat as all-black placeholder for now rather than exclude, to be re-rendered once real labels land (no config change needed then, same file count/paths).
+
+206 total cases (union), giving this project real ground truth on a second temporal offset for the first time. A matching bwdif-processed version (`CMC_grasp10_bwdif/eval_instrument,eval_tissue`) was also built — not via a fresh deinterlace run, but by extracting the already-bwdif-processed pre-frame for each of the 206 stems directly from `CMC_grasp0_5_10_merged_bwdif/JPEGImages/<stem>_g10/` (verified all 206 present — bwdif processing covers the full merged g0+g5+g10 dataset, not just g0).
+
+**Holdout split built for retraining without eval leakage**: verified v83/v102's existing g0 training split (378 cases) has **zero overlap** with the 222 annotated g0 eval cases (no fix needed there) — but 199 of the 587 g10 training pairs in the "clean" split ARE now grasp10-eval cases. New splits `train_g0378_g5592_g10388_clean_holdout.txt` (both the old and bwdif dataset roots) exclude exactly those 199 (g10: 587→388, g0/g5 unchanged at 378/592). `v114`/`v115` (old-dataset/bwdif-dataset, otherwise identical) use this holdout split for training and a combined 4-source `val_dataset_list` (grasp0 + grasp10, instrument + tissue, ~419/~415 total eval frames) — pending first run at time of writing. A `main_tissue.py` fix was needed to support this: the tissue-oracle-exclude branch checked `nm == 'tissue'` (exact match), which would have silently skipped the exclude-instrument-channel logic for the new `'tissue_g10'` name — changed to substring match (`'tissue' in nm`), verified backward compatible with every existing config's bare `'tissue'` name.
+
+### grasp0 multi-gap real consecutive frames (260716) — a cleaner alternative to bridge pairs
+
+New raw data (`CMC/grasp-0/post_2` through `post_7`, ~770-780MB each, downloaded mid-session): per the advisor, these are **real consecutive frames** at increasing distance from `pre` (post_2 = pre+2 frames, ..., post_7 = pre+7 frames) — genuine video continuity CMC was earlier established not to have, at least for grasp0. This directly supersedes the bridge-pair approximation for grasp0: exact known gap sizes (not the bridge's ~5-frame estimate), no cross-offset stitching, and critically no shared-frame mask-gradient conflict (every post_N file is a distinct image, never double-duty the way bridge frames were).
+
+596 of 601 cases have a complete pre..post_7 (8-frame) set (some cases' later frames "didn't exist" per the advisor's note — matches the observed per-folder counts 601/601/601/600/599/597/596 for post_1..post_7). Deinterlaced (`tools/deinterlace_cmc_grasp0_multigap.py`) using the SAME real-multi-frame-context bwdif approach as before, but genuinely improved: the full 8-frame sequence is real consecutive video, so bwdif gets true bidirectional temporal neighbours per frame (not the 2-frame concat-hack the original pre/post-only script needed). Two implementation bugs found and fixed en route: (1) `-vf` cannot carry `[0:v][1:v]...` multi-input labeled-graph syntax — silently produces a garbage single-line idet result; must use `-filter_complex` (caused a full mis-run misclassifying ~93% of cases as interlaced, including a re-litigated false claim that a specific 1080p case was interlaced — it wasn't, re-verified progressive after the fix); (2) `-vsync 0` is required on the actual bwdif+extract pass (without it, ffmpeg silently drops frames when concatenating multiple single-image `-i` inputs) but must NOT be used on the idet detection pass (empirically found to also corrupt idet's multi-frame counting — root-caused to the `-vf` bug above, not vsync itself, once isolated). Final run: 596/596 processed, 0 errors, 439 TFF + 157 Progressive (73.7%/26.3% — matches the dataset-wide 73%/26.5% split from the original interlace scan almost exactly, a strong cross-validation signal that detection is now correct). Output: new dataset root `CMC_grasp0_continuous_bwdif/`.
+
+RAFT flow generation (`RAFT/generate_flows_cmc_grasp0_multigap.py`) computes **all C(8,2)=28 pairwise combinations per case** (not just the 7 pre-anchored gaps) — fw+bw+confidence each, 56 flow fields/case, named `<stem>_f{i}t{j}_gap{j-i}.npy` (i,j = frame indices 0..7, gap = j-i). Chosen over the cheaper pre-anchored-only option (7 pairs, no gap-value redundancy) to also get multiple samples per gap value at different absolute time points, at ~4x the RAFT compute cost (~2 hours measured for 1 case × 12.29s, extrapolated). Smoke-tested (1 case, 56/56 files correct) before handing off as an sbatch script (`script/run_generate_flows_cmc_grasp0_multigap.sh`) for the user to submit once needed — not yet run at scale. **User independently submitted and completed this run**: 596/596 cases, all 4 flow dirs (`Flows`/`BackwardFlows`/`FlowConf`/`BackwardFlowConf`) present, 28 npy files each, verified by direct file count.
+
+### Using the multi-gap data: two dataset structures, four experiments (260717)
+
+Two physically different ways to feed the 28-pairs-per-case multigap data into `VideoDataset` were built and compared, plus a data-quality analysis to inform which gaps are actually worth using.
+
+**Structure A — exhaustive pair explosion (`CMC_grasp0_multigap_paired`, `tools/build_paired_multigap_dataset.py`).** All 596 cases × 28 pairs get their own `<stem>_f{i}t{j}_gap{gap}/` directory (frames symlinked from `CMC_grasp0_continuous_bwdif`, flow symlinked from `CMC_grasp0_multigap_flows`, matching `VideoDataset`'s per-pair-dir convention exactly — verified against `dataset/data.py`'s split-line/flow-path-resolution logic directly, not assumed). 16688 pair dirs built (0 missing). Training split (`ImageSets/train_multigap_all28.txt`) includes only the 376 currently-unannotated cases → 10528 lines. Every gap combination is a fixed, always-included training sample — gap distribution is whatever the raw C(8,2) combinatorics produce (gap1 has 7 combos/case, gap7 has 1), not a deliberately chosen ratio.
+
+**Structure B — native random-gap sampling (`CMC_grasp0_multigap_seq`, `tools/build_multigap_seq_dataset.py`).** Discovered mid-session that `VideoDataset.__getitem__` (`dataset/data.py`) already has a random-gap mechanism (`options=[1,2,3]` @ `probabilities=[0.7,0.2,0.1]`, reading from 3 separate `flow_suffix`/`_2`/`_3` directories) — the same one `data_medical` (EndoVis-style, real 225-frame continuous sequences, `Flows_NewCT`/`_NewCT2`/`_NewCT3`, target-frame-named flow files) has used in production all along. It was **silently dead on every CMC config to date** (v41 through v119's predecessors) because CMC's 2-frame pair-dirs made all 3 suffixes point at the same folder and any gap>1 draw instantly overflowed and fell back to gap=1 — verified by reading the fallback logic directly (`frame_to_get >= len(current_seq) → flag_gap = 1`). `CMC_grasp0_multigap_seq` restructures data to match: one split line per case (`JPEGImages/<stem>/` with all 8 frames listed, symlinked wholesale from `CMC_grasp0_continuous_bwdif`), plus `Flows_gap1..7`/`BackwardFlows_gap1..7` directories (target-frame-named, matching `data_medical`'s convention, symlinked from `CMC_grasp0_multigap_flows`) — built once, shared by all random-gap variants below (596×7 flow-symlink counts all matched exact expectations, 0 missing).
+
+`dataset/data.py`'s hardcoded 3-gap mechanism was generalized (not replaced) to support arbitrary gap counts: new `gap_options`/`gap_probabilities`/`gap_flow_suffixes` constructor params (all `None` by default → reproduces the old hardcoded `[1,2,3]`/`[0.7,0.2,0.1]`/`[flow_suffix,flow_suffix2,flow_suffix3]` behavior bit-for-bit, verified via a 400-sample seeded draw giving the identical `{1:320, 2:53, 3:27}` distribution before and after the refactor). The old 3-branch `elif` chain collapsed into one generic block keyed by `gap_options.index(flag_gap)`. Zero behavior change for every existing caller (`data_medical` configs, all pre-v116 CMC configs).
+
+End-to-end correctness of Structure B was verified two ways, not just assumed from the build script: (1) 300 real `__getitem__` draws (covering all 7 gaps) each cross-checked by independently reconstructing the expected source RAFT flow file path from the actually-loaded frame filenames, then comparing tensors — 0 mismatches; (2) a per-case spot check of `Flows_gap1..7` confirmed every target-frame filename resolves to the correct `_f{i}t{j}_gap{g}.npy` source with no cross-gap collisions. Also found (not yet fixed): `ret['paths']` in `__getitem__` is always `current_seq[frame_ind:frame_ind+frame_num]` (hardcoded consecutive), NOT the actual gap-adjusted frames used when `flag_gap>1` — harmless today (only consumed by `rcf_model.py`'s debug-image-save filename), but a latent trap if anything ever keys real logic off it.
+
+**Realized gap distribution ≠ nominal probability, and gets worse as sequences get shorter.** Because each case sequence is only 8 frames (vs `data_medical`'s 225), large gaps have few valid anchor positions (gap=7 only works from anchor=0; every other anchor overflows and silently falls back to gap=1). Measured via direct sampling (seeded, thousands of draws) for two probability vectors:
+
+| nominal (gap1..7) | realized gap1 | realized gap7 |
+|---|---|---|
+| `[.30,.22,.16,.12,.09,.06,.05]` (v118, monotonic decay) | 62.7% | 0.45% |
+| `[.08,.16,.28,.22,.14,.08,.04]` (v119, bell peak@gap3) | 51.95% | 0.55% |
+
+gap3 still edges out gap2/gap4 in the bell-shaped case (17.85% vs ~11% each) despite gap1's boundary advantage swamping everything in absolute terms — the intended shape survives in relative terms, just diluted. Accepted as-is (not compensated for) per explicit instruction.
+
+**Four training runs launched (260717), all starting from v102's exact recipe (`model_kwargs`/`decode_head`/etc. untouched) — only the training-data source/mechanism differs:**
+
+| ver | data | mechanism | job |
+|---|---|---|---|
+| v116 | Structure A (28-pair explosion) | none (naive baseline, explicitly requested first: "first idea — don't worry about anything, just feed it all in for training") | 442 |
+| v117 | Structure B | native gap∈{1,2,3} @ `[.7,.2,.1]`, zero code changes | 445 |
+| v118 | Structure B | generalized gap∈{1..7} @ monotonic decay | 444 |
+| v119 | Structure B | generalized gap∈{1..7} @ bell peak-at-3 | 446 |
+
+Batches/epoch differ enormously by construction, not by training-signal richness: v116 (10528-line split) gets **2632** batches/epoch; v117/v118/v119 (376-line split, one line per case regardless of how many gap combos it can yield) get **376** — almost exactly v102's own baseline (**389**), and NOT under-trained relative to it. v116 is the outlier (~7x more batches/epoch) purely because it enumerates every pair explicitly rather than sampling.
+
+Eval for all four: **must** use `CMC_grasp0_continuous_bwdif/eval_instrument`+`eval_tissue` (built this session via `tools/build_multigap_matched_eval.py` — images symlinked fresh from `CMC_grasp0_continuous_bwdif`, itself a different bwdif run than `CMC_grasp0_deinterlaced`/`CMC_grasp0_5_10_merged_bwdif`; masks reused as-is from `CMC_grasp0_deinterlaced/eval_instrument,eval_tissue`, unaffected by deinterlace method). Caught and fixed before it could repeat the earlier eval-mismatch bug: v116 was initially configured with eval images from `CMC_grasp0_5_10_merged_bwdif` (a *different* bwdif pass) — corrected before submission. 212/213 instrument, 207/209 tissue eval cases covered (the rest lack a complete 7-post-frame run, dropped, same caveat as the multigap flow set itself).
+
+**GPU scheduling note (job-submission process error, worth remembering):** `run_grasp0_tissue_ft.sh`'s `GPU` arg, when passed explicitly (e.g. `0`), sets `CUDA_VISIBLE_DEVICES` directly, **bypassing SLURM's own `--gres=gpu:1` allocation/queueing** — this node (`superMITI`) has exactly 2 physical GPUs (`gpu:2`), and forcing two jobs onto the same explicit GPU id causes a same-GPU collision (v117's first submission attempt crashed with CUDA OOM ~4 min in, fighting v116 for GPU0's memory). Leaving `GPU` unset lets SLURM assign automatically and queue (`PD`) when both cards are busy — the correct default going forward. `--time` bumped from 20h to 48h (`2-00:00:00`) in `run_grasp0_tissue_ft.sh` itself, expecting the multigap runs (more data, more epochs-worth of wall clock at this batches/epoch count) to need it.
+
+### Multi-gap flow quality: forward-backward consistency vs. the old fixed-threshold "toxic" filter (260717)
+
+Motivating question: **is naively using all 7 gaps (as v116/v118/v119 currently do, no filtering) actually sound, or is some of this data actively wrong rather than just weaker signal?**
+
+Raw magnitude stats (per-pair mean/p99 flow magnitude, all 16688 fw pairs) show the expected near-linear growth with gap, and — using the project's existing g0/g5/g10/bridge "toxic" criterion (mean magnitude >30px OR p99 >80px) verbatim — an alarming toxic-rate curve:
+
+| gap | n | mean_mag(px) | median_mag(px) | p99_mag(px, avg) | toxic% (old fixed threshold) |
+|---|---|---|---|---|---|
+| 1 | 4172 | 7.97 | 6.43 | 26.40 | 1.8% |
+| 2 | 3576 | 15.68 | 12.71 | 49.12 | 13.7% |
+| 3 | 2980 | 22.93 | 18.50 | 68.58 | 31.6% |
+| 4 | 2384 | 29.58 | 23.73 | 84.41 | 47.4% |
+| 5 | 1788 | 35.39 | 28.05 | 97.51 | 59.1% |
+| 6 | 1192 | 40.71 | 31.63 | 108.79 | 65.9% |
+| 7 | 596 | 44.86 | 35.27 | 116.98 | 69.3% |
+
+**This threshold is confounded and shouldn't be trusted at face value for multigap data.** It was calibrated on gap≈1 data (`v83`'s "24 toxic pairs, p99 up to 298px" clean-split), where large flow magnitude is a genuine anomaly signal (real gap1 motion is small, so >30px mean is suspicious). At gap7, 44.86px mean is the *expected*, legitimate motion scale, not a failure signature — a fixed absolute px cutoff can't tell "real large displacement" apart from "RAFT got it wrong," and conflates them increasingly badly as gap grows. None of v116/v118/v119's current training data has ever been filtered by this metric (unlike the original g0/g5/g10/bridge "clean split") — meaning a possibly-large fraction of gap4-7 samples currently being fed as ground truth may be uncorrected RAFT failures, not just weaker signal.
+
+Switched to the field-standard alternative: **forward-backward (cycle) consistency with an adaptive threshold** (Sundaram/Brox/Keutzer, ECCV 2010 — `err(x) = ||flow_fw(x) + flow_bw(x+flow_fw(x))||²  >  scale·(||flow_fw(x)||²+||flow_bw_warped(x)||²) + bias`), already implemented in this repo as `utils.warp_utils.get_occu_mask_bidirection` (unused until now) with the literature-standard `scale=0.01, bias=0.5`. Unlike the fixed threshold, the tolerance itself scales with flow magnitude, so large legitimate motion at high gap isn't automatically penalized. Computed over all 16688 fw/bw pairs (`tools/multigap_flow_quality_fb_consistency.py`; first attempt on CPU with PyTorch's default per-call multithreading stalled badly — ~13 pairs/s, projected 20+ min; switched to `torch.set_num_threads(1)` + GPU (`cuda:0`, ~1.2GB footprint, run concurrently alongside the two live training jobs on the same card with no observed slowdown to them) — 5 min total at ~40-75 pairs/s):
+
+| gap | n | mean_incons% | median_incons% | p90_incons% |
+|---|---|---|---|---|
+| 1 | 4172 | 17.96 | 14.93 | 32.50 |
+| 2 | 3576 | 22.95 | 19.65 | 39.33 |
+| 3 | 2980 | 27.04 | 23.45 | 45.60 |
+| 4 | 2384 | 31.19 | 27.83 | 52.24 |
+| 5 | 1788 | 34.60 | 31.17 | 57.58 |
+| 6 | 1192 | 37.66 | 34.10 | 62.59 |
+| 7 | 596 | 40.50 | 37.02 | 65.06 |
+
+**Two findings.** (1) The degradation with gap is real but far gentler than the fixed-threshold view suggested — ~2.25x from gap1→gap7 (17.96%→40.50%) instead of ~40x (1.8%→69.3%). Large gaps are worse, genuinely (more true occlusion accumulates over more elapsed time, and RAFT's correspondence search does get less reliable at larger displacement) — but nowhere near "most of it is garbage." (2) gap1's own baseline is already ~18% inconsistent, not near-zero — plausibly close to this scene's true occlusion rate (a thin moving instrument continuously reveals/covers tissue background even frame-to-frame), which the FB-consistency check is expected to flag by design (occluded pixels have no valid correspondence, cycle-check will always catch them regardless of flow correctness).
+
+**Not yet done**: turning this per-pair inconsistency fraction into an actual sample-level filter or per-pixel loss weight (analogous to `use_cycle_conf`'s existing `_compute_cycle_conf`/`cycle_conf_sigma_overrides` mechanism, which already implements a similar bidirectional-consistency gate for bridge pairs specifically) and re-deriving `gap_probabilities` from post-filter sample availability rather than hand-picked curves. Per-pair fraction data saved to `/tmp/.../scratchpad/gap_fb_consistency.npz` for follow-up.
+
+## Joint Multi-Frame Mask Architecture — giving the mask branch forward-pass access to other frames (260720)
+
+Motivation: `decode_head2` (mask) has always been per-frame in its forward pass — frame_i/frame_j features never interact except in `decode_head3` (residual) and, indirectly, mask's training gradient via the flow-fit loss. v121+ gives mask genuine forward-pass access to other frames for the first time. Also found and fixed along the way: `RandomFlip` (`dataset/transforms.py`) mirrored flow arrays but never negated the flow vector's sign — a project-wide bug affecting every `strong_aug`+`load_flow` config's history, including v83/v102; a `VideoDataset` boundary-index bug for `frame_num>=3` that silently loaded the wrong annotation file.
+
+| ver | model_cls | mechanism | data | eval | status |
+|---|---|---|---|---|---|
+| v121 | `RCFJointMaskSoftTissueModel` | feat0 concat (2 frames) → 64ch, symmetric broadcast | multigap_seq, gap∈{1,2,3} random | val_paired.txt (gap1), 2-frame | **done** (80ep): inst 50.0 / tissue 73.2 / sum 123.0 (`flow_drop_p` bug: only ~50% steps use joint feat) |
+| v122 | same as v121 | same + `flow_drop_p: 0.0` fix (100% usage) | same as v121 | same as v121 | **done** (80ep): inst 51.0 / tissue 66.7 / sum 118.0 — **below v121 despite 100% usage**, unexpected |
+| v123 | `RCFJointMaskV2SoftTissueModel` | v121 extended to all 4 scales | same as v122 | same as v122 | running (job458): inst 58.4 / tissue 67.9 @ep56 |
+| v124 | `RCFJointMaskV3SoftTissueModel` | Deformable cross-frame attention (learned offsets, real alignment) instead of concat, 4 scales | same as v122 | same as v122 | running (job459): inst 44.7 / tissue 70.4 @ep45 — **below v123** so far (fewer epochs done, attention is slower/epoch — not yet a fair comparison) |
+| v125 | `RCFJointMaskSoftTissueModel` | v122 arch, exhaustive gap1-only data (no random mix) | multigap_paired, gap1 exhaustive (2632) | val_paired.txt | queued |
+| v126 | `RCFTripletModel` | 3 consecutive frames, 3 pairwise flow losses averaged, no joint mask | triplet split (2256) | val.txt, 1-frame | queued |
+| v127 | `RCFTripletJointMaskModel` | v126 + 3-frame feat0 concat, symmetric broadcast | same as v126 | val_triplet.txt, 3-frame | queued |
+| v128 | `RCFTripletJointMaskV2Model` | v127 extended to all 4 scales | same as v126 | same as v127 | queued |
+| v129 | `RCFJointMaskSoftTissueModel` | v122 arch, `topk: 4→8` (disables sample selection) — tests whether topk starves gradient from hard samples | same as v122 | same as v122 | queued |
+| v130 | `RCFJointMaskV4SoftTissueModel` | v124 + learned position embedding (query-side only) on offset predictor | same as v122 | same as v122 | queued |
+| v131 | `RCFJointMaskV3SoftTissueModel` | v124's exact architecture, data changed to exhaustive gap1+2+3 (no random mix) — deliberately NOT step-matched vs v124 (~4.5x more batches/epoch, 376→1692), on the reasoning that attention's zero-init offset predictor plausibly needs more gradient steps to learn its way out of the cold start than naive concat does | multigap_paired, gap1+2+3 exhaustive (6768) | val_paired.txt | queued |
+| v132 | `RCFJointMaskV2SoftTissueModel` | v123's exact architecture/data + `decode_head.boundary_floor: 0.1→0.5` — the flow-fit loss weights every pixel by a GT-flow-angle-discontinuity boundary map (dilated 15px), full weight (1.0) on boundary, `boundary_floor` elsewhere (incl. mask interior) — raised from 0.1 to strengthen interior supervision after visually spotting speckle/noise in v123's mask interiors. `floor=0` would make this WORSE, not better (interior gets literally zero gradient, not "boundary-only" as one might first guess) | same as v123 | same as v123 | queued |
+| v133 | `RCFJointMaskV2SoftTissueModel` | v123's exact architecture, data extended with grasp10 (restores what v83/v102's champion recipe had — grasp10's stronger instrument motion — that the entire v116-v132 grasp0-only line dropped) | `CMC_grasp0_5_10_merged_bwdif`, `train_g0378_g10500.txt` — g0 (378) + g10 (500 = 601 total minus the 101 reserved for eval). Eval adds `instrument_g10`/`tissue_g10` entries (101 grasp10 cases with BOTH instrument+tissue COCO annotations, `val_paired_both101.txt`) | same as v123 for g0 (`val_paired.txt`, now sourced from `CMC_grasp0_5_10_merged_bwdif` to match training's bwdif pass, not `CMC_grasp0_continuous_bwdif` — verified frame1 differs between the two bwdif pipelines, 105/212 mismatches) + grasp10's 101 both-annotated cases | resubmitted (job499) |
+| v134 | `RCFJointMaskV4SoftTissueModel` | v130's architecture (attention + query-side position embedding) + v131's exhaustive gap1/2/3 g0 data + v133's grasp10 data, combined — tests whether grasp10's richer instrument motion helps the attention offset predictor specifically (v130 alone showed tissue improving but instrument declining) | `CMC_grasp0_multigap_paired` (v131's gap123 root, with grasp10's 500 pairs symlinked in), `train_gap123_plus_g10500.txt` (6768 g0 + 500 g10 = 7268 lines) | identical to v133 (same 4 entries, same data sources) | resubmitted (job500) |
+
+**Correction (260724):** v133/v134's grasp10 training set was initially built as 287 (601 total − 101 reserved for eval − a further 101 assumed to overlap grasp0's eval set on the theory that grasp0/grasp10 are the same surgeries at different temporal offsets). The user confirmed this theory is wrong — grasp0 and grasp10 are separate, non-overlapping datasets that merely share a case-ID naming convention. That extra exclusion was removed; grasp10's training set is the full 500 (601−101) for both versions, and both were rebuilt/resubmitted accordingly.
+
+v121/v122 finished all 80 epochs; v123/v124 now running (2 GPUs on this node, v125-v132 queued behind them). v122's 100%-joint-feature-usage measuring *below* v121's ~50%-usage — confirmed at full convergence, not just a mid-training artifact — is the open puzzle motivating v129 (topk-starvation hypothesis) and v124/v130 (misalignment hypothesis), neither resolved yet. Both v121/v122 also trail the historical v64/v83/v102-class champions (sum ≈134-139) by a wide margin (123.0/118.0). v124 (attention) currently trailing v123 (naive concat) at a lower epoch count is not yet a fair same-epoch comparison — attention is markedly slower per epoch (1.83it/s vs 2.16it/s) — but worth watching once both reach 79/80.

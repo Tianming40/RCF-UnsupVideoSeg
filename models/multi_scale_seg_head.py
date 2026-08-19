@@ -230,8 +230,26 @@ class MultiScaleSegHead(nn.Module):
         gy = F.conv2d(norm, self.sobel_y, padding=1)
         return (gx ** 2 + gy ** 2 + 1e-6).sqrt()       # [B, 1, H/4, W/4]
 
-    def forward(self, inputs, flow_feat=None):
+    def _inject_decoder_prior(self, fused, dino_eigvecs=None):
         """
+        Overridable no-op hook (260801, see models/multi_scale_seg_head_
+        decoder_prior.py's MultiScaleSegHeadDecoderPrior for the one
+        subclass that overrides this) -- called right after Step 3's
+        upsample, i.e. right after the decoder's own multi-scale (ASPP)
+        fusion has produced its H/4-resolution feature, BEFORE feat0 gets
+        concatenated in. Base class: identity, `dino_eigvecs` ignored --
+        zero-behaviour-change for every existing config.
+        """
+        return fused
+
+    def forward_features(self, inputs, flow_feat=None, dino_eigvecs=None):
+        """
+        Steps 1-7 of forward(), stopping BEFORE dropout/conv_seg -- pulled out
+        (260731) as its own method so subclasses (e.g. MultiScaleSegHeadHiRes)
+        can build additional stages on top of the pre-classifier feature
+        without duplicating this logic. Behaviour-preserving refactor --
+        forward() below is unchanged in output, just calls this + conv_seg.
+
         Args:
             inputs: list of backbone2 feature maps
               inputs[0] = feat0: [B, 256,  H/4, W/4]
@@ -241,8 +259,10 @@ class MultiScaleSegHead(nn.Module):
             flow_feat: [B, flow_in_channels, H/4, W/4] or None
               Passed during training from gt_flow via rcf_model (.detach());
               always None at val/test time — the branch is skipped entirely.
+            dino_eigvecs: [B, g, H', W'] or None -- passed through to
+              _inject_decoder_prior (260801), ignored by the base class.
 
-        Returns: [B, num_classes, H/4, W/4]
+        Returns: [B, mid_channels, H/4, W/4] (pre-dropout, pre-classifier)
         """
         feat0, feat1, feat2, feat3 = inputs[0], inputs[1], inputs[2], inputs[3]
 
@@ -260,6 +280,10 @@ class MultiScaleSegHead(nn.Module):
             align_corners=self.align_corners,
         )
         # [B, mid_ch, H/4, W/4]
+
+        # Step 3.5 (260801): decoder-stage prior injection hook -- no-op in
+        # the base class, see _inject_decoder_prior above.
+        fused = self._inject_decoder_prior(fused, dino_eigvecs=dino_eigvecs)
 
         # Step 4: optional edge enhancement — inject Sobel response of feat0 into fused
         if self.use_edge_feat:
@@ -280,7 +304,11 @@ class MultiScaleSegHead(nn.Module):
         x = self.decode_conv1(x)
         x = self.decode_conv2(x)
         # [B, mid_ch, H/4, W/4]
+        return x
 
+    def forward(self, inputs, flow_feat=None, dino_eigvecs=None):
+        """Returns: [B, num_classes, H/4, W/4]"""
+        x = self.forward_features(inputs, flow_feat=flow_feat, dino_eigvecs=dino_eigvecs)
         # Step 8: dropout + classifier
         if self.dropout is not None:
             x = self.dropout(x)

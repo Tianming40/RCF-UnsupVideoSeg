@@ -52,19 +52,16 @@ class MultiScaleSegHeadJoint4(MultiScaleSegHead):
         self.feat2_joint_proj = _proj(feat2_joint_in_channels)
         self.feat3_joint_proj = _proj(feat3_joint_in_channels)
 
-    def forward(self, inputs, flow_feat=None, feat1_joint=None, feat2_joint=None, feat3_joint=None):
+    def forward_features(self, inputs, flow_feat=None, feat1_joint=None, feat2_joint=None, feat3_joint=None):
         """
-        Args:
-            inputs: same as MultiScaleSegHead (feat0..feat3, own-frame features)
-            flow_feat: [B, flow_in_channels, H/4, W/4] or None -- feat0-level
-                joint feature (same slot/semantics as the base class)
-            feat1_joint, feat2_joint, feat3_joint: [B, C, H/8, W/8] or None --
-                joint two-frame features at the feat1/feat2/feat3 scale
-                (H/8 resolution, matching proj1/proj2/proj3's input scale).
-                All three default None -> this class behaves exactly like
-                MultiScaleSegHead.
-
-        Returns: [B, num_classes, H/4, W/4]
+        Identical to forward() up to (NOT including) the final conv_seg
+        classifier -- returns the mid_channels-dim fused feature map conv_seg
+        would otherwise consume, [B, mid_channels, H/4, W/4]. Added 260728
+        for k-means-based conv_seg initialization (see
+        rcf_selftaught_flow_model.py:kmeans_init_mask_head) -- clustering
+        needs the ACTUAL feature space conv_seg operates on, not a proxy
+        space (e.g. DINO's), so this must be extracted from this exact
+        forward path rather than duplicated/approximated elsewhere.
         """
         feat0, feat1, feat2, feat3 = inputs[0], inputs[1], inputs[2], inputs[3]
 
@@ -111,7 +108,25 @@ class MultiScaleSegHeadJoint4(MultiScaleSegHead):
         x = self.decode_conv1(x)
         x = self.decode_conv2(x)
 
-        # Step 8: dropout + classifier
+        # Step 8: dropout
         if self.dropout is not None:
             x = self.dropout(x)
-        return self.conv_seg(x)
+        return x
+
+    def forward(self, inputs, flow_feat=None, feat1_joint=None, feat2_joint=None, feat3_joint=None):
+        """
+        Args:
+            inputs: same as MultiScaleSegHead (feat0..feat3, own-frame features)
+            flow_feat: [B, flow_in_channels, H/4, W/4] or None -- feat0-level
+                joint feature (same slot/semantics as the base class)
+            feat1_joint, feat2_joint, feat3_joint: [B, C, H/8, W/8] or None --
+                joint two-frame features at the feat1/feat2/feat3 scale
+                (H/8 resolution, matching proj1/proj2/proj3's input scale).
+                All three default None -> this class behaves exactly like
+                MultiScaleSegHead.
+
+        Returns: [B, num_classes, H/4, W/4]
+        """
+        return self.conv_seg(self.forward_features(
+            inputs, flow_feat=flow_feat, feat1_joint=feat1_joint,
+            feat2_joint=feat2_joint, feat3_joint=feat3_joint))

@@ -1,0 +1,110 @@
+% ────────────────────────────────────────────────────────────────────────
+% Placeholder bibliography for report.tex. Entries marked "VERIFY" are
+% filled in from general knowledge / partial recall and should be checked
+% against the actual paper before submitting. Entries marked "TODO -- fill
+% in" are cited in the text but I do not have reliable bibliographic data
+% for them (in particular the original RCF paper itself) -- please
+% complete these yourself.
+% ────────────────────────────────────────────────────────────────────────
+
+@misc{rcf_cvpr2023,
+  author       = {Lian, Long and Wu, Zhirong and Yu, Stella X.},
+  title        = {Bootstrapping Objectness from Videos by Relaxed Common Fate and Visual Grouping},
+  year         = {2023},
+  eprint       = {2304.08025},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV},
+  url          = {https://arxiv.org/abs/2304.08025}
+}
+
+% VERIFY -- standard citation, high confidence, please double-check
+% venue/page numbers against the published version.
+@inproceedings{raft_eccv2020,
+  author    = {Teed, Zachary and Deng, Jia},
+  title     = {{RAFT}: Recurrent All-Pairs Field Transforms for Optical Flow},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  year      = {2020}
+}
+
+% Exact citation, taken directly from the reference list of
+% 2408.14789v3 (graphpartition_mchm2024 below), which itself cites this
+% paper as ref [9].
+@inproceedings{dino_iccv2021,
+  author    = {Caron, Mathilde and Touvron, Hugo and Misra, Ishan and Jegou, Herv{\'e} and Mairal, Julien and Bojanowski, Piotr and Joulin, Armand},
+  title     = {Emerging Properties in Self-Supervised Vision Transformers},
+  booktitle = {IEEE/CVF International Conference on Computer Vision (ICCV)},
+  pages     = {9630--9640},
+  year      = {2021},
+  doi       = {10.1109/ICCV48922.2021.00951}
+}
+
+% Exact citation, taken directly from the reference list of
+% 2408.14789v3, ref [3].
+@misc{endovis2017,
+  author       = {Allan, Max and Shvets, Alex and Kurmann, Thomas and Zhang, Zichen and Duggal, Rahul and Su, Yun-Hsuan and Rieke, Nicola and Laina, Iro and Kalavakonda, Niveditha and Bodenstedt, Sebastian and Herrera, Luis and Li, Wenqi and Iglovikov, Vladimir and Luo, Huoling and Yang, Jian and Stoyanov, Danail and Maier-Hein, Lena and Speidel, Stefanie and Azizian, Mahdi},
+  title        = {2017 Robotic Instrument Segmentation Challenge},
+  year         = {2019},
+  eprint       = {1902.06426},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV},
+  doi          = {10.48550/arXiv.1902.06426}
+}
+
+% Exact citation -- this is the paper read in full for report.tex Sections
+% III-G/III-H (DINO graph-partitioning fusion / Bayesian prior).
+@inproceedings{graphpartition_mchm2024,
+  author    = {Sheng, Mingyu and Fan, Jianan and Liu, Dongnan and Kikinis, Ron and Cai, Weidong},
+  title     = {Revisiting Surgical Instrument Segmentation Without Human Intervention: A Graph Partitioning View},
+  booktitle = {Proceedings of the 1st International Workshop on Multimedia Computing for Health and Medicine (MCHM '24)},
+  year      = {2024},
+  address   = {Melbourne, VIC, Australia},
+  publisher = {ACM},
+  doi       = {10.1145/3688868.3689193},
+  note      = {arXiv:2408.14789v3}
+}
+
+% Exact citation -- taken from graphpartition_mchm2024's own reference
+% list, ref [53], which it cites as the theoretical basis (Normalized
+% Cut) for the eigenvector-partitioning mechanism.
+@article{normalized_cuts,
+  author  = {Shi, Jianbo and Malik, Jitendra},
+  title   = {Normalized Cuts and Image Segmentation},
+  journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  volume  = {22},
+  number  = {8},
+  pages   = {888--905},
+  year    = {2000},
+  doi     = {10.1109/34.868688}
+}
+
+% Exact citation -- author list/authors read directly from the PDF
+% (report.tex Sec. II / III-A future-work discussion). VERIFY exact
+% venue -- the version read did not show a venue/proceedings header on
+% its own title page in the excerpt captured; check for the final
+% published venue (likely CVPR/arXiv 2025) before citing.
+@misc{batrack2025,
+  author = {Chen, Weirong and Zhang, Ganlin and Wimbauer, Felix and Wang, Rui and Araslanov, Nikita and Vedaldi, Andrea and Cremers, Daniel},
+  title  = {Back on Track: Bundle Adjustment for Dynamic Scene Reconstruction},
+  year   = {2025},
+  note   = {TODO: verify final venue/proceedings before citing}
+}
+
+% VERIFY -- standard citation, high confidence.
+@inproceedings{resnet_cvpr2016,
+  author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  title     = {Deep Residual Learning for Image Recognition},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  pages     = {770--778},
+  year      = {2016},
+  doi       = {10.1109/CVPR.2016.90}
+}
+
+% VERIFY -- ASPP module, as used in the project's v64 MultiScaleSegHead.
+% This is usually cited to the DeepLabv3 paper -- double check which of
+% the DeepLab-family papers you actually mean before submitting.
+@article{aspp_deeplab,
+  author  = {Chen, Liang-Chieh and Papandreou, George and Schroff, Florian and Adam, Hartwig},
+  title   = {Rethinking Atrous Convolution for Semantic Image Segmentation},
+  journal = {arXiv preprint arXiv:1706.05587},
+  year    = {2017}
+}

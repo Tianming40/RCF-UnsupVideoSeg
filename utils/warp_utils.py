@@ -111,3 +111,35 @@ def get_occu_mask_backward(flow21, th=0.2):
     corr_map = get_corresponding_map(base_grid + flow21)  # BHW
     occu_mask = corr_map.clamp(min=0., max=1.) < th
     return occu_mask.float()
+
+
+def edge_aware_smoothness_loss(flow, img):
+    """First-order edge-aware smoothness (standard unsupervised-optical-flow
+    regularizer, e.g. Yu et al. 2016 / ARFlow / SelFlow), added 260728 for
+    the self-taught (RAFT-free) flow direction discussed this session.
+
+    Penalises flow gradients, down-weighted wherever the image itself has a
+    strong gradient (a real edge) -- so smoothness is enforced INSIDE
+    low-texture regions (where the reconstruction loss alone gives a weak,
+    ambiguous signal -- the classic aperture problem) without flattening
+    genuine motion discontinuities at object boundaries, where image edges
+    and motion edges usually coincide.
+
+    flow: [B, 2, H, W]           displacement field
+    img:  [B, 3, H, W]           SAME resolution as flow (resize the raw
+                                  image to flow's resolution before calling)
+    Returns: scalar loss.
+    """
+    def _grad(x):
+        dx = x[:, :, :, :-1] - x[:, :, :, 1:]
+        dy = x[:, :, :-1, :] - x[:, :, 1:, :]
+        return dx, dy
+
+    img_dx, img_dy = _grad(img)
+    weight_x = torch.exp(-img_dx.abs().mean(dim=1, keepdim=True))
+    weight_y = torch.exp(-img_dy.abs().mean(dim=1, keepdim=True))
+
+    flow_dx, flow_dy = _grad(flow)
+    loss_x = (flow_dx.abs() * weight_x).mean()
+    loss_y = (flow_dy.abs() * weight_y).mean()
+    return loss_x + loss_y

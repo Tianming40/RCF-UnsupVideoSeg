@@ -29,9 +29,19 @@ from metrics import empty_prf_bucket, mean_prf as _mean_prf
 # ── 1. Register V2 flow head + MultiScaleSegHeadJoint4 ─────────────────────────
 import models.rcf_model as _rcf_mod
 from models.flow_aggregation_head_with_residual_v2 import FlowAggregationHeadWithResidualV2
+from models.flow_aggregation_head_raftfree import FlowAggregationHeadRaftFree
+from models.flow_aggregation_head_image_boundary import FlowAggregationHeadImageBoundary
+from models.flow_aggregation_head_graph_motion import FlowAggregationHeadGraphMotion
 from models.multi_scale_seg_head_joint4 import MultiScaleSegHeadJoint4
+from models.multi_scale_seg_head_hires import MultiScaleSegHeadHiRes
+from models.multi_scale_seg_head_decoder_prior import MultiScaleSegHeadDecoderPrior
 _rcf_mod.FlowAggregationHeadWithResidualV2 = FlowAggregationHeadWithResidualV2
+_rcf_mod.FlowAggregationHeadRaftFree = FlowAggregationHeadRaftFree  # decode_head.type: FlowAggregationHeadRaftFree (v140+, RAFT-free)
+_rcf_mod.FlowAggregationHeadImageBoundary = FlowAggregationHeadImageBoundary  # decode_head.type (v144+, image-edge boundary weight on v102)
+_rcf_mod.FlowAggregationHeadGraphMotion = FlowAggregationHeadGraphMotion  # decode_head.type (v148+, DINO graph weight in the motion least-squares fit)
 _rcf_mod.MultiScaleSegHeadJoint4 = MultiScaleSegHeadJoint4  # decode_head2.type: MultiScaleSegHeadJoint4 (v123+)
+_rcf_mod.MultiScaleSegHeadHiRes = MultiScaleSegHeadHiRes  # decode_head2.type: MultiScaleSegHeadHiRes (v150+, H/4->H/2 resolution upgrade)
+_rcf_mod.MultiScaleSegHeadDecoderPrior = MultiScaleSegHeadDecoderPrior  # decode_head2.type (v155+, DINO graph eigenvectors injected at decoder stage)
 
 # ── 2. Register RCFDinoModel + RCFSoftTissueModel ─────────────────────────────
 import models as _models_pkg
@@ -44,6 +54,9 @@ from models.rcf_joint_mask_v4_model import RCFJointMaskV4SoftTissueModel
 from models.rcf_joint_mask_v5_model import RCFJointMaskV5SoftTissueModel
 from models.rcf_joint_mask_v6_model import RCFJointMaskV6SoftTissueModel
 from models.rcf_triplet_model import RCFTripletModel
+from models.rcf_selftaught_flow_model import RCFSelfTaughtFlowModel
+from models.rcf_jepa_flow_model import RCFJepaFlowModel
+from models.rcf_jepa_predictor_model import RCFJepaPredictorModel
 
 _models_pkg.RCFDinoModel              = RCFDinoModel               # type: ignore[attr-defined]
 _models_pkg.RCFSoftTissueModel        = RCFSoftTissueModel         # type: ignore[attr-defined]
@@ -55,6 +68,9 @@ _models_pkg.RCFJointMaskV5SoftTissueModel = RCFJointMaskV5SoftTissueModel  # typ
 _models_pkg.RCFJointMaskV6SoftTissueModel = RCFJointMaskV6SoftTissueModel  # type: ignore[attr-defined]
 _models_pkg.RCFJointMaskSoftTissueModel = RCFJointMaskSoftTissueModel  # type: ignore[attr-defined]
 _models_pkg.RCFTripletModel            = RCFTripletModel           # type: ignore[attr-defined]
+_models_pkg.RCFSelfTaughtFlowModel     = RCFSelfTaughtFlowModel     # type: ignore[attr-defined]
+_models_pkg.RCFJepaFlowModel           = RCFJepaFlowModel           # type: ignore[attr-defined]
+_models_pkg.RCFJepaPredictorModel      = RCFJepaPredictorModel      # type: ignore[attr-defined]
 
 # ── 3. Subclass Model to track epoch-level train loss ─────────────────────────
 import main as _main_module
@@ -80,6 +96,19 @@ class TissueModel(_BaseModel):
             self.model._reset_full_decode_head2()
         elif getattr(self.model, 'reset_non_instrument_heads', False):
             self.model._reset_non_instrument_mask_heads()
+
+        # k-means-initialize decode_head2.conv_seg from real pretrained-
+        # backbone features instead of pure random noise (see
+        # RCFSelfTaughtFlowModel.kmeans_init_mask_head's docstring). No-op
+        # for every other model class (hasattr guard); skipped on resume so
+        # a checkpoint's already-learned conv_seg is never clobbered.
+        if hasattr(self.model, 'kmeans_init_mask_head') and not getattr(self.args, 'resume_from_checkpoint', None):
+            sample_batches = []
+            for i, batch in enumerate(self.train_dataloader()):
+                sample_batches.append(batch)
+                if i >= 3:
+                    break
+            self.model.kmeans_init_mask_head(sample_batches)
 
     def on_train_epoch_start(self) -> None:
         super().on_train_epoch_start()
@@ -207,6 +236,17 @@ class TissueModel(_BaseModel):
         else:
             self.args.oracle_exclude_channels = []
         self.test_step(batch, batch_idx)
+
+        # Optional per-model eval visualization hook (no-op unless the model
+        # class defines visualize_eval_sample -- currently only
+        # RCFSelfTaughtFlowModel does, to check self-taught flow_raw quality
+        # against real held-out frames over training). First batch of each
+        # dataloader per epoch only, to keep validation fast.
+        if batch_idx == 0 and hasattr(self.model, 'visualize_eval_sample'):
+            try:
+                self.model.visualize_eval_sample(batch, self.save_dir_eval, self.current_epoch)
+            except Exception:
+                logger.warning("visualize_eval_sample failed", exc_info=True)
 
     def validation_epoch_end(self, outputs):
         if not getattr(self.args, 'val_dataset_list', None):

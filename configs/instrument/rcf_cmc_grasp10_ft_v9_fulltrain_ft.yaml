@@ -47,8 +47,10 @@ test_transform_kwargs:
 loss_log_interval: 10
 log_interval: 100
 
-object_channel: 1
+object_channel: null
 set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+val_dataset_list: []
 
 data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced
 dataset_kwargs: {}

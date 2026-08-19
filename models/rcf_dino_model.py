@@ -132,6 +132,173 @@ class RCFDinoModel(RCFModel):
       dino_input_size  int    spatial size to resize frames before DINO
                               (must be divisible by dino_patch_size)
                               default: 128
+
+      use_dino_graph_fusion    bool   enable DinoGraphFusionHead (see
+                                      models/dino_graph_fusion.py), discussed
+                                      260730 -- fuses frozen-DINO graph-
+                                      partitioning eigenvectors into backbone2's
+                                      feat0 before decode_head2, via a small
+                                      trainable, zero-init'd conv module.
+                                      default: False (zero-behaviour-change for
+                                      every existing config, incl. v102)
+      dino_graph_input_size    int    resize frames to this square before DINO
+                                      for the graph branch (independent of
+                                      dino_input_size, which stays 128 for
+                                      loss_dino). default: 384 (matches
+                                      backbone2's own input res -- the
+                                      configuration empirically validated in
+                                      saved/edge_test_260729/spectral_test.jpg)
+      dino_graph_grid_size     int    graph node grid GxG (default 32 -> 1024
+                                      nodes, same as spectral_test.jpg)
+      dino_graph_num_eigvecs   int    how many smallest-eigenvalue eigenvectors
+                                      to use (default 10)
+      dino_graph_proj_channels int    channel width of the small conv module's
+                                      internal eigenvector projection (default 32)
+      dino_graph_feat_channels int    channel count of backbone2's feat0
+                                      (default 256, matches ResNet50 stage0)
+      dino_graph_chunk_size    int    max frames processed through DINO+eigh
+                                      per internal chunk (default 8) -- purely
+                                      a peak-memory control (DINO-384's self-
+                                      attention is O(tokens^2)=O(2304^2) per
+                                      sample), no_grad throughout so chunking
+                                      doesn't change results. Does NOT affect
+                                      batch_size/topk training semantics --
+                                      deliberately kept independent so a
+                                      memory fix here never silently re-tunes
+                                      topk's easy-sample survival ratio
+                                      (discussed 260730).
+
+      use_dino_graph_estep_fusion  bool  enable DinoGraphEStepFusion (see
+                                      models/dino_graph_estep_fusion.py),
+                                      discussed 260730 -- an alternative to
+                                      use_dino_graph_fusion with NO new
+                                      trainable weights: fuses P_CNN(z=k) with
+                                      a graph-derived P_Graph(z=k) computed
+                                      fresh each forward pass from the CNN's
+                                      own current mask (self-referential
+                                      centroid matching -- see that file's
+                                      docstring). Independent of/compatible
+                                      with use_dino_graph_fusion, though not
+                                      intended to be enabled together in the
+                                      configs used so far. default: False
+                                      (zero-behaviour-change for every
+                                      existing config, incl. v102 and v146).
+      dino_graph_estep_*           see models/dino_graph_estep_fusion.py for
+                                      input_size/grid_size/num_eigvecs/
+                                      chunk_size (same meaning as the
+                                      dino_graph_* params above, kept as a
+                                      fully separate set so the two mechanisms
+                                      never share config/state) plus
+                                      temperature and alpha (blend exponent,
+                                      alpha=0 -> exact no-op, alpha=1 -> the
+                                      literal P_CNN*P_Graph fusion).
+
+      use_dino_graph_fusion_deep   bool  discussed 260730: v146
+                                      (use_dino_graph_fusion) fuses DINO-graph
+                                      eigenvectors into feat0 (backbone2's
+                                      stage-1 output, 256ch/H4, MultiScaleSegHead's
+                                      LOCAL/fine-boundary-detail input). Eigenvectors
+                                      encode GLOBAL semantic-partition structure,
+                                      which is architecturally closer to what
+                                      feat1/feat2/feat3 (deep, large-receptive-
+                                      field, "what class is this roughly"
+                                      features, fused together BEFORE feat0 is
+                                      even consulted) are for -- not feat0's
+                                      job. This reuses the exact same
+                                      DinoGraphFusionHead class (see models/
+                                      dino_graph_fusion.py, same zero-init
+                                      no-op safety property) but targets
+                                      all_feat[3] (feat3, the deepest/most-
+                                      semantic scale) instead of all_feat[0].
+                                      Separate attribute
+                                      (dino_graph_fusion_deep_head), separate
+                                      hook in rcf_model.py -- independent of/
+                                      compatible with use_dino_graph_fusion,
+                                      not intended to be enabled together in
+                                      the configs used so far. default: False.
+      dino_graph_deep_*            same meaning as dino_graph_* above
+                                      (input_size/grid_size/num_eigvecs/
+                                      proj_channels/chunk_size), but
+                                      feat_channels defaults to 2048 (feat3's
+                                      channel count, not feat0's 256) and this
+                                      is a fully separate param/state set.
+
+      use_dino_graph_attention_gate  bool  discussed 260801: an ALTERNATIVE
+                                      fusion TYPE to use_dino_graph_fusion_deep
+                                      (v149) at the same feat3 injection
+                                      point -- instead of concatenating a
+                                      projection of the eigenvectors into
+                                      feat3 (where they're outnumbered 2048:32
+                                      by feat3's own channels), predicts a
+                                      single-channel spatial GATE from the
+                                      eigenvectors and multiplicatively
+                                      modulates feat3: F' = F*(1+tanh(gate)),
+                                      gate's last conv zero-initialized so
+                                      F'==F exactly at init. See models/
+                                      dino_graph_attention_gate.py's docstring.
+                                      Separate attribute
+                                      (dino_graph_attention_gate_head),
+                                      separate hook in rcf_model.py -- not
+                                      intended to be enabled together with
+                                      use_dino_graph_fusion_deep in the same
+                                      config (both target feat3). default:
+                                      False.
+      dino_graph_gate_*            same meaning as dino_graph_deep_* above
+                                      (input_size/grid_size/num_eigvecs/
+                                      chunk_size) plus gate_hidden_channels
+                                      (width of the small conv stack that
+                                      predicts the gate logit, default 32) --
+                                      fully separate param/state set from
+                                      both dino_graph_* and dino_graph_deep_*.
+
+      use_dino_graph_fusion_deep2  bool  discussed 260801: multi-scale
+                                      injection -- reuses the exact same
+                                      DinoGraphFusionHead class as
+                                      dino_graph_fusion_deep_head (v149)
+                                      but targets all_feat[2] (feat2,
+                                      1024ch, H/8=48x48) as a SECOND,
+                                      independent injection point, on top
+                                      of (not instead of) feat3. Meant to be
+                                      combined with use_dino_graph_fusion_deep
+                                      in the same config -- orthogonal
+                                      variable to fusion TYPE (concat vs
+                                      attention-gate). Separate attribute
+                                      (dino_graph_fusion_deep2_head),
+                                      separate hook. default: False.
+      dino_graph_deep2_*           same meaning as dino_graph_deep_* above,
+                                      but feat_channels defaults to 1024
+                                      (feat2's channel count) and this is a
+                                      fully separate param/state set.
+
+      use_dino_graph_decoder_prior bool  discussed 260801: a third distinct
+                                      injection POINT (not just fusion type)
+                                      -- instead of fusing into a backbone2
+                                      feature (encoder-side, before
+                                      decode_head2 runs, like v146/v149/
+                                      v153), this builds an extraction-only
+                                      DinoGraphEigvecExtractor (models/
+                                      dino_graph_eigvec_extractor.py, NO
+                                      trainable params) whose output is
+                                      passed into decode_head2 as an extra
+                                      dino_eigvecs kwarg -- only meaningful
+                                      when decode_head2.type is
+                                      MultiScaleSegHeadDecoderPrior (models/
+                                      multi_scale_seg_head_decoder_prior.py),
+                                      which owns its own trainable fusion
+                                      module and injects at the DECODER stage
+                                      (right after decode_head2's own multi-
+                                      scale/ASPP fusion, before feat0 concat)
+                                      -- see that file's docstring. For any
+                                      other decode_head2 type this kwarg is
+                                      simply unused (harmless). default: False.
+      dino_prior_input_size/grid_size/num_eigvecs/chunk_size  extraction-side
+                                      params (same meaning as dino_graph_*
+                                      above) -- MUST match decode_head2's own
+                                      dino_prior_num_eigvecs (the fusion
+                                      module's expected input channel count),
+                                      since those two are configured
+                                      independently (model_kwargs top level
+                                      vs decode_head2 sub-config).
     """
 
     def __init__(
@@ -144,6 +311,52 @@ class RCFDinoModel(RCFModel):
         w_dino_merge: float = 0.0,
         dino_input_size: int = 128,
         dino_channels: Optional[list] = None,
+        use_dino_graph_fusion: bool = False,
+        dino_graph_input_size: int = 384,
+        dino_graph_grid_size: int = 32,
+        dino_graph_num_eigvecs: int = 10,
+        dino_graph_proj_channels: int = 32,
+        dino_graph_feat_channels: int = 256,
+        dino_graph_chunk_size: int = 8,
+        use_dino_graph_estep_fusion: bool = False,
+        dino_graph_estep_input_size: int = 384,
+        dino_graph_estep_grid_size: int = 32,
+        dino_graph_estep_num_eigvecs: int = 10,
+        dino_graph_estep_chunk_size: int = 8,
+        dino_graph_estep_temperature: float = 1.0,
+        dino_graph_estep_alpha: float = 1.0,
+        use_dino_graph_fusion_deep: bool = False,
+        dino_graph_deep_input_size: int = 384,
+        dino_graph_deep_grid_size: int = 32,
+        dino_graph_deep_num_eigvecs: int = 10,
+        dino_graph_deep_proj_channels: int = 32,
+        dino_graph_deep_feat_channels: int = 2048,
+        dino_graph_deep_chunk_size: int = 8,
+        use_dino_graph_attention_gate: bool = False,
+        dino_graph_gate_input_size: int = 384,
+        dino_graph_gate_grid_size: int = 32,
+        dino_graph_gate_num_eigvecs: int = 10,
+        dino_graph_gate_hidden_channels: int = 32,
+        dino_graph_gate_feat_channels: int = 2048,
+        dino_graph_gate_chunk_size: int = 8,
+        use_dino_graph_fusion_deep2: bool = False,
+        dino_graph_deep2_input_size: int = 384,
+        dino_graph_deep2_grid_size: int = 32,
+        dino_graph_deep2_num_eigvecs: int = 10,
+        dino_graph_deep2_proj_channels: int = 32,
+        dino_graph_deep2_feat_channels: int = 1024,
+        dino_graph_deep2_chunk_size: int = 8,
+        use_dino_graph_decoder_prior: bool = False,
+        dino_prior_input_size: int = 384,
+        dino_prior_grid_size: int = 32,
+        dino_prior_num_eigvecs: int = 10,
+        dino_prior_chunk_size: int = 8,
+        use_dino_graph_bayesian_prior: bool = False,
+        dino_bayes_input_size: int = 384,
+        dino_bayes_grid_size: int = 32,
+        dino_bayes_num_eigvecs: int = 10,
+        dino_bayes_temperature: float = 1.0,
+        dino_bayes_chunk_size: int = 8,
         **kwargs,
     ):
         super().__init__(args, **kwargs)
@@ -162,14 +375,154 @@ class RCFDinoModel(RCFModel):
         # Slot for mask logits captured during forward_train
         self._captured_mask_logits: Optional[torch.Tensor] = None
 
+        # DINO graph-partitioning fusion (discussed 260730) -- reuses self.dino
+        # (same frozen weights as loss_dino, called at a different resolution).
+        self.dino_graph_fusion_head = None
+        if use_dino_graph_fusion:
+            from models.dino_graph_fusion import DinoGraphFusionHead
+            self.dino_graph_fusion_head = DinoGraphFusionHead(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                feat_channels=dino_graph_feat_channels,
+                dino_input_size=dino_graph_input_size,
+                grid_size=dino_graph_grid_size,
+                num_eigvecs=dino_graph_num_eigvecs,
+                proj_channels=dino_graph_proj_channels,
+                chunk_size=dino_graph_chunk_size,
+            )
+
+        # DINO graph E-step fusion (discussed 260730, models/
+        # dino_graph_estep_fusion.py) -- separate mechanism, separate
+        # attribute, separate config namespace from dino_graph_fusion_head
+        # above; deliberately does not share any state with it.
+        self.dino_graph_estep_fusion_head = None
+        if use_dino_graph_estep_fusion:
+            from models.dino_graph_estep_fusion import DinoGraphEStepFusion
+            self.dino_graph_estep_fusion_head = DinoGraphEStepFusion(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                dino_input_size=dino_graph_estep_input_size,
+                grid_size=dino_graph_estep_grid_size,
+                num_eigvecs=dino_graph_estep_num_eigvecs,
+                chunk_size=dino_graph_estep_chunk_size,
+                temperature=dino_graph_estep_temperature,
+                alpha=dino_graph_estep_alpha,
+            )
+
+        # DINO graph fusion at feat3 instead of feat0 (discussed 260730) --
+        # reuses the exact same DinoGraphFusionHead class as
+        # dino_graph_fusion_head above (same zero-init no-op property), just
+        # a second instance targeting the deep/semantic scale instead of the
+        # shallow/boundary scale. Separate attribute, separate hook.
+        self.dino_graph_fusion_deep_head = None
+        if use_dino_graph_fusion_deep:
+            from models.dino_graph_fusion import DinoGraphFusionHead
+            self.dino_graph_fusion_deep_head = DinoGraphFusionHead(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                feat_channels=dino_graph_deep_feat_channels,
+                dino_input_size=dino_graph_deep_input_size,
+                grid_size=dino_graph_deep_grid_size,
+                num_eigvecs=dino_graph_deep_num_eigvecs,
+                proj_channels=dino_graph_deep_proj_channels,
+                chunk_size=dino_graph_deep_chunk_size,
+            )
+
+        # DINO graph BAYESIAN prior (discussed 260811) -- distinct mechanism
+        # from dino_graph_fusion_deep_head above: instead of concatenating
+        # eigenvectors into a mid-network feature (feat3) and letting later
+        # conv/ASPP layers implicitly reprocess them, this computes a genuine
+        # categorical prior P(channel | DINO eigenvectors) directly (soft
+        # distance to learnable centroids in eigenvector-embedding space,
+        # mirroring the paper's own K-Means-on-eigenvectors recipe) and adds
+        # its log-probability straight onto decode_head2's raw mask logits
+        # at the decision layer -- see models/dino_graph_bayesian_prior.py's
+        # docstring for the full design and paper grounding. Separate
+        # attribute/hook, not intended to be combined with
+        # dino_graph_fusion_deep_head in the same config (both target the
+        # same decision, via different mechanisms -- comparing them, not
+        # stacking them).
+        self.dino_graph_bayesian_prior_head = None
+        if use_dino_graph_bayesian_prior:
+            from models.dino_graph_bayesian_prior import DinoGraphBayesianPrior
+            self.dino_graph_bayesian_prior_head = DinoGraphBayesianPrior(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                num_classes=self.mask_layer,
+                dino_input_size=dino_bayes_input_size,
+                grid_size=dino_bayes_grid_size,
+                num_eigvecs=dino_bayes_num_eigvecs,
+                prior_temperature=dino_bayes_temperature,
+                chunk_size=dino_bayes_chunk_size,
+            )
+
+        # DINO graph attention-gate fusion at feat3 (discussed 260801,
+        # models/dino_graph_attention_gate.py) -- alternative fusion TYPE to
+        # dino_graph_fusion_deep_head above (concat-based), same feat3
+        # injection point. Separate attribute, separate hook -- not intended
+        # to be enabled together with use_dino_graph_fusion_deep.
+        self.dino_graph_attention_gate_head = None
+        if use_dino_graph_attention_gate:
+            from models.dino_graph_attention_gate import DinoGraphAttentionGate
+            self.dino_graph_attention_gate_head = DinoGraphAttentionGate(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                feat_channels=dino_graph_gate_feat_channels,
+                dino_input_size=dino_graph_gate_input_size,
+                grid_size=dino_graph_gate_grid_size,
+                num_eigvecs=dino_graph_gate_num_eigvecs,
+                gate_hidden_channels=dino_graph_gate_hidden_channels,
+                chunk_size=dino_graph_gate_chunk_size,
+            )
+
+        # DINO graph fusion at feat2, a SECOND independent injection point
+        # on top of feat3 (discussed 260801, multi-scale injection) -- reuses
+        # DinoGraphFusionHead unchanged, same zero-init no-op property.
+        # Separate attribute, separate hook -- meant to be combined with
+        # use_dino_graph_fusion_deep (feat3) in the same config.
+        self.dino_graph_fusion_deep2_head = None
+        if use_dino_graph_fusion_deep2:
+            from models.dino_graph_fusion import DinoGraphFusionHead
+            self.dino_graph_fusion_deep2_head = DinoGraphFusionHead(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                feat_channels=dino_graph_deep2_feat_channels,
+                dino_input_size=dino_graph_deep2_input_size,
+                grid_size=dino_graph_deep2_grid_size,
+                num_eigvecs=dino_graph_deep2_num_eigvecs,
+                proj_channels=dino_graph_deep2_proj_channels,
+                chunk_size=dino_graph_deep2_chunk_size,
+            )
+
+        # DINO graph eigenvector extraction for decoder-stage injection
+        # (discussed 260801, models/dino_graph_eigvec_extractor.py) -- NO
+        # trainable params here; the fusion module lives inside decode_head2
+        # itself (MultiScaleSegHeadDecoderPrior). Separate attribute,
+        # separate hook.
+        self.dino_graph_eigvec_extractor = None
+        if use_dino_graph_decoder_prior:
+            from models.dino_graph_eigvec_extractor import DinoGraphEigvecExtractor
+            self.dino_graph_eigvec_extractor = DinoGraphEigvecExtractor(
+                dino=self.dino,
+                dino_patch_size=dino_patch_size,
+                dino_input_size=dino_prior_input_size,
+                grid_size=dino_prior_grid_size,
+                num_eigvecs=dino_prior_num_eigvecs,
+                chunk_size=dino_prior_chunk_size,
+            )
+
     # ------------------------------------------------------------------ #
     # Capture mask logits (same pattern as RCFTissueModel)                #
     # ------------------------------------------------------------------ #
-    def _decode_head_forward(self, x, decode_head, flow_feat=None):
+    def _decode_head_forward(self, x, decode_head, flow_feat=None, stem_feat=None, dino_eigvecs=None):
+        kwargs = {}
         if flow_feat is not None:
-            pred = decode_head.forward(x, flow_feat=flow_feat)
-        else:
-            pred = decode_head.forward(x)
+            kwargs['flow_feat'] = flow_feat
+        if stem_feat is not None:
+            kwargs['stem_feat'] = stem_feat
+        if dino_eigvecs is not None:
+            kwargs['dino_eigvecs'] = dino_eigvecs
+        pred = decode_head.forward(x, **kwargs)
         if self.training and decode_head is self.decode_head2:
             self._captured_mask_logits = pred          # [B*I, C, H, W]
         return pred

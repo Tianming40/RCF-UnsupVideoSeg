@@ -1,0 +1,316 @@
+# rcf_cmc_grasp0_tissue_ft_v155.yaml
+#
+# v155 = v102 (this project's all-time champion, 139.77/140.12 sum) +
+# MultiScaleSegHeadDecoderPrior (models/multi_scale_seg_head_decoder_prior.py,
+# new file), discussed 260801 -- "Decoder阶段注入" (decoder-stage injection),
+# a THIRD distinct injection POINT (not just fusion type) alongside v146/
+# v149 (encoder-side, fuse into backbone2's feat0/feat3, BEFORE decode_head2
+# runs) and v153 (attention-gate, also encoder-side at feat3).
+#
+# Motivation ("Eigen其实更像mask prior...很多医学论文都会在decoder阶段加入
+# shape prior", discussed 260801): v146/v149/v153 all inject the eigenvector
+# signal into a backbone2 feature, which then flows through decode_head2's
+# OWN multi-scale fusion (Step 1-2: proj1(feat1)+proj2(feat2)+proj3(feat3),
+# then ASPP) before reaching any decision. This instead injects AFTER that
+# fusion (right after Step 3's bilinear upsample to feat0's resolution, via
+# the new _inject_decoder_prior hook added to MultiScaleSegHead.
+# forward_features -- a small, behaviour-preserving refactor: base class
+# default is a no-op, only this subclass overrides it) -- treating the
+# eigenvectors more literally as a shape/mask prior added onto the network's
+# own near-final multi-scale decision, closer to how many medical
+# segmentation papers add a shape prior at the decoder rather than the
+# encoder. Different tradeoff from the encoder-side lines: less opportunity
+# for the signal to be deeply integrated into semantic reasoning (Step 1-2
+# never sees it), but also less opportunity for it to be diluted by that
+# same processing.
+#
+# Mechanism split across two pieces (see their docstrings for full detail):
+#   - models/dino_graph_eigvec_extractor.py's DinoGraphEigvecExtractor:
+#     extraction-ONLY (frozen DINO -> affinity -> Laplacian -> eigh), NO
+#     trainable params, built in RCFDinoModel (use_dino_graph_decoder_prior
+#     toggle) and passed into decode_head2 as an extra dino_eigvecs kwarg.
+#   - models/multi_scale_seg_head_decoder_prior.py's
+#     MultiScaleSegHeadDecoderPrior: owns the trainable fusion module
+#     (eig_proj + fuse_conv, operating at mid_channels=256 and H/4
+#     resolution -- NOT feat3's 2048ch/H/8), fuse_conv's last layer zero-
+#     initialized, same "exact no-op at init" property as every other
+#     DINO-graph mechanism this session.
+#
+# dino_prior_num_eigvecs is set identically in BOTH model_kwargs (extractor
+# side) and decode_head2 (fusion module side) -- these are configured
+# independently and MUST match (fusion module's input channel count).
+#
+# use_dino_graph_decoder_prior=True (+ decode_head2.type change, + its
+# dino_prior_* params) is the only behavioural difference from v102; every
+# other setting below is byte-identical to v102 -- see
+# rcf_cmc_grasp0_tissue_ft_v102.yaml for that history. NOT combined with
+# v146/v149/v153's encoder-side injections in this config -- tests the
+# decoder-stage injection POINT in isolation against the plain v102 baseline.
+# ────────────────────────────────────────────────────────────────────────
+#
+# v102 = v83 + GT flow downsample mode: bilinear → area
+#
+# Changes vs v83:
+#   model_kwargs.gt_flow_downsample_mode: bilinear → area
+#
+# GT flow is downsampled from crop resolution (384x384) to mask_size
+# (96x96, 4x reduction) before the warp loss. Bilinear interpolation blends
+# instrument-boundary motion vectors with surrounding background motion
+# AT THE DOWNSAMPLE STEP ITSELF, before boundary_dilation/floor even get a
+# chance to weight anything — for a target that occupies ~1% of frame area,
+# this dilutes exactly the pixels v83's supervision-density mechanism is
+# built to preserve. 'area' (box/average pooling — the more standard choice
+# for *downsampling* specifically; bilinear is more natural for upsampling)
+# is tested here as the isolated single-variable alternative.
+# New model-level `gt_flow_downsample_mode` param (models/rcf_model.py,
+# default 'bilinear' so all other configs are unaffected); only the GT-flow
+# resize call site in forward_train uses it — mask/pred-flow resizing
+# elsewhere is untouched. No other v83 setting touched.
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v155
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFSoftTissueModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_5_10_merged
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: true
+  flow_suffix:  "_NewCT"
+  flow_suffix2: "_NewCT"
+  flow_suffix3: "_NewCT"
+  split: ImageSets/train_g0379_g5601_g10601_clean.txt
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 1
+  load_flow: false
+  split: ImageSets/val.txt
+  zero_ann: false
+
+val_dataset_list:
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_instrument
+    split: ImageSets/val.txt
+    name: instrument
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_deinterlaced/eval_tissue
+    split: ImageSets/val.txt
+    name: tissue
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]       # ← matches MultiScaleSegHead output resolution, no interpolation needed
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  # ── DINO graph eigenvector extraction for decoder-stage injection (new,
+  # 260801) -- extraction only, no trainable params here; fusion module
+  # lives inside decode_head2 below (MultiScaleSegHeadDecoderPrior)
+  use_dino_graph_decoder_prior: true
+  dino_prior_input_size: 384      # same validated config as v146/v149
+  dino_prior_grid_size: 32        # (saved/edge_test_260729/spectral_test.jpg)
+  dino_prior_num_eigvecs: 10      # MUST match decode_head2.dino_prior_num_eigvecs below
+  dino_prior_chunk_size: 8        # peak-memory control only
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadWithResidualV2
+    topk: 4
+    boundary_threshold: 0.1745
+    boundary_dilation: 15
+    boundary_floor: 0.1
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]     # ← aligned with mask_size
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  # ── New segmentation head (decoder-stage DINO prior injection) ─────────
+  decode_head2:
+    type: MultiScaleSegHeadDecoderPrior
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]   # feat0, feat1, feat2, feat3
+    fuse_dilation: 6        # ignored when use_aspp=true
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+    dino_prior_num_eigvecs: 10     # MUST match model_kwargs.dino_prior_num_eigvecs above
+    dino_prior_hidden_channels: 32
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

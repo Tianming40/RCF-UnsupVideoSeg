@@ -1000,6 +1000,112 @@ class ResolutionAwareCrop:
         return f"ResolutionAwareCrop(configs={self.configs})"
 
 
+class ResolutionAwareResize:
+    """Eval-time counterpart to ResolutionAwareCrop -- resize only, no crop.
+
+    New (260810), opt-in via test_transform_kwargs.resolution_resize_configs
+    (None by default -- every existing config's eval path is byte-identical
+    unless this is explicitly set, see Transform.__init__ below).
+
+    Motivation: Transform's default eval resize (`Resize(img_scale=(9999,
+    resize_short), ratio_range=(0.98, 0.98))`) uses ONE fixed target short
+    side for every source resolution. Training's ResolutionAwareCrop instead
+    branches by the image's OWN short side (576p sources -> resize_short
+    400; 1080p sources -> resize_short 576), because 1080p source pixels are
+    "denser" (less real detail per pixel after the sensor's own downscale)
+    -- a single universal eval target short side of ~392 was verified
+    (260810 discussion) to under-resize 1080p sources relative to what the
+    model was trained on: train sees 1080p objects at ~576/1080=0.53x scale,
+    eval was shrinking them further to ~392/1080=0.36x -- a real ~1.47x
+    scale mismatch, while 576p sources (400 vs 392 target) had almost none.
+
+    This class mirrors ResolutionAwareCrop's per-image branching logic but
+    skips the RandomCrop step (eval covers the whole resized image via
+    sliding-window instead of a single random crop) and uses a FIXED ratio
+    (not train's randomized 0.96-1.0 augmentation range) for determinism.
+
+    configs: same list-of-dict format as ResolutionAwareCrop's `configs`
+    (only `max_short_side`/`resize_short` keys are read here; `crop_size`/
+    `split_wide`/`half_crop` are ignored if present, since there's no crop).
+    """
+    def __init__(self, configs, ratio=0.98):
+        self.configs = sorted(configs, key=lambda c: c['max_short_side'])
+        self.ratio = ratio
+
+    def __call__(self, results):
+        h, w = results['img'][0].shape[:2]
+        short = min(h, w)
+        cfg = self.configs[-1]
+        for c in self.configs:
+            if short <= c['max_short_side']:
+                cfg = c
+                break
+        r = self.ratio
+        return Resize(img_scale=(9999, cfg['resize_short']), ratio_range=(r, r))(results)
+
+    def __repr__(self):
+        return f"ResolutionAwareResize(configs={self.configs}, ratio={self.ratio})"
+
+
+class MultiScaleCrop:
+    """Resize + RandomCrop with a WIDE random scale range, applied uniformly
+    regardless of source resolution -- no per-resolution branching.
+
+    New (260810), opt-in via train_transform_kwargs.multiscale_crop_config
+    (None by default -- every existing config's train path is byte-
+    identical unless this is explicitly set; takes priority over
+    resolution_crop_configs if both happen to be set, see Transform.
+    __init__ below).
+
+    Motivation ("思路3", discussed 260810): ResolutionAwareCrop branches by
+    the image's OWN short side (576p sources -> resize_short 400, 1080p
+    sources -> resize_short 576, each with only a narrow ±4% jitter via the
+    hardcoded ratio_range=(0.96,1.0)) -- this makes training's *effective*
+    object scale depend on source resolution in a way eval doesn't
+    automatically match (verified 260810: matching eval's resize to train's
+    branching made v102's champion checkpoint WORSE, 140.19->133.16 sum --
+    because that checkpoint's own per-epoch validation, and therefore its
+    top-3 selection, was itself always run under the OLD fixed eval scale;
+    swapping eval scale post-hoc without retraining just breaks that
+    calibration instead of fixing anything).
+
+    Rather than trying to hand-match one exact eval scale (fragile -- any
+    future eval-side change re-breaks it), this instead widens the
+    TRAINING scale distribution enough to cover whatever reasonable eval
+    scale ends up being used, so the model is scale-robust rather than
+    scale-calibrated to one specific number. Standard "multi-scale
+    training" recipe (Detectron2/YOLO-style scale jitter), applied here as
+    a single continuous ratio_range (not resolution-gated) instead of two
+    fixed branch points.
+
+    Args:
+        resize_short (int): centre target short side before ratio jitter.
+        ratio_range (tuple[float]): (min_ratio, max_ratio) multiplied onto
+            resize_short -- e.g. resize_short=480, ratio_range=(0.73, 1.25)
+            gives an effective target short side range of ~350-600, which
+            spans both branches ResolutionAwareCrop used (384-400 for 576p,
+            553-576 for 1080p) plus margin on both ends.
+        crop_size (list[int]): [h, w], same fixed crop size regardless of
+            the randomly-drawn resize scale -- every sample is still
+            exactly crop_size after this transform, so no batching/padding
+            complication (unlike ResolutionAwareCrop, this doesn't need
+            ResolutionGroupedBatchSampler).
+    """
+    def __init__(self, resize_short, ratio_range, crop_size):
+        self.resize_short = resize_short
+        self.ratio_range = tuple(ratio_range)
+        self.crop_size = tuple(crop_size)
+
+    def __call__(self, results):
+        results = Resize(img_scale=(9999, self.resize_short), ratio_range=self.ratio_range)(results)
+        results = RandomCrop(crop_size=self.crop_size, cat_max_ratio=1.0)(results)
+        return results
+
+    def __repr__(self):
+        return (f"MultiScaleCrop(resize_short={self.resize_short}, "
+                f"ratio_range={self.ratio_range}, crop_size={self.crop_size})")
+
+
 class ResolutionGroupedBatchSampler(torch.utils.data.Sampler):
     """Batch sampler that groups samples by resolution and interleaves batches.
 
@@ -1096,13 +1202,16 @@ class Transform(object):
     """
     def __init__(self, training, strong_aug=False, has_flow=True, has_attn=False, has_pl=False,
                  scale_flow=False, test_crop_size=None, resolution_crop_configs=None,
-                 resize_short=400, crop_size=None):
+                 resize_short=400, crop_size=None, resolution_resize_configs=None,
+                 multiscale_crop_config=None):
         # v1 by default uses weak_aug
         self.training = training
         self.has_pl = has_pl
         normalize_kwargs = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
         if self.training:
-            if resolution_crop_configs:
+            if multiscale_crop_config:
+                resize_crop = [MultiScaleCrop(**multiscale_crop_config)]
+            elif resolution_crop_configs:
                 resize_crop = [ResolutionAwareCrop(resolution_crop_configs)]
             else:
                 _crop = tuple(crop_size) if crop_size else (384, 384)
@@ -1128,6 +1237,10 @@ class Transform(object):
             # AnnotationTransform so that both img and ann are resized together.
             if test_crop_size is not None:
                 test_resize = Resize(img_scale=tuple(test_crop_size), keep_ratio=False)
+            elif resolution_resize_configs is not None:
+                # Opt-in (260810): match train's ResolutionAwareCrop per-source-
+                # resolution resize target instead of one universal resize_short.
+                test_resize = ResolutionAwareResize(resolution_resize_configs)
             else:
                 test_resize = Resize(img_scale=(9999, resize_short), ratio_range=(0.98, 0.98))
             self.group_transform = transforms.Compose([

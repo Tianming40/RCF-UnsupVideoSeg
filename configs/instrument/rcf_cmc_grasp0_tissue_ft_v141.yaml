@@ -1,0 +1,409 @@
+# rcf_cmc_grasp0_tissue_ft_v141.yaml
+#
+# v141 = v140 + grasp10 data. ONLY the data changed (single-variable
+# isolation, per this project's established discipline -- v133 did the same
+# single-variable "+g10" test on v123's exact architecture without touching
+# anything else, and v134 repeated it on v130's). Architecture, losses,
+# topk, all model_kwargs are byte-identical to v140 below.
+#
+# CORRECTION (260728): originally built as v140(gap1-only)'s 2632 g0 pairs +
+# 500 g10. v140's first submission (job 506) collapsed (flow_raw -> ~0,
+# see v140.yaml's own CORRECTION note and rcf_selftaught_flow_model.py's
+# docstring for the full root-cause writeup) -- fixed there by reverting to
+# gap1+2+3 mixed data AND a baseline-relative reconstruction loss. This
+# config inherits BOTH fixes automatically (loss fix lives in the model
+# class; data fix means using v140's already-existing gap123-mix training
+# split as the g0 base instead of the gap1-only one this file originally
+# used).
+#
+# Training split: train_gap123_plus_g10500.txt (v140's own 6768 g0
+# gap1+2+3 pairs + 500 grasp10 pairs -- this exact file already existed,
+# built for v133/v134's "+g10" experiments, so no new split file was needed
+# once v140 itself moved to the gap123-mix base). The 500 g10 pairs have no
+# gap suffix in their directory name and were confirmed this session (same
+# as when v133/v134 built them) to all be a single fixed gap -- adding them
+# does not introduce a SECOND gap-mix variable on top of g0's gap1+2+3.
+#   - 0 overlap between the 500 g10 training cases and grasp10's own 101
+#     eval cases (val_paired_both101.txt) -- same leak-free 601-101 split
+#     established earlier this session's history for v133/v134.
+#   - 0 overlap between g0's 376 training-source cases and g0's 212 eval
+#     cases (already verified for v140 itself, unaffected by this change).
+#
+# Eval: v140's own 2 entries (g0 instrument/tissue, CMC_grasp0_continuous_bwdif,
+# val_paired.txt) kept UNCHANGED, plus 2 new entries for grasp10 (instrument/
+# tissue, CMC_grasp10_bwdif, val_paired_both101.txt, 101 both-annotated
+# cases) -- same 4-entries-total pattern v134 used, so g10's contribution can
+# be measured directly instead of only inferred from a combined g0 number.
+#
+# ────────────────────────────────────────────────────────────────────────
+# v140 = RAFT-free. Discussed at length 260728: bottleneck diagnosis this
+# session (script/diagnose_v102_bottleneck.py, run against v102's champion
+# checkpoint) found mask miss-rate on true foreground pixels correlates
+# strongly with RAFT's OWN cycle-consistency confidence (miss rate ~0.27-0.31
+# when RAFT confidence <0.6, vs 0.08 when confidence >=0.8 -- a 3x+ gap) --
+# i.e. RAFT's synthetic-data domain-transfer error (trained on FlyingChairs/
+# Sintel, applied to endoscopic low-light/specular/textureless footage) is a
+# BIGGER error source here than anything wrong with the ResNet appearance
+# features. This is also exactly the failure mode Instrument.pdf (Liu et al.,
+# the paper HQAM/LQCD/topk in this codebase are adapted from) built HQAM/LQCD
+# to defend against, from the opposite direction (restrict supervision to
+# where RAFT is trustworthy, rather than fix RAFT itself).
+#
+# Rather than trying to denoise/clean RAFT's output (the C-LaV-inspired
+# latent-denoising idea discussed earlier the same session, ultimately set
+# aside once this diagnosis pointed at the SUPERVISION signal, not the
+# ResNet representation, as the actual bottleneck), v140 removes RAFT from
+# the loop entirely: motion is learned end-to-end, jointly with mask, from
+# THIS dataset's own frame pairs via reconstruction -- it can never inherit
+# a domain gap it was never given. NO gt_fw_flows/gt_bw_flows are loaded
+# anywhere (train/test_dataset_kwargs.load_flow: false throughout).
+#
+# model_cls: RCFJointMaskV5SoftTissueModel -> RCFSelfTaughtFlowModel
+#   (models/rcf_selftaught_flow_model.py, new file). Subclasses
+#   RCFJointMaskV5SoftTissueModel UNCHANGED for the mask branch (joint_attn0..3,
+#   v138's LocalCorrelationCrossFrameAttention, cross-frame mask forward pass
+#   preserved exactly) -- ONLY the flow/motion side of the architecture
+#   changes. New:
+#     - LocalCorrelationFlowHeadBidirectional (models/local_correlation_flow_head.py):
+#       coarse-to-fine (coarse=feat2 1024ch/48x48, fine=feat0 256ch/96x96,
+#       PWC-Net-style warp-refine) soft-argmax flow estimator, reusing
+#       LocalCorrelationCrossFrameAttention's exact correlation mechanics
+#       (F.unfold local window, scaled dot-product, softmax) but reducing the
+#       softmax weights to an expected displacement instead of an aggregated
+#       feature. Deterministic single-pass regression (soft-argmax), NOT a
+#       generative/flow-matching ODE -- discussed and rejected earlier the
+#       same session: frame0->frame1 correspondence is assumed unique, not
+#       genuinely multimodal, so the stochastic/multi-step machinery buys
+#       nothing here.
+#     - Trained via reconstruction (loss_flow_recon: feature-space, warp
+#       feat0_j by flow vs feat0_i -- NOT pixel-space, since pixel-level
+#       brightness-constancy would inherit the exact same specular/low-light
+#       failure modes just diagnosed for RAFT), edge-aware smoothness
+#       (loss_flow_smooth: propagates reliable boundary-adjacent motion into
+#       low-texture tissue interior, the same class of region HQAM was
+#       protecting -- classic unsupervised-optical-flow regulariser, see
+#       utils/warp_utils.py:edge_aware_smoothness_loss, new), and
+#       forward-backward cycle consistency (loss_flow_cycle, reusing the
+#       exact warp formula _compute_cycle_conf already had, now as a loss
+#       instead of a confidence weight).
+#     - decode_head: FlowAggregationHeadWithResidualV2 -> FlowAggregationHeadRaftFree
+#       (models/flow_aggregation_head_raftfree.py, new file). Mechanically
+#       IDENTICAL (per-channel rigid+affine+residual motion fit, same
+#       aggregate_flow_with_residual/bg-affine-removal/topk) -- the only
+#       change is detect_flow_changes_batch's static boundary-angle detector
+#       is bypassed by an externally-supplied per-pixel confidence map,
+#       derived from the flow head's OWN reconstruction error (low error ->
+#       trustworthy -> full weight; high error -> down-weight) instead of a
+#       hand-tuned angle threshold -- dynamic and self-diagnosing, since the
+#       smoothness regulariser already changes the interior's reliability
+#       profile relative to RAFT's (see session discussion).
+#     - Fed into decode_head DETACHED (flow_raw.detach()): mask/decode_head
+#       must not be able to corrupt the flow estimate towards "whatever's
+#       easiest for the rigid+affine model to explain" -- same collapse
+#       concern discussed for the C-LaV latent-denoising idea earlier in the
+#       session (BYOL/SimSiam-style stop-gradient on the target side). Only
+#       loss_flow_recon/smooth/cycle train the flow head; only loss_warp_seg
+#       trains mask/decode_head.
+#     - topk (LQCD) KEPT, relaxed 4 -> 6 (per explicit decision, NOT removed):
+#       protects against a DIFFERENT failure mode (whole-frame content
+#       fundamentally uninterpretable -- lens obstruction, extreme blur,
+#       blood/smoke) that self-taught flow can't fix either, orthogonal to
+#       RAFT's domain-transfer problem this version targets.
+#
+# Unit-convention note (see rcf_selftaught_flow_model.py's docstring for the
+# full explanation): flow_raw comes out of the new flow head in feat0's OWN
+# 96x96-grid pixel units; decode_head's calibrated constants (clamp_flow_t,
+# residual_adjustment_scale, pred_div_coeff, all =10) were tuned against the
+# OLD convention (RAFT flow kept in crop-resolution units even after
+# spatial-only downsampling to mask_size) -- flow_raw is rescaled by feat0's
+# downsample factor (384/96=4) ONLY on the copy fed into decode_head, so
+# those constants stay meaningful unchanged; the native (unscaled) flow_raw
+# is what flow_warp/smoothness/cycle actually operate on.
+#
+# w_flow_recon/w_flow_smooth/w_flow_cycle/recon_conf_sigma are first-guess
+# defaults, UNVERIFIED against real loss-magnitude balance -- check relative
+# scale of loss_flow_recon vs loss_warp_seg during the pre-submission
+# verification pass and retune if wildly imbalanced, per this project's
+# established discipline (build small, verify forward+backward+gradients+
+# memory before submitting, never submit unverified).
+#
+# Data: gap1-ONLY, not v138's gap∈{1,2,3} random mix (explicit decision
+# 260728) -- CMC_grasp0_multigap_paired/train_multigap_gap1only.txt, 2632
+# exhaustive gap1 pairs (exploded pair-dirs, same convention v125/v131/
+# v133/v134 used), 7x more pairs than v138's 376-line mixed-gap split.
+# Isolates the RAFT-free change to gap1 (v102's dominant case, 70% of the
+# old random-gap draw) so results aren't conflated with a data-mix change.
+# Eval unchanged from v138: CMC_grasp0_continuous_bwdif, val_paired.txt
+# (2-frame). train_dataset_kwargs.load_flow: false throughout (flow files
+# are simply never read, RAFT-free).
+
+batch_size: 8
+val_batch_size: 1
+epochs: 80
+learning_rate: 1.e-4
+optimizer: Adam
+weight_decay: 1.e-4
+
+workers: 8
+
+checkpoints_dir: saved/grasp0_tissue_ft_v141
+pretrained_model: data/pretrained/densecl_r50_imagenet_200ep.pth
+model_cls: RCFSelfTaughtFlowModel
+
+eval_pos_th: 0.35
+eval_save: false
+use_sliding_window: true
+sliding_window_size: 384
+sliding_window_stride: 192
+eval_export: false
+export_all_seg: false
+
+disable_wandb: true
+allow_overwriting_checkpoints_dir: false
+
+train_transform_kwargs:
+  strong_aug: true
+  has_flow: false   # RAFT-free: load_flow=false means gt_fw_flows/gt_bw_flows
+                     # never exist in the sample dict -- FlowTransform (which
+                     # v138's config left implicitly on, has_flow defaults to
+                     # true) would KeyError trying to process a missing key.
+  resolution_crop_configs:
+    - max_short_side: 576
+      resize_short: 400
+      crop_size: [384, 384]
+    - max_short_side: 99999
+      resize_short: 576
+      crop_size: [384, 384]
+
+test_transform_kwargs:
+  strong_aug: false
+
+loss_log_interval: 10
+log_interval: 100
+
+object_channel: null
+set_object_channel_after_epoch: 0
+oracle_exclude_channels: []
+# gap1-only for this first RAFT-free run (explicit decision 260728: grasp0
+# has plenty of gap1 data -- CMC_grasp0_multigap_paired's exploded pair-dirs
+# convention, each directory a pre-materialized fixed-gap frame pair, same
+# data source v125/v131/v133/v134 used for their gap123-exhaustive splits).
+# Isolates the RAFT-free architecture change to the SAME gap distribution
+# v102's own most-common case (gap1 is 70% of the old random-gap mix), so
+# any result isn't conflated with a data-mix change too.
+data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_multigap_paired
+test_data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+dataset_kwargs: {}
+
+train_dataset_kwargs:
+  frame_num: 2
+  load_flow: false   # RAFT-free: flow files are never read
+  flow_suffix:  "_gap1"   # unused (load_flow: false) -- kept only to satisfy
+  flow_suffix2: "_gap2"   # VideoDataset's gap_options/gap_probabilities/
+  flow_suffix3: "_gap3"   # gap_flow_suffixes length-match assertion
+  split: ImageSets/train_gap123_plus_g10500.txt   # 6768 g0 gap1+2+3 + 500 g10 -- CORRECTION 260728, see header
+  zero_ann: false
+
+test_dataset_kwargs:
+  frame_num: 2
+  load_flow: false
+  split: ImageSets/val_paired.txt
+  zero_ann: false
+
+val_dataset_list:
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_instrument
+    split: ImageSets/val_paired.txt
+    name: instrument
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp0_continuous_bwdif/eval_tissue
+    split: ImageSets/val_paired.txt
+    name: tissue
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_instrument
+    split: ImageSets/val_paired_both101.txt
+    name: instrument_g10
+    frame_num: 2
+  - data_path: /media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_bwdif/eval_tissue
+    split: ImageSets/val_paired_both101.txt
+    name: tissue_g10
+    frame_num: 2
+
+lr_scheduler_kwargs:
+  power: 0.9
+  min_lr: 1.e-5
+
+saved_eval_dir_name: saved_eval
+
+trainer_kwargs:
+  check_val_every_n_epoch: 1
+  amp_backend: "native"
+  precision: 32
+  benchmark: true
+
+model_kwargs:
+  w_seg: 1.0
+  w_sharpen: 0
+  w_entropy: 0.0
+  separate_residual: true
+  mask_layer: 5
+  align_corners: false
+  mask_size: [96, 96]
+  allow_mask_resize: true
+  gt_flow_downsample_mode: area   # unused (no gt flow), kept for base-class compat
+  log_interval: 100
+
+  freeze_backbone: false
+  freeze_backbone_stages: 0
+  freeze_flow_head: false
+
+  # ── RAFT-free self-taught flow (new, v140) ──────────────────────────────
+  flow_proj_channels: 32
+  flow_coarse_radius: 4
+  flow_fine_radius: 3
+  w_flow_recon: 1.0
+  w_flow_smooth: 0.1
+  w_flow_cycle: 0.1
+  recon_conf_sigma: 0.5
+
+  w_dino: 0.1
+  dino_channels: null
+  dino_checkpoint: /home/tianming/.cache/torch/hub/checkpoints/dino_deitsmall8_300ep_pretrain.pth
+  dino_arch: vit_small
+  dino_patch_size: 8
+  dino_input_size: 128
+
+  instrument_channels: []
+  instrument_channel: 1
+  tissue_channel: 2
+  grasping_channel: 1
+  bg_channels: [0, 3, 4]
+  distill_channel: 1
+
+  w_rigid:      0.0
+  w_grasp_conv: 0.0
+  w_deform:     0.0
+  w_align:      0.0
+  w_motion:     0.0
+  motion_margin: 1.0
+  deform_margin: 0.5
+  min_grasp_frac: 0.005
+
+  w_grasp_flow: 0.0
+  w_dissect:    0.0
+  grasp_flow_min_mag: 0.5
+  dissect_sigma: 0.12
+
+  w_contact: 0.0
+  contact_dilation_r: 10
+  w_div_tissue: 0.0
+
+  w_rigid_tissue: 0.0
+
+  w_flow_cosine: 0.0
+  flow_cosine_temperature: 0.5
+  flow_cosine_diversity: 0.5
+
+  w_flow_tv: 0.0
+  flow_tv_K: 5
+  flow_tv_n_iter: 10
+  flow_tv_start_epoch: 5
+  flow_tv_push_margin: 0.3
+
+  w_flow_cluster_ce: 0.0
+  flow_cluster_ce_temperature: 0.3
+  flow_cluster_ce_diversity: 0.5
+  flow_cluster_ce_start_epoch: 0
+  flow_cluster_ce_max_iter: 300
+  flow_cluster_ce_color_weight: 0.0
+
+  w_flow_angle_ce: 0.0
+  flow_angle_ce_diversity: 0.0
+  w_flow_angle_outside: 0.0
+
+  w_flow_boundary_tv: 0.0
+  flow_boundary_tv_var_window: 13
+  flow_boundary_tv_alpha: 1.0
+
+  w_flow_bilateral_ce: 0.0
+  flow_bilateral_window: 15
+  flow_bilateral_sigma: 0.3
+
+  reset_non_instrument_heads: false
+  reset_full_decode_head: false
+
+  w_distill:    0.0
+  distill_mode: symmetric
+  teacher_ckpt: null
+
+  backbone2:
+    dilations: [1, 1, 2, 4]
+    strides: [1, 2, 1, 1]
+    type: ResNet
+    depth: 50
+    num_stages: 4
+    out_indices: [0, 1, 2, 3]
+    norm_cfg: &id001
+      type: BN
+      requires_grad: true
+    norm_eval: false
+    style: pytorch
+    contract_dilation: true
+
+  decode_head:
+    ssim_sz: 1
+    create_flownet: true
+    mask_layer: 5
+    type: FlowAggregationHeadRaftFree
+    topk: 6   # relaxed from the historical 4, per explicit decision -- KEPT (not removed)
+    boundary_threshold: 0.1745   # unused (bypassed by external confidence), kept for compat
+    boundary_dilation: 15        # unused (bypassed by external confidence), kept for compat
+    boundary_floor: 0.1          # unused (bypassed by external confidence), kept for compat
+    flow_feat_before_agg_kernel_size: 3
+    num_flow_feat_channels: 64
+    mask_size: [96, 96]
+    norm_flow: false
+    clamp_flow_t: 10.
+    free_residual: false
+    free_residual_with_affine: true
+    free_scale: false
+    outlier_robust_loss: false
+    eps: 0.01
+    q: 0.4
+    allow_residual_resize: true
+    residual_adjustment_scale: 10.
+    pred_div_coeff: 10.
+
+    use_bg_affine_removal: true
+
+  decode_head2:
+    type: MultiScaleSegHeadJoint4
+    num_classes: 5
+    mid_channels: 256
+    feat_channels: [256, 512, 1024, 2048]
+    fuse_dilation: 6
+    use_aspp: true
+    aspp_rates: [6, 12, 18]
+    dropout_ratio: 0.1
+    align_corners: false
+    use_flow_feat: true
+    flow_in_channels: 64
+    feat1_joint_in_channels: 64
+    feat2_joint_in_channels: 64
+    feat3_joint_in_channels: 64
+
+  decode_head3:
+    concat_input: false
+    dilation: 6
+    channels: 256
+    type: FCNHead
+    in_channels: 4096
+    in_index: -1
+    num_convs: 2
+    dropout_ratio: 0.1
+    num_classes: 20
+    norm_cfg: *id001
+    align_corners: false
+    loss_decode:
+      type: CrossEntropyLoss
+      use_sigmoid: false
+      loss_weight: 1.0

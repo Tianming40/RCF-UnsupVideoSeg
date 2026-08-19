@@ -393,6 +393,94 @@ class Model(pl.LightningModule):
             result = F.softmax(result, dim=1)
         return result
 
+    def _sliding_window_eval_nearest(self, x, window_size=384, stride=192):
+        """
+        Alternative to _sliding_window_eval (discussed 260731): instead of
+        averaging softmax probabilities across overlapping windows, each
+        pixel is assigned WHOLESALE to whichever window's centre is nearest
+        -- no blending at all. Opt-in via sw_nearest_center=True (default
+        False -- exact prior behaviour for every config that doesn't set it).
+
+        Motivation: this project's mask channels have no fixed external
+        semantics (unsupervised, self-organised per forward pass -- see
+        main_tissue.py's validation_step, channel identity is only resolved
+        post-hoc via a greedy-union oracle against ground truth, which is
+        unavailable during inference). Averaging softmax probabilities
+        across two overlapping-but-distinct 384x384 crops implicitly assumes
+        "window A's channel k" and "window B's channel k" mean the same
+        thing -- an assumption training never enforces (BatchNorm stats and
+        conv boundary effects differ per crop). If two windows happen to
+        assign the same real object to different channels, averaging mixes
+        confident-but-disagreeing predictions into spurious uncertainty.
+        Hard nearest-centre assignment sidesteps this entirely by never
+        combining two windows' predictions for the same pixel -- the same
+        principle as the original U-Net paper's "overlap-tile" strategy
+        (keep only each tile's well-contextualised centre, discard the
+        truncated-receptive-field edges), just implemented via nearest-
+        centre partitioning instead of a fixed centre-crop margin.
+
+        Because window positions form a regular 1D grid along each axis
+        independently (_positions()), the "nearest centre" assignment
+        reduces to non-overlapping rectangular regions -- the boundary
+        between two adjacent windows is simply the midpoint between their
+        centres. No per-pixel distance computation needed.
+        """
+        imgs = torch.stack(x['imgs'], dim=1)   # [B, im_num, C, H, W]
+        B, im_num, C, H, W = imgs.shape
+
+        mask_layer = self.args.model_kwargs['mask_layer']
+        result = torch.zeros(B, mask_layer, H, W, device=imgs.device)
+
+        def _positions(length):
+            if length <= window_size:
+                return [0]
+            pts = list(range(0, length - window_size, stride))
+            if not pts or pts[-1] + window_size < length:
+                pts.append(length - window_size)
+            return sorted(set(pts))
+
+        def _assign_bounds(positions, length):
+            # midpoint-of-centres partition -> [lo, hi) region each window owns
+            centers = [p + window_size / 2.0 for p in positions]
+            bounds = []
+            for i, p in enumerate(positions):
+                lo = 0 if i == 0 else int(round((centers[i - 1] + centers[i]) / 2.0))
+                hi = length if i == len(positions) - 1 else int(round((centers[i] + centers[i + 1]) / 2.0))
+                bounds.append((lo, hi))
+            return bounds
+
+        ys, xs = _positions(H), _positions(W)
+        y_bounds, x_bounds = _assign_bounds(ys, H), _assign_bounds(xs, W)
+
+        eval_on_ema = getattr(self.model, 'eval_on_ema', False)
+        backbone = self.model.backbone2_ema if eval_on_ema else self.model.backbone2
+        head     = self.model.decode_head2_ema if eval_on_ema else self.model.decode_head2
+
+        for yi, y in enumerate(ys):
+            for xi, xp in enumerate(xs):
+                y2, x2 = min(y + window_size, H), min(xp + window_size, W)
+                crop = imgs[:, :, :, y:y2, xp:x2]
+                ch, cw = crop.shape[-2], crop.shape[-1]
+                if ch < window_size or cw < window_size:
+                    crop = F.pad(crop, (0, window_size - cw, 0, window_size - ch))
+
+                img3 = crop.view(B * im_num, C, window_size, window_size)
+                feat = self.model.extract_feat(img3, backbone)
+                pred = self.model._decode_head_forward(feat, head)
+                pred = pred.view(B, im_num, mask_layer, *pred.shape[-2:])
+                pred = F.softmax(pred, dim=2)[:, 0]   # [B, C, fH, fW]
+                pred = F.interpolate(pred, size=(window_size, window_size),
+                                     mode='bilinear', align_corners=False)
+
+                y_lo, y_hi = y_bounds[yi]
+                x_lo, x_hi = x_bounds[xi]
+                # translate this window's owned global region into its own local crop coords
+                ly_lo, ly_hi = y_lo - y, y_hi - y
+                lx_lo, lx_hi = x_lo - xp, x_hi - xp
+                result[:, :, y_lo:y_hi, x_lo:x_hi] = pred[:, :, ly_lo:ly_hi, lx_lo:lx_hi]
+
+        return result
+
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
         # We use max IoU channel in validation to be fast.
@@ -416,7 +504,10 @@ class Model(pl.LightningModule):
         if getattr(self.args, 'use_sliding_window', False):
             sw_size   = getattr(self.args, 'sliding_window_size', 384)
             sw_stride = getattr(self.args, 'sliding_window_stride', sw_size // 2)
-            pred_masks_current_batch = self._sliding_window_eval(x, sw_size, sw_stride)
+            if getattr(self.args, 'sw_nearest_center', False):
+                pred_masks_current_batch = self._sliding_window_eval_nearest(x, sw_size, sw_stride)
+            else:
+                pred_masks_current_batch = self._sliding_window_eval(x, sw_size, sw_stride)
             # forward_eval was not called → no pending viz; disable eval_save for this step
             if hasattr(self.model, '_pending_eval_viz'):
                 self.model._pending_eval_viz = None
@@ -735,6 +826,14 @@ class Model(pl.LightningModule):
         return [optimizer], [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)]
 
     def on_train_epoch_start(self):
+        # RCFModel is a plain nn.Module (not a LightningModule), so it has no
+        # current_epoch of its own -- forward_train's EMA-bg-mask warm-up
+        # gate (discussed 260811, use_ema_bg_mask) needs to know the epoch,
+        # same "stash it on self.model" pattern as this method already uses
+        # for progressive_unfreeze below. Harmless when unused: nothing reads
+        # this attribute unless use_ema_bg_mask=True is explicitly set.
+        self.model.current_epoch = self.current_epoch
+
         schedule = getattr(self.args, 'progressive_unfreeze', None)
         if schedule:
             epoch = self.current_epoch

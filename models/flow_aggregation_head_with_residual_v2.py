@@ -230,6 +230,9 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
                  affine_order: int = 1,
                  use_bg_affine_removal: bool = False,
                  bg_removal_affine: bool = False,
+                 bg_affine_irls_iters: int = 0,
+                 bg_affine_irls_eps: float = 1e-6,
+                 use_ema_bg_mask: bool = False,
                  use_per_channel_residual_scale: bool = False,
                  use_heteroscedastic_loss: bool = False,
                  use_flow_metric_loss: bool = False,
@@ -239,6 +242,7 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
                  use_em_consistency_loss: bool = False,
                  em_consistency_weight: float = 0.1,
                  em_consistency_temperature: float = 1.0,
+                 em_consistency_use_boundary_weight: bool = False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         assert topk >= 1, "topk must be >= 1"
@@ -270,6 +274,33 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         self.topk_scale_normalize = topk_scale_normalize
         self.use_bg_affine_removal = use_bg_affine_removal
         self.bg_removal_affine = bg_removal_affine
+        # IRLS-robustified _estimate_bg_flow_affine (discussed 260801).
+        # 0 (default) => exact prior behaviour, a single plain-OLS fit
+        # (bg_affine_irls_iters is never even read) -- zero-behaviour-change
+        # for v79 (the only existing config with bg_removal_affine=True) or
+        # any other config that doesn't explicitly opt in.
+        self.bg_affine_irls_iters = bg_affine_irls_iters
+        self.bg_affine_irls_eps = bg_affine_irls_eps
+
+        # EMA-teacher-mask-weighted background fit (discussed 260811).
+        # _estimate_bg_flow_affine's plain-OLS and IRLS variants both fit the
+        # background affine model with NO knowledge of instrument identity --
+        # IRLS only downweights by RESIDUAL MAGNITUDE post-hoc, which cannot
+        # distinguish "this pixel is instrument" from "this pixel is some
+        # other real motion (tissue deformation)", and neither variant
+        # excludes the instrument's INTERIOR (a rigidly-translating
+        # instrument has smooth internal flow -- no residual spike there
+        # relative to its own motion, only at its silhouette edge). An EMA
+        # teacher's own instrument-channel prediction (see rcf_model.py's
+        # forward_train, set_ema_bg_weights below) gives a semantic, whole-
+        # silhouette signal instead of a residual-magnitude proxy. Default
+        # False / self._ema_bg_weight_fw|bw stay None -> _bg_flow's
+        # exclude_weight stays None -> _estimate_bg_flow_affine's base_weight
+        # is the original all-ones tensor -> zero behaviour change for every
+        # config that doesn't opt in.
+        self.use_ema_bg_mask = use_ema_bg_mask
+        self._ema_bg_weight_fw = None
+        self._ema_bg_weight_bw = None
 
         # affine_order=1 (default): exactly the parent's linear demeaned
         # affine model (2x2 A, closed-form 2x2 inverse — see
@@ -359,6 +390,12 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         self.use_em_consistency_loss = use_em_consistency_loss
         self.em_consistency_weight = em_consistency_weight
         self.em_consistency_temperature = em_consistency_temperature
+        # discussed 260811: default False reproduces the exact prior
+        # behaviour (uniform spatial mean) -- see _em_consistency_loss's
+        # boundary_weight docstring for why True makes this loss agree with
+        # warp_seg's own boundary_dilation/floor weighting instead of
+        # disagreeing with it.
+        self.em_consistency_use_boundary_weight = em_consistency_use_boundary_weight
 
         # coord_map is created by parent as a plain .cuda() tensor attribute
         # (not register_buffer), which causes CUDA illegal memory access when
@@ -438,6 +475,20 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         flag_tensor = flag_tensor.view(-1, 1, 1, 1)
         return torch.where(flag_tensor, mask.detach(), mask)
 
+    def set_ema_bg_weights(self, weight_fw, weight_bw):
+        """
+        Called by rcf_model.py's forward_train (hasattr-guarded, mirrors the
+        existing set_agg_mask_weights/set_external_weights pattern used by
+        FlowAggregationHeadGraphMotion/FlowAggregationHeadImageBoundary) right
+        before self.decode_head(...) is invoked. weight_fw/weight_bw: [B,1,H,W]
+        background-confidence (1 - EMA instrument-channel probability), same
+        resolution as gt_fw_flow/gt_bw_flow at mask_size. Consumed once by the
+        next forward() call and reset to None immediately after (single-use,
+        same discipline as the graph-motion weight setter).
+        """
+        self._ema_bg_weight_fw = weight_fw
+        self._ema_bg_weight_bw = weight_bw
+
     @staticmethod
     def _estimate_bg_flow(flow):
         """
@@ -449,7 +500,7 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         bg, _ = flow.view(B, 2, -1).median(dim=-1)
         return bg.view(B, 2, 1, 1)
 
-    def _estimate_bg_flow_affine(self, flow):
+    def _estimate_bg_flow_affine(self, flow, exclude_weight=None):
         """
         Global affine background fit: bg(x,y) = A·(x,y) + b (6 params).
         Captures camera rotation/zoom that the median (translation-only)
@@ -460,18 +511,76 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         bg estimate we must add the translation back; we use the spatial
         median (robust to instrument outliers, matches the v73 estimator,
         and reduces exactly to it when A≈0).
-        Not robust to instrument pixels biasing A, but the instrument
-        covers a small frame fraction so the bias is modest.
+
+        exclude_weight (new, discussed 260811, [B,1,H,W] or None): starting
+        per-pixel fit weight, e.g. an EMA teacher's (1 - instrument_prob)
+        background confidence (see set_ema_bg_weights). None (default)
+        reproduces the exact prior behaviour (all-ones starting weight) --
+        zero behaviour change for every config that doesn't opt in. When
+        IRLS is also enabled (bg_affine_irls_iters>0), IRLS's residual-based
+        reweighting is APPLIED ON TOP of exclude_weight (multiplicatively)
+        instead of starting from all-ones -- the EMA signal gives a semantic
+        "this is probably instrument, covering its whole silhouette" prior,
+        IRLS still refines further within that prior based on residuals.
+
+        bg_affine_irls_iters=0 (default): the A matrix is fit via a single
+        PLAIN OLS pass (all pixels weighted equally, or by exclude_weight if
+        given) -- NOT robust to instrument pixels biasing A on its own,
+        though the instrument covers a small frame fraction so the bias is
+        modest. Exact prior behaviour, unchanged, when this param is 0 AND
+        exclude_weight is None (every existing config incl. v79, the only
+        one with bg_removal_affine=True before this session).
+
+        bg_affine_irls_iters>0 (discussed 260801, e.g. v151): IRLS
+        (Iteratively Reweighted Least Squares) -- refit the SAME weighted
+        affine solver (_demean_affine_flow_per_channel, already generic over
+        arbitrary per-pixel weights) several times, each round downweighting
+        pixels with large residual under the previous round's fit
+        (Gaussian/Geman-McClure-style soft weight: w = exp(-0.5*(r/sigma)^2),
+        sigma estimated per-sample via a robust MAD of residuals, no fixed
+        magnitude threshold to hand-tune). A few rounds converge to a fit
+        dominated by the majority (background) pixels -- same "instrument is
+        a minority" assumption the median-based translation estimate already
+        relies on, now extended to the rotation/scale/shear part too. This
+        entire function operates on GT flow (no gradient needed either way,
+        cheap to iterate), same "frozen external signal" category as RAFT
+        flow / DINO features elsewhere in this project.
+
         Returns [B, 2, H, W].
         """
         B, _, H, W = flow.shape
-        ones = torch.ones(B, 1, H, W, device=flow.device, dtype=flow.dtype)
-        affine_demean = self.get_demean_affine_flow(ones, flow)      # A·(u-mu): [B,2,H,W]
-        translation = self._estimate_bg_flow(flow)                   # median:   [B,2,1,1]
+        translation = self._estimate_bg_flow(flow)                   # median:   [B,2,1,1], unchanged either way
+        base_weight = exclude_weight if exclude_weight is not None else \
+            torch.ones(B, 1, H, W, device=flow.device, dtype=flow.dtype)
+
+        if self.bg_affine_irls_iters <= 0:
+            affine_demean = self.get_demean_affine_flow(base_weight, flow)  # A·(u-mu): [B,2,H,W]
+            return affine_demean + translation
+
+        with torch.no_grad():
+            weight = base_weight
+            affine_demean = None
+            for _ in range(self.bg_affine_irls_iters):
+                # _demean_affine_flow_per_channel (not get_demean_affine_flow)
+                # -- the latter re-multiplies its output by the raw (here
+                # non-uniform) weight during its channel-collapse step, which
+                # is correct when weight IS the mask being classified against
+                # but wrong here: we want the affine MODEL's prediction at
+                # every pixel, not that prediction re-scaled by how much the
+                # pixel counted during fitting.
+                per_cls = self._demean_affine_flow_per_channel(weight, flow)   # [B,1,H,W,2]
+                affine_demean = per_cls[:, 0].permute(0, 3, 1, 2)              # [B,2,H,W]
+                pred = affine_demean + translation
+                residual = (flow - pred).norm(dim=1, keepdim=True)            # [B,1,H,W]
+                med = residual.flatten(1).median(dim=1).values.view(B, 1, 1, 1)
+                mad = (residual - med).abs().flatten(1).median(dim=1).values.view(B, 1, 1, 1)
+                sigma = (1.4826 * mad).clamp(min=self.bg_affine_irls_eps)
+                weight = base_weight * torch.exp(-0.5 * (residual / sigma) ** 2)
+
         return affine_demean + translation
 
-    def _bg_flow(self, flow):
-        return (self._estimate_bg_flow_affine(flow) if self.bg_removal_affine
+    def _bg_flow(self, flow, exclude_weight=None):
+        return (self._estimate_bg_flow_affine(flow, exclude_weight=exclude_weight) if self.bg_removal_affine
                 else self._estimate_bg_flow(flow))
 
     def _flow_metric_loss(self, mask, flow):
@@ -581,7 +690,7 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
 
         return per_channel.permute(0, 2, 1, 3, 4)  # [B, C, 2, H, W]
 
-    def _em_consistency_loss(self, mask, flow):
+    def _em_consistency_loss(self, mask, flow, boundary_weight=None):
         """
         E-step-consistency auxiliary loss. mask is predicted purely from
         RGB appearance (backbone + seg head) — nothing currently checks
@@ -605,6 +714,18 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         badly -> uniform target -> uniform mask "satisfies" it for free).
         warp_seg remains what keeps the rigid models themselves accurate in
         absolute terms.
+
+        boundary_weight (new, discussed 260811, [B,1,H,W] or None): per-
+        pixel weight applied to the cross-entropy before spatial averaging.
+        None (default) reproduces the exact prior behaviour -- a plain
+        unweighted spatial mean over every pixel. The main warp_seg loss
+        (this class's forward()) is NOT uniform -- it's boundary_dilation/
+        floor-weighted, concentrated near motion-boundary pixels -- so an
+        unweighted em_consistency_loss disagrees with warp_seg about which
+        pixels matter (diluted by the large majority of near-static
+        background pixels that warp_seg itself mostly ignores). Passing the
+        SAME mask_fw_flow/mask_bw_flow boundary weight already computed by
+        forward() (see that method's call site) makes the two losses agree.
         Returns per-sample [B] loss so it composes with topk.
         """
         per_channel_flow = self._per_channel_rigid_flow(mask, flow)   # [B, C, 2, H, W]
@@ -613,7 +734,10 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
 
         log_mask = torch.log(mask.clamp(min=1e-8))
         ce = -(target * log_mask).sum(dim=1)  # [B, H, W]
-        return ce.mean(dim=(1, 2))  # [B]
+        if boundary_weight is None:
+            return ce.mean(dim=(1, 2))  # [B]
+        w = boundary_weight.squeeze(1)  # [B, H, W]
+        return (ce * w).sum(dim=(1, 2)) / (w.sum(dim=(1, 2)) + 1e-6)  # [B]
 
     def _predict_sigma(self, all_pred_residual, head, target_hw):
         """
@@ -779,6 +903,26 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
         return mask
 
     # ------------------------------------------------------------------ #
+    # mask1_agg/mask2_agg: the actual per-channel weights fed into the    #
+    # weighted least-squares motion fit (aggregate_flow_with_residual).  #
+    # Pulled out of forward() (260730) as its own overridable method so   #
+    # subclasses (e.g. FlowAggregationHeadGraphMotion) can inject         #
+    # additional weighting sources without duplicating forward()'s other #
+    # ~150 lines. Behaviour-preserving refactor -- identical math to what #
+    # was previously inlined; v102 and every other existing config is    #
+    # unaffected (use_cycle_conf gating, else identity).                 #
+    # ------------------------------------------------------------------ #
+    def _compute_agg_masks(self, mask1, mask2, gt_fw_flow, gt_bw_flow, seq_names=None):
+        if self.use_cycle_conf:
+            conf_fw = self._compute_cycle_conf(gt_fw_flow, gt_bw_flow, seq_names=seq_names)
+            conf_bw = self._compute_cycle_conf(gt_bw_flow, gt_fw_flow, seq_names=seq_names)
+            mask1_agg = mask1 * conf_fw   # low-conf pixels contribute less
+            mask2_agg = mask2 * conf_bw
+        else:
+            mask1_agg, mask2_agg = mask1, mask2
+        return mask1_agg, mask2_agg
+
+    # ------------------------------------------------------------------ #
     # Override forward to use self.topk instead of hard-coded 2           #
     # ------------------------------------------------------------------ #
     def forward(self, imgs, masks, gt_fw_flows, gt_bw_flows,
@@ -817,18 +961,19 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
             gt_bw_flow = self.norm_and_clamp_flow(gt_bw_flow, seq_names=seq_names)
 
             # ── cycle-consistency confidence (gates spatial averaging) ──
-            if self.use_cycle_conf:
-                conf_fw = self._compute_cycle_conf(gt_fw_flow, gt_bw_flow, seq_names=seq_names)
-                conf_bw = self._compute_cycle_conf(gt_bw_flow, gt_fw_flow, seq_names=seq_names)
-                mask1_agg = mask1 * conf_fw   # low-conf pixels contribute less
-                mask2_agg = mask2 * conf_bw
-            else:
-                mask1_agg, mask2_agg = mask1, mask2
+            mask1_agg, mask2_agg = self._compute_agg_masks(
+                mask1, mask2, gt_fw_flow, gt_bw_flow, seq_names=seq_names)
 
             # ── background flow removal (subtract dominant global motion) ─
             if self.use_bg_affine_removal:
-                bg_fw = self._bg_flow(gt_fw_flow)   # median [B,2,1,1] or affine [B,2,H,W]
-                bg_bw = self._bg_flow(gt_bw_flow)
+                # single-use: consumed here, then cleared so a forward() call
+                # made without set_ema_bg_weights first (e.g. during eval,
+                # which never calls set_ema_bg_weights) falls back to None
+                # -> exact prior all-ones-weight behaviour.
+                _ema_w_fw, _ema_w_bw = self._ema_bg_weight_fw, self._ema_bg_weight_bw
+                self._ema_bg_weight_fw = self._ema_bg_weight_bw = None
+                bg_fw = self._bg_flow(gt_fw_flow, exclude_weight=_ema_w_fw)   # median [B,2,1,1] or affine [B,2,H,W]
+                bg_bw = self._bg_flow(gt_bw_flow, exclude_weight=_ema_w_bw)
                 flow_fw_agg = gt_fw_flow - bg_fw   # residual = instrument motion
                 flow_bw_agg = gt_bw_flow - bg_bw
             else:
@@ -890,8 +1035,10 @@ class FlowAggregationHeadWithResidualV2(FlowAggregationHeadWithResidual):
                 # term stops being a valid log-probability — v83 (and this
                 # loss's only tested config so far) has use_cycle_conf=False,
                 # where mask1_agg == mask1 exactly, so this doesn't apply yet.
-                em_fw = self._em_consistency_loss(mask1_agg, flow_fw_agg)
-                em_bw = self._em_consistency_loss(mask2_agg, flow_bw_agg)
+                _em_bw_weight_fw = mask_fw_flow if self.em_consistency_use_boundary_weight else None
+                _em_bw_weight_bw = mask_bw_flow if self.em_consistency_use_boundary_weight else None
+                em_fw = self._em_consistency_loss(mask1_agg, flow_fw_agg, boundary_weight=_em_bw_weight_fw)
+                em_bw = self._em_consistency_loss(mask2_agg, flow_bw_agg, boundary_weight=_em_bw_weight_bw)
                 losses_fw = losses_fw + self.em_consistency_weight * em_fw
                 losses_bw = losses_bw + self.em_consistency_weight * em_bw
 

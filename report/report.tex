@@ -1,0 +1,809 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% ────────────────────────────────────────────────────────────────────────
+% DRAFT generated from project README + session logs. Every \cite{} key is
+% a PLACEHOLDER -- see the "References (to fill in)" comment block at the
+% end of this file for what each key needs and what is already known about
+% it. Add the real BibTeX entries to refs.bib yourself before compiling.
+% All tables/numbers are taken directly from this project's own recorded
+% experiment results (README.md and this session's eval batches), not
+% fabricated.
+% ────────────────────────────────────────────────────────────────────────
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Soft Body Identification from Optical Flow: \\
+Unsupervised Instrument and Soft-Tissue Segmentation \\
+in Surgical Video via Motion Reconstruction}
+
+\author{
+\IEEEauthorblockN{1\textsuperscript{st} Tianming Zhang}
+\IEEEauthorblockA{}
+}
+
+\maketitle
+
+\begin{abstract}
+Pixel-level annotation of surgical video is expensive and slow to
+collect, which limits fully-supervised instrument and tissue
+segmentation to whichever datasets happen to be annotated and leaves
+such models generalizing poorly across hospitals, scopes, and
+procedures. We address this with an unsupervised approach that uses
+motion, rather than manual labels, as the supervisory signal for both
+instrument and soft-tissue segmentation. Building on RCF
+(Rigid-Cluster-Flow)~\cite{rcf_cvpr2023}, which reframes segmentation as
+motion clustering -- a soft per-pixel cluster assignment is learned by
+requiring each cluster's own rigid motion model to reconstruct optical
+flow from a frozen RAFT~\cite{raft_eccv2020} network -- we extend the
+method to a new, heterogeneous surgical dataset (``CMC''), for
+instrument segmentation and, novel to this work, for soft-tissue
+segmentation, a target whose motion signal is an order of magnitude
+weaker and noisier than the instrument's. We add a DINO-feature
+consistency loss~\cite{dino_iccv2021} to stabilize which output channel
+represents which object across training, and report roughly 150
+controlled single-variable experiments spanning loss design,
+segmentation-head architecture, training/data-quality interventions,
+multi-frame extensions, and a DINO graph-partitioning
+prior~\cite{graphpartition_mchm2024}. Across this arc we distill one
+recurring, reproducible finding: gains come almost exclusively from
+protecting and denoising an already-scarce motion signal, not from added
+model capacity. We close with a diagnosis of the project's current
+performance ceiling and a concrete proposal -- explicit, filtering-style
+motion decoupling with a dedicated sub-network, in the spirit of recent
+dynamic scene reconstruction work~\cite{batrack2025} -- for what would
+need to change to move past it.
+\end{abstract}
+
+\begin{IEEEkeywords}
+unsupervised segmentation, optical flow, surgical video, motion clustering, self-supervised learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Minimally invasive surgery relies heavily on video for both intra-operative
+guidance and post-operative analysis, and automatic segmentation of
+surgical instruments and soft tissue is a prerequisite for most
+downstream applications (workflow analysis, skill assessment, augmented
+reality overlays). Fully-supervised segmentation models are the dominant
+approach, but they require per-frame pixel masks that are costly to
+collect and that do not transfer well across hospitals, scopes, and
+procedures with different visual statistics. This motivates
+\emph{unsupervised} approaches that use a signal already present in the
+raw video -- motion -- instead of manual labels.
+
+RCF~\cite{rcf_cvpr2023} formulates unsupervised video object segmentation
+as an Expectation-Maximization-like motion clustering problem implemented
+through regression: a convolutional network predicts a soft, per-pixel
+cluster assignment (the segmentation mask); each cluster's own rigid (or
+near-rigid) motion model is then fit, in closed form, to the optical flow
+under that cluster's current soft assignment (the ``M-step''); and the
+whole pipeline is trained end-to-end by requiring the mask-weighted
+mixture of per-cluster motion predictions to reconstruct the externally
+computed, frozen optical flow (RAFT~\cite{raft_eccv2020}) between adjacent
+frames. No manual segmentation label ever enters training -- only the
+optical flow, an external, non-trainable signal, does.
+
+This project starts from that idea and pursues it in two stages. First,
+because RCF's own paper does not release a pretrained checkpoint or
+training configuration for the instrument-segmentation setting, we
+reproduce it from scratch on the public EndoVis~2017 instrument
+segmentation benchmark~\cite{endovis2017}, and find that a
+straightforward reproduction is unstable: the instrument does not
+reliably stay bound to one output channel across training. We add an
+auxiliary DINO-feature consistency loss~\cite{dino_iccv2021} to anchor the
+instrument channel by appearance, which resolves the instability and
+becomes the standard configuration for everything that follows. Second,
+we transfer this recipe to a private, considerably more heterogeneous
+laparoscopic dataset (``CMC'', collected across multiple grasp-event
+offsets and, later, multiple hospitals/resolutions), first for instrument
+segmentation and then -- on top of an instrument-competent model -- for
+soft-tissue segmentation, where the motion signal is an order of
+magnitude weaker (soft tissue moves less, and less rigidly, than a
+held instrument) and correspondingly harder to learn from without
+collapsing.
+
+Across roughly 150 numbered, single-variable experiments recorded in this
+project's history, we find a consistent pattern: architectural capacity
+increases (deeper segmentation heads, ASPP, U-Net-style decoders, extra
+injected features, multi-frame fusion) plateau quickly, while the only
+mechanism-level changes that produced clean, reproducible improvements
+were ones that protected or denoised the existing motion-reconstruction
+signal (supervision density around motion boundaries, removing corrupted
+flow pairs, correcting a downsampling operation that blended
+object-boundary motion into the background before the loss ever saw it).
+This paper documents that arc, the specific architecture and training
+protocol at each stage, the ablations that did and did not work, and a
+concrete diagnosis -- backed by a within-project literature detour into
+recent bundle-adjustment-based dynamic scene reconstruction
+work~\cite{batrack2025} and a re-derivation of a DINO
+graph-partitioning eigenvector prior~\cite{graphpartition_mchm2024} in
+explicit Bayesian terms -- of what is currently limiting further
+progress, and what a principled next step looks like.
+
+\textbf{Contributions.}
+\begin{itemize}
+\item A from-scratch reproduction of RCF's instrument-segmentation
+setting on EndoVis~2017, with an added DINO consistency loss that fixes a
+channel-instability failure mode absent from the original paper's
+description, reaching approximately 70\% mIoU.
+\item A transfer of this recipe to a new, heterogeneous surgical dataset
+(CMC) for both instrument and (novel to this project) soft-tissue
+segmentation, including a diagnosis and fix for a resolution/field-of-view
+domain gap between the source and target datasets.
+\item A systematic experimental study (data-quality/signal-density
+interventions, segmentation-head architecture search, multi-frame
+extensions, DINO graph-partitioning fusion) isolating which classes of
+change reliably help this specific unsupervised motion-reconstruction
+architecture and which do not.
+\item A root-cause diagnosis of a previously unexplained instrument-mIoU
+decay observed in the strongest recent configuration, traced to a
+specific background-motion-removal mechanism's lack of robustness to
+foreground (instrument) contamination.
+\item A reformulation of DINO graph-partitioning eigenvector fusion as an
+explicit Bayesian prior (rather than an opaque mid-network feature
+concatenation), combined with an existing-but-unused motion-derived
+likelihood term already implicit in the architecture's own EM structure.
+\end{itemize}
+
+\section{Related Work}
+
+\textbf{Unsupervised motion-based video object segmentation.} This
+project builds directly on RCF~\cite{rcf_cvpr2023}, which frames
+segmentation as regression-based EM motion clustering driven by optical
+flow reconstruction. The core signal is a frozen, pre-trained optical
+flow estimator, RAFT~\cite{raft_eccv2020}, applied off-the-shelf as an
+external target -- the network never receives motion supervision beyond
+what RAFT itself outputs, so the ceiling on segmentation quality is
+coupled to RAFT's own accuracy on the target domain.
+
+\textbf{Self-supervised appearance features.} DINO~\cite{dino_iccv2021}
+vision transformers, trained with no labels via self-distillation, are
+used twice in this project: (i) as an auxiliary per-pixel consistency
+loss that anchors channel identity during training (Section
+\ref{sec:endovis}), and (ii) as a frozen feature extractor for graph-based
+semantic partitioning (Section \ref{sec:dino_graph}).
+
+\textbf{Graph-partitioning segmentation from self-supervised features.}
+\cite{graphpartition_mchm2024} shows that a cosine-similarity affinity
+graph built from frozen DINO patch features, spectrally decomposed via
+the normalized graph Laplacian~\cite{normalized_cuts}, yields eigenvectors
+that meaningfully partition a surgical scene into semantic modules
+(instrument, tissue, background) with no supervision at all -- entirely
+independent of motion. We revisit this mechanism in Section
+\ref{sec:dino_graph} and re-derive it as a genuine Bayesian prior over the
+same cluster assignment RCF's motion likelihood already estimates,
+rather than treating it as an opaque feature to concatenate.
+
+\textbf{Dynamic scene reconstruction via explicit motion decoupling.}
+\cite{batrack2025} decouples camera-induced (static) motion from
+object-induced (dynamic) motion using a dedicated, separately-trained
+network, then hands the isolated static component to classical bundle
+adjustment. Their ablation shows that (a) explicit decoupling and (b) a
+learned camera/dynamic-region mask compose multiplicatively (roughly a
+$4\times$ error reduction together, each individually contributing a
+factor of $\sim2\times$), and, notably, that training one network to
+predict \emph{both} the total and the dynamic motion component is
+worse than two separate networks. We return to this finding in Section
+\ref{sec:future} as the basis for a concrete architectural proposal.
+
+\section{Method}
+
+\subsection{Base architecture: motion reconstruction as regression-EM}
+\label{sec:base_arch}
+
+The network has a shared ResNet-50 backbone~\cite{resnet_cvpr2016}
+(dilated in the last two stages to preserve spatial resolution),
+initialized from DenseCL self-supervised pretraining, feeding three
+heads:
+
+\begin{itemize}
+\item \textbf{Mask head} (multi-scale segmentation head with an ASPP
+module~\cite{aspp_deeplab}, Section~\ref{sec:archsearch}): produces a
+$C$-channel softmax over the backbone's fused multi-scale features -- the
+soft cluster assignment (E-step).
+\item \textbf{Motion head}: for each of the $C$ channels, fits a
+per-channel rigid motion model (constant translation, or translation with
+an affine correction) to the optical flow using the current mask as a
+weighted-least-squares weight (M-step), then adds a learned, bounded
+per-pixel residual to absorb non-rigid deformation the rigid model cannot
+explain.
+\item \textbf{Residual head}: an independent branch predicting a
+secondary per-channel residual correction directly from the deepest
+backbone feature, decoupled from the mask.
+\end{itemize}
+
+The mask-weighted mixture of the $C$ channels' motion predictions is
+compared against the RAFT flow with an $L_2$ reconstruction loss, computed
+\emph{only} near detected motion boundaries (an angle-change detector on
+the flow field, dilated and floored so non-boundary pixels retain a small
+residual weight) -- this supervision-density mechanism, introduced
+partway through the project (Section~\ref{sec:signal_quality}), turned
+out to be the single most consequential change in the whole history of
+the project. Per training step, an easy-example-mining rule keeps only
+the $k$ lowest-loss samples in the batch for backpropagation.
+
+No manual segmentation label participates in this loss. Channel identity
+(which of the $C$ channels ends up representing the instrument, which
+represents tissue, etc.) is not fixed by architecture; it emerges from
+training and is resolved at evaluation time by an oracle matching
+procedure (Section~\ref{sec:eval_protocol}).
+
+\subsection{EndoVis~2017 reproduction and the DINO consistency loss}
+\label{sec:endovis}
+
+RCF's own paper does not release pretrained weights or a training
+configuration for surgical instrument segmentation, so this project first
+reproduces the method from scratch on EndoVis~2017~\cite{endovis2017}.
+A direct reproduction of the base architecture (Section~\ref{sec:base_arch})
+is unstable at this stage: because the loss only ever supervises the
+\emph{mixed} reconstruction, not any individual channel's identity, the
+instrument's soft assignment can drift across channels over training,
+and different channels can partially split or merge the instrument
+region with no signal telling the network this is wrong.
+
+We add an auxiliary DINO-feature consistency loss: for each channel $c$,
+minimize the mask-weighted mean cosine distance between every assigned
+pixel's frozen DINO feature and that channel's own mask-weighted mean DINO
+feature,
+\[
+\mathcal{L}_{\text{dino}} = \frac{1}{C}\sum_{c}
+\frac{\sum_p \hat M_c(p)\,\big(1-\cos(f_p,\mu_c)\big)}{\sum_p \hat M_c(p)},
+\]
+where $\mu_c$ is the mask-weighted mean of $\ell_2$-normalized DINO
+features under channel $c$. This does not require or assume any specific
+channel index for the instrument -- it only pushes each channel toward
+visually coherent membership, which in practice is enough to keep the
+instrument bound to a stable identity across training. This loss (small
+weight, $w_{\text{dino}} \approx 0.05$--$0.1$) becomes the standard
+configuration for every later experiment in this project. With it, the
+EndoVis reproduction reaches approximately 70\% instrument mIoU,
+establishing the base recipe subsequent sections build on.
+
+\subsection{Transfer to CMC: instrument segmentation}
+\label{sec:cmc_instrument}
+
+Directly fine-tuning the EndoVis-trained model on the CMC dataset
+under-performed. CMC is collected across multiple source hospitals with
+different camera resolutions and framing conventions, and the
+EndoVis-trained backbone carries an inductive bias (in particular, a
+learned notion of object scale/field-of-view) that does not transfer
+cleanly. Rather than discarding the EndoVis prior outright, we diagnosed
+the dominant failure mode as a scale/resolution mismatch (the network's
+effective receptive field vs. object scale, inherited from EndoVis's own
+image statistics) and adjusted the resize/crop configuration used during
+fine-tuning so that the CMC crop presented to the network matches the
+scale distribution the backbone was pretrained under, closing most of the
+gap. With this fix, fine-tuning on CMC reaches roughly 67\% instrument
+mIoU -- below the EndoVis number, attributable to (a) the CMC dataset
+being considerably smaller, and (b) the well-known EM/regression tension
+between a strong pretrained prior and the (weaker, noisier) new evidence
+the posterior update has to reconcile it with. Sliding-window inference
+(Section~\ref{sec:sliding_window}) is introduced at this stage to handle
+CMC's variable, generally larger image resolutions without retraining at
+native resolution.
+
+\subsection{Soft-tissue segmentation: loss-engineering attempts (largely unsuccessful)}
+\label{sec:tissue_loss}
+
+With an instrument-competent CMC model as a starting point, we next
+target soft-tissue segmentation by continuing training on grasp-event
+data with additional supervision meant to shape a dedicated tissue
+channel while protecting the already-learned instrument channel. Roughly
+20 auxiliary losses were tried across this phase, targeting: rigidity
+(reward high intra-channel flow variance, i.e. non-rigid deformation, for
+candidate tissue channels), motion divergence (grasped tissue compresses
+under contact, producing non-zero flow divergence RAFT can detect),
+grasp-point convergence, cross-channel flow-direction clustering (both
+self-referential, using the model's own current mask as the pseudo-label,
+and externally referenced, using an independent $k$-means clustering of
+RAFT flow direction), and several distillation variants (one-sided vs.\
+symmetric BCE) meant to protect the instrument channel from being
+absorbed by the new tissue-oriented pressure.
+
+None of these auxiliary losses produced a stable, above-baseline result:
+runs oscillate close to the instrument-only baseline, and several
+specific, diagnosable failure modes recur -- most commonly the instrument
+channel degrading over training as increasingly strong tissue-oriented
+pressure (deformation reward, entropy regularization) wins the underlying
+softmax competition for pixels near the instrument/tissue boundary. By
+the end of this phase every one of these losses is disabled (weight 0)
+in the surviving configuration; the two losses that remain active
+throughout the rest of the project are the core motion-reconstruction
+loss and the small DINO consistency loss from Section~\ref{sec:endovis}.
+We conclude that the inductive bias carried over from the instrument-only
+pretraining was not something an additional loss term could cheaply
+redirect, and that architecture, not loss design, was the more promising
+lever -- motivating Section~\ref{sec:archsearch}.
+
+\subsection{Segmentation-head architecture search}
+\label{sec:archsearch}
+
+Observing that the segmentation head only consumed two of the backbone's
+four available multi-scale feature maps, we trained the tissue model from
+scratch on the merged grasp0+grasp10 CMC data with a series of
+segmentation-head architectures: a U-Net-style top-down decoder with skip
+connections, several ASPP/multi-scale-fusion variants, DenseASPP
+(cascaded dilated convolutions), and strip pooling (targeting the
+instrument's characteristically elongated shape). Table~\ref{tab:arch}
+summarizes the two configurations that mattered most.
+
+\begin{table}[htbp]
+\caption{Segmentation-head architecture search, selected results (mIoU \%, oracle-matched)}
+\label{tab:arch}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Version & Change & Instrument & Tissue \\
+\midrule
+v64 & MultiScaleSegHead + ASPP (dil.\ 6/12/18 + GAP) & 65.57 & 73.32 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MultiScaleSegHead with a parallel-dilation ASPP module, replacing a
+single fusion convolution, was the only architecture change in this
+search that produced a clean, reproducible improvement (v64, sum
+mIoU 138.89, the project's best result up to that point). Subsequent
+refinement attempts on top of this head (finer dilation schedules,
+additional pooling branches, alternative skip-connection patterns)
+consistently failed to exceed v64, indicating the segmentation head's own
+capacity had saturated for this data scale -- further gains, documented
+next, came from the training signal itself rather than the network.
+
+\subsection{Signal density and data quality}
+\label{sec:signal_quality}
+
+Two changes, made independently of architecture, produced this project's
+largest and most reproducible gains, and are the basis for this paper's
+central empirical claim.
+
+\textbf{Boundary supervision density (v83).} The reconstruction loss's
+boundary mask (Section~\ref{sec:base_arch}) was, at this point, a thin,
+un-dilated band around detected motion-angle discontinuities, covering
+only $\sim$20\% of pixels; every other pixel received zero loss weight.
+Widening this band (dilation $7\!\to\!15$~px) and giving the remaining,
+non-boundary pixels a small non-zero floor weight (rather than exactly
+zero) raised effective supervision coverage to $\sim$40\% of pixels.
+Combined with removing 24 training pairs whose RAFT flow had failed
+outright (identified by extreme flow magnitude, plausible causes:
+motion blur or textureless/specular frames RAFT cannot track), this
+produced sum mIoU 139.36 (instrument 66.76, tissue 72.60) -- a new record
+and, per this project's own repeated later re-verification, the only
+single mechanism-level change in the project's entire history that
+reliably improved on its predecessor whenever it was combined with other
+new mechanisms.
+
+\textbf{Downsampling mode for the ground-truth flow (v102).} The
+ground-truth flow is resized from crop resolution ($384\!\times\!384$) to
+the mask resolution ($96\!\times\!96$) before the reconstruction loss is
+computed. The default (bilinear) interpolation blends instrument-boundary
+motion vectors with surrounding background motion \emph{at the
+downsampling step itself} -- for a target occupying roughly 1\% of frame
+area, this directly works against the density mechanism just described,
+diluting exactly the pixels it was built to protect. Switching to area
+(box) downsampling, the more standard choice for \emph{downsampling}
+specifically, gave 139.77 (0.30 threshold) / 140.12 (0.35 threshold) --
+this project's champion result prior to this session's work, and the
+baseline every subsequent experiment (Sections
+\ref{sec:multiframe}--\ref{sec:this_session}) is compared against.
+
+We highlight this pattern because of how it recurs: two of the three
+best-performing changes across $\sim$150 experiments are corrections to
+how an already-present signal was being computed or supervised, not new
+information sources.
+
+\subsection{Multi-frame extensions}
+\label{sec:multiframe}
+
+All experiments up to this point predict the mask independently per
+frame, with no mechanism for one frame's prediction to be informed by
+neighboring frames. We tested whether giving the mask branch access to
+multiple frames -- either via an approximate ``bridge'' construction
+(reusing existing single-gap frame pairs across grasp-event offsets to
+simulate a larger temporal gap) or via genuine multi-frame continuous
+video later obtained for a subset of cases -- would help. Concretely:
+joint cross-frame mask architectures (shared features across a frame
+pair, feature concatenation, a 4-scale extension, and a deformable
+cross-frame attention variant) were each tried on top of the v102
+baseline. None produced a clean improvement; several of the largest,
+most structurally novel variants (deformable attention in particular)
+were the weakest. We separately confirmed, and fixed, a real
+long-standing bug discovered during this arc: the project's own
+random-gap sampling mechanism, present in the dataset code since early in
+the project, had been silently dead for every CMC configuration because
+CMC's directory structure gave every non-unit gap draw the same source
+folder as the gap-1 draw, causing it to fall back to gap-1 with no
+warning. We conclude, tentatively, that the current mask-prediction
+architecture -- and, per Section~\ref{sec:signal_quality}'s pattern, the
+current bottleneck more broadly -- is not well suited to naive multi-frame
+feature fusion; modeling genuine cross-frame relationships appears to
+need a different mechanism than concatenation or attention over
+independently-extracted per-frame features (see Section~\ref{sec:future}).
+
+\subsection{DINO graph-partitioning eigenvector fusion}
+\label{sec:dino_graph}
+
+\cite{graphpartition_mchm2024} shows that eigenvectors of the normalized
+graph Laplacian of a cosine-similarity affinity graph over frozen DINO
+patch features meaningfully partition a surgical frame into semantic
+modules with no supervision, no motion, and no training at all -- we
+verified this reproduces cleanly on our own frames using a frozen DINO
+ViT-Small/8 at $384\!\times\!384$ input, downsampled to a $32\!\times\!32$
+graph, and that the identical affinity/Laplacian/eigendecomposition
+pipeline run on our own trained ResNet-50 features instead produces pure
+noise -- DINO, not the project's own backbone, is required as the feature
+source for this to work.
+
+We tested seven independent fusion mechanisms/injection points on top of
+the v102 baseline, spanning: concatenating eigenvectors into different
+backbone feature stages, a non-parametric self-referential centroid
+matching mechanism, injecting eigenvector-derived confidence directly
+into the motion-fitting step's weights, a multiplicative attention gate,
+simultaneous multi-scale injection, and decoder-stage injection after the
+segmentation head's own multi-scale fusion. Table~\ref{tab:dino_batch}
+summarizes.
+
+\begin{table}[htbp]
+\caption{DINO graph-partitioning fusion, seven mechanisms vs.\ v102 baseline}
+\label{tab:dino_batch}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Version & Mechanism & Val.\ sum peak & Test mIoU \\
+\midrule
+v102 (baseline) & -- & 139.77 & -- \\
+v146 & concat $\to$ feat0 (shallow) & 137.0 & 73.55 \\
+v149 & concat $\to$ feat3 (deep) & \textbf{139.0} & \textbf{74.57} \\
+v147 & self-ref.\ centroid matching & 137.0 & 69.71 \\
+v148 & inject into motion-fit weights & 133.0 & 67.52 \\
+v153 & multiplicative attention gate & 126.0 & 73.37 \\
+v154 & feat2 $+$ feat3 (double inject.) & 131.0 & 68.28 \\
+v155 & decoder-stage injection & 113.0 & 67.11 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The simplest mechanism (concatenation into the deepest, most semantic
+backbone feature stage, v149) was the best of the seven -- every
+mechanism explicitly designed to be ``smarter'' than plain concatenation
+(gating, non-parametric matching, direct injection into the motion fit)
+underperformed it, several substantially. We interpret this as the
+opposite of a coincidence: a fixed-form combination rule imposes a prior
+on \emph{how} two independent signal sources should be combined, and
+under this project's small data regime (on the order of 1500 training
+pairs), that prior is more often wrong than the flexibility a plain
+learned convolution retains.
+
+Independently, we tested a more robust background-motion removal step
+(subtracting an estimated camera/background flow, fit via
+Iteratively-Reweighted Least Squares, before the per-channel motion fit)
+on top of v149. The plain (non-robustified) variant, v152, reached the
+highest single validation peak recorded in this batch (140.0), matching
+the v102 champion range, but a full-training-curve analysis revealed a
+systematic, previously unnoticed problem, detailed next.
+
+\subsection{Root-cause diagnosis: background-motion removal and instrument decay}
+\label{sec:bg_removal}
+
+Pulling the full, per-epoch validation curve (not just the sparse
+checkpoints normally used for comparison) for four closely related
+configurations reveals a clear pattern invisible in checkpoint-level
+comparisons alone: configurations without background-motion removal
+(v102, v149) show noisy but flat instrument mIoU across all 80 training
+epochs, while both variants \emph{with} background-motion removal (v151,
+IRLS-robustified; v152, plain least-squares) show a distinct
+\emph{early-peak-then-decline} shape -- a strong result in the first
+$\sim$20 epochs, followed by a systematic decline to a $\sim$15-point
+lower plateau for the remainder of training. This isolates the
+background-removal mechanism itself, independent of the DINO fusion it
+was layered on top of, as the cause.
+
+The root cause, stated in that mechanism's own pre-existing
+implementation notes but never previously connected to an observed
+failure mode, is that the background-motion fit is not robust to
+instrument pixels biasing it. Critically, the residual-magnitude-based
+robustification (IRLS) that was tried does not fix this: a rigidly
+translating instrument has smooth \emph{internal} flow, so it produces no
+local residual spike relative to its own motion anywhere except at its
+own silhouette edge -- IRLS can only ever detect and downweight the
+edge, never the interior, and so under-corrects exactly the region that
+matters. An attempted fix using an EMA teacher's own instrument-channel
+prediction as a semantic (not residual-magnitude-based) exclusion weight
+for this fit was tested and found, empirically, to underperform both the
+uncorrected baseline and the original mechanism, plausibly because the
+EMA teacher's segmentation head is itself too unreliable early in
+training to serve as a dependable exclusion signal, even with a
+warm-up delay.
+
+\subsection{Train/eval scale mismatch, multi-scale training, and this session's remaining changes}
+\label{sec:this_session}
+
+A separate, previously undiagnosed issue was found in the evaluation
+pipeline: training's data augmentation resizes source images differently
+depending on their native resolution (two discrete target scales), while
+evaluation resizes every image to one universal target scale regardless
+of source resolution. For the higher-resolution source images specifically,
+this amounts to a real $\sim\!1.47\times$ scale mismatch between what the
+network was trained to expect and what it is shown at evaluation time
+(objects appear noticeably smaller at eval than during training).
+Patching evaluation alone to match training's resize logic, without
+retraining, made results \emph{worse}, not better (140.19 $\to$ 133.16),
+because the champion checkpoint's own selection (which checkpoint counted
+as ``best'' during training) had itself always been computed under the
+old, mismatched evaluation scale -- correcting evaluation alone breaks
+that calibration rather than fixing anything. This motivated fixing the
+training side instead: replacing the two discrete resize targets with one
+continuous, source-resolution-independent random-scale range (standard
+multi-scale training), training for more epochs to compensate for the
+wider distribution needing more iterations to converge, and (separately)
+enabling this project's existing-but-previously-unused exponential moving
+average (EMA) weight-smoothing mechanism to reduce the training curve's
+substantial epoch-to-epoch variance. We also reformulated the DINO
+graph-partitioning fusion of Section~\ref{sec:dino_graph} as an explicit
+Bayesian prior (Section~\ref{sec:bayesian_prior}) rather than a
+feature-level concatenation, combined with the project's own,
+previously-unused motion-derived likelihood term. Results for this batch
+of changes are reported alongside the rest in
+Section~\ref{sec:results_summary}.
+
+\subsection{DINO eigenvectors as a Bayesian prior}
+\label{sec:bayesian_prior}
+
+Re-reading~\cite{graphpartition_mchm2024} in full (rather than only its
+affinity/Laplacian recipe) surfaces an important correction to how this
+project had informally described the eigenvector signal: an individual
+eigenvector is not a per-pixel class probability. Each is a single
+real-valued partition ``mode'' at a specific normalized-cut granularity
+-- the lowest-eigenvalue eigenvectors give the coarsest, most salient
+split (typically instrument vs.\ background), higher-index eigenvectors
+give progressively finer sub-structure, and eigenvectors beyond roughly
+the 10th--15th become noise-like. The paper's own recipe for turning
+this into an actual segmentation is to stack the leading $g$ eigenvectors
+into a $g$-dimensional per-pixel embedding and run $k$-means on that
+embedding -- not to read class membership off the raw values.
+
+This project's own architecture (Section~\ref{sec:base_arch}) is already,
+explicitly, a regression form of Expectation-Maximization: the mask is a
+soft E-step responsibility, and the per-channel motion fit is an M-step.
+Under that framing, the DINO eigenvector embedding is a genuine,
+motion-independent \emph{prior} $P(\text{channel}\mid\text{appearance})$,
+and the architecture already contains, unused, a genuine motion-derived
+\emph{likelihood}: an auxiliary consistency term whose (previously never
+enabled) target is
+\[
+P(\text{channel}=c \mid \text{flow}) \;\propto\;
+\exp\!\Big(-\tfrac{1}{T}\,\big\lVert
+\hat F_c(\text{rigid model}) - F_{\text{RAFT}} \big\rVert^2\Big),
+\]
+i.e.\ how well channel $c$'s \emph{own} fitted rigid motion model
+explains the observed flow at each pixel. Bayes' rule combines a prior
+and a likelihood by adding their logs. We implement this directly:
+$C$ learnable centroids in the $g$-dimensional eigenvector-embedding
+space give a temperature-scaled soft-distance prior logit, of the same
+mathematical form as the motion likelihood above, added straight onto the
+segmentation head's raw mask logits before the final softmax -- a
+decision-layer fusion, in contrast to Section~\ref{sec:dino_graph}'s
+feature-layer concatenation. The added module is initialized as an exact
+no-op (a zero-initialized output scale), so training begins at the
+baseline's own optimum. We additionally corrected a design inconsistency
+found while implementing this: the motion-likelihood auxiliary loss, as
+originally written, applied to every pixel uniformly, while the
+project's main reconstruction loss is deliberately concentrated near
+motion boundaries (Section~\ref{sec:signal_quality}) -- we made the two
+losses agree on where the signal should matter by having the auxiliary
+loss reuse the same boundary weighting.
+
+\section{Evaluation Protocol}
+\label{sec:eval_protocol}
+
+\subsection{Oracle matching and channel identity}
+Because channel identity is not fixed by the architecture, evaluation
+must resolve, per checkpoint, which output channel(s) correspond to the
+instrument and which to tissue. Two protocols are used across this
+project, and are not equivalent: (i) an \emph{oracle} protocol, used for
+per-epoch training-time monitoring, that exhaustively searches every
+non-empty subset of channels per frame independently and reports the
+best-matching union's IoU -- an optimistic, best-case-given-this-prediction
+number used only for checkpoint selection; and (ii) a \emph{locked}
+protocol, used for final reported instrument numbers, that fixes a
+channel (or channel pair) once, from a held-out detection pass, and
+applies it uniformly. Tissue numbers reported throughout this paper
+remain oracle (channel(s) already known to be instrument are excluded
+from the candidate set, but the remaining channels are still searched
+exhaustively per frame) -- a caveat we flag explicitly, since it means
+reported tissue numbers are somewhat more optimistic than reported
+instrument numbers, and this asymmetry should be kept in mind when
+comparing across versions.
+
+\subsection{Sliding-window inference}
+\label{sec:sliding_window}
+Because the network is trained on fixed $384\!\times\!384$ crops but CMC
+images are larger and of variable resolution, test-time inference uses a
+sliding window ($384$px, $192$px stride) with probability-space averaging
+in overlapping regions. We tested two alternatives: (i) hard
+nearest-window-center assignment (no blending across windows, in the
+spirit of the original U-Net's overlap-tile strategy), and (ii) a
+distance-weighted (Hann-window) taper. Both alternatives underperformed
+the existing probability-averaging default (by $-1.58$ and $-0.33$ to
+$-1.09$ points respectively, depending on threshold), most of the loss
+concentrated on the tissue channel, whose boundaries are more diffuse
+than the instrument's -- we conclude the current default should be kept.
+
+\section{Results Summary}
+\label{sec:results_summary}
+
+\begin{table}[htbp]
+\caption{Top results across the full v1--v134 project history (sum mIoU, oracle-matched)}
+\label{tab:top10}
+\centering
+\begin{tabular}{clc}
+\toprule
+Rank & Version & Sum mIoU \\
+\midrule
+1 & v102 & 139.77 (140.12 at threshold 0.30) \\
+2 & v83  & 139.36 \\
+3 & v64  & 138.89 \\
+4 & v75  & 138.50 \\
+5 & v47  & 138.28 \\
+6 & v95  & 137.89 \\
+7 & v43  & 137.72 \\
+8 & v85  & 137.59 \\
+9 & v91  & 137.59 \\
+10 & v63 & 137.57 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:top10} lists the ten best results across the first 134
+versions of the project (the multi-frame and DINO-graph lines, discussed
+above, are evaluated separately since they were not directly comparable
+under the same protocol at the time). The top three results each
+represent a distinct class of intervention -- a data-preprocessing
+correction (v102), a supervision-density and data-cleaning change (v83),
+and an architecture change (v64) -- and, consistent with the pattern
+argued throughout this paper, the two highest-ranked results are both
+signal-quality corrections rather than new architecture or new
+information sources.
+
+\begin{table}[htbp]
+\caption{This session's changes vs.\ the v102/v152 baselines, best checkpoint per configuration (grasp0 + grasp10 combined, sum mIoU)}
+\label{tab:this_session}
+\centering
+\begin{tabular}{llc}
+\toprule
+Version & Change vs.\ base & Combined sum \\
+\midrule
+v102 (base) & -- & 282.85 \\
+v152 (base) & DINO fusion + plain bg-removal & \textbf{282.89} \\
+v151 & \quad + IRLS-robustified bg-removal & 281.82 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A broader historical comparison, evaluating eleven representative
+checkpoints spanning the entire project history on \emph{both} the
+grasp0 and grasp10 CMC eval sets (whereas nearly all earlier reported
+numbers, including Table~\ref{tab:top10}, are grasp0-only), confirms
+v102 and v152 remain jointly the two strongest configurations discovered
+so far, essentially tied (282.85 vs.\ 282.89 combined sum), with the
+IRLS-robustified variant (v151) close behind but not ahead -- consistent
+with Section~\ref{sec:bg_removal}'s finding that IRLS does not fully
+resolve the underlying contamination issue. Full per-checkpoint,
+per-dataset results are provided in the project repository.
+
+\section{Discussion: Diagnosing the Current Ceiling}
+\label{sec:discussion}
+
+Two structural factors, not any single implementation detail, explain why
+this project's $\sim$150 experiments cluster so tightly around the same
+performance band. First, the only external supervisory signal is optical
+flow from a flow estimator trained on synthetic data and applied,
+zero-shot, to a visually very different domain (laparoscopic video with
+specular highlights, blood, smoke, and fast, thin-object motion); a prior
+diagnosis in this project directly measured that the network's own
+mask-prediction error correlates strongly with RAFT's own forward-backward
+cycle-consistency confidence, i.e.\ a substantial share of the error
+budget is attributable to the supervisory signal itself, not to anything
+downstream of it. An attempt to remove RAFT from the loop entirely
+(replacing it with a self-taught, in-network correlation-based flow)
+collapsed via self-referential feedback and was abandoned -- to date,
+every subsequent experiment, including this paper's own, has continued to
+regress against the same fixed-quality external signal rather than
+improving it at the source.
+
+Second, the instrument occupies roughly 1\% of frame area, and RAFT's
+own per-pixel error does not shrink with object size -- so the
+effective signal-to-noise ratio available to the instrument channel is
+structurally worse than for tissue or background, which can average
+flow-estimation noise over a much larger area. This offers a unifying
+explanation for a pattern that recurs across many, otherwise unrelated
+experiments in this project's history: tissue mIoU improves steadily over
+training while instrument mIoU oscillates or degrades. We verified this
+is not unique to the background-removal mechanism diagnosed in
+Section~\ref{sec:bg_removal} -- a milder version of the same
+instrument-declines/tissue-improves tension is visible even in the
+project's own historical champion configuration.
+
+Neither factor is something further architecture search, on this
+project's current data scale, is likely to resolve on its own -- both
+Section~\ref{sec:archsearch} (architecture) and
+Section~\ref{sec:dino_graph} (adding a new, independent information
+source) were tested directly and, at best, matched rather than clearly
+exceeded the two signal-quality corrections of
+Section~\ref{sec:signal_quality}.
+
+\section{Future Work}
+\label{sec:future}
+
+We highlight one design principle, surfaced repeatedly and independently
+across this project's history, as the guiding constraint for future
+work: any attempt to denoise this architecture's already-weak supervisory
+signal must be \emph{filtering}, not \emph{smoothing} -- it must
+selectively identify and remove genuine noise while leaving the
+underlying (already scarce) signal untouched, rather than uniformly
+blurring/averaging in a way that degrades signal and noise together.
+Every one of this project's clean wins (Section~\ref{sec:signal_quality})
+fits this description; every negative or inconclusive result we can point
+to a clear cause for (Section~\ref{sec:bg_removal}'s IRLS,
+Section~\ref{sec:sliding_window}'s taper/nearest-center alternatives) is,
+in one way or another, a smoothing operation applied where a filtering
+operation was needed. We note, separately, that this architecture's own
+residual-correction and affine-relaxation machinery (Section
+\ref{sec:base_arch}) already gives it real tolerance for imperfect rigid
+motion assumptions by design -- the failure mode we diagnose is
+specifically an unfiltered contamination of the \emph{background}
+estimate, not a lack of robustness in the model itself.
+
+Concretely, we propose two directions motivated by this constraint and by
+\cite{batrack2025}'s ablation (Section~\ref{sec:related_work}):
+
+\begin{itemize}
+\item \textbf{A dedicated, separately-trained motion-decoupling
+sub-network.} \cite{batrack2025} finds that a single network cannot
+reliably learn both total motion and the dynamic-only component
+simultaneously, and that a small, dedicated network for the dynamic
+component -- rather than reusing the main segmentation branch -- is
+required. This project's own attempted fix in Section~\ref{sec:bg_removal}
+reused the \emph{same} segmentation branch (an EMA copy of it) for both
+jobs; a genuinely independent, purpose-built sub-network whose only task
+is instrument/background discrimination for the background-motion fit,
+supervised indirectly through the effect it has on the fit's own
+downstream quality, is a natural next step and has not yet been tried.
+\item \textbf{Cross-frame evidence aggregation.} All current inference is
+per-frame independent; RAFT's own errors are therefore never
+cross-checked against any other estimate. This project has already
+computed, but never used for training, dense multi-gap flow across up to
+28 frame-pair combinations per continuous-video case -- a natural,
+already-available resource for aggregating multiple independent flow
+estimates of the same underlying motion into a single, lower-noise
+target, rather than trusting any single-frame-pair RAFT estimate
+outright.
+\end{itemize}
+
+Lower-priority directions surfaced during this project but not yet
+pursued include self-supervised fine-tuning of the flow estimator itself
+on the target domain (photometric-consistency-based, requiring no labels)
+to address the domain-gap half of Section~\ref{sec:discussion}'s
+diagnosis directly, and multi-scale test-time ensembling as a cheaper,
+no-retraining alternative to Section~\ref{sec:this_session}'s multi-scale
+training fix.
+
+\section*{Acknowledgment}
+% fill in supervisor / lab / compute acknowledgments here
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}

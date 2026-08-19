@@ -18,23 +18,30 @@ not assumed):
 
 Two annotation batches, verified disjoint (zero stem overlap, 103+103=206
 images total):
-  annotations/instances_default.json      — 103 images, has BOTH instrument
-                                              (cat 1) and tissue (cat 2)
-                                              annotations.
-  annotations_108/instances_default.json  — 103 images, instrument (cat 1)
-                                              ONLY — verified zero cat-2
-                                              annotations. Tissue labelling
-                                              for this batch is pending
-                                              (user will add it later).
-                                              Per explicit instruction: for
-                                              now, treat these 103 images as
-                                              "no tissue" (all-black tissue
-                                              mask) rather than omitting
-                                              them from eval_tissue — no
-                                              special-casing needed in code,
-                                              since an all-zero soft_mask is
-                                              already what happens when a
-                                              stem has zero cat-2 annotations.
+  annotations/instances_default.json          — 103 images, has BOTH
+                                                  instrument (cat 1) and
+                                                  tissue (cat 2) annotations.
+  annotations_108_new/instances_default.json  — 260810: UPDATED batch (was
+                                                  annotations_108/, instrument-
+                                                  only with tissue labelling
+                                                  "pending" — that placeholder
+                                                  is now resolved). Same 103
+                                                  images/stems as the old
+                                                  annotations_108/ (verified:
+                                                  identical stem set, zero
+                                                  overlap with annotations/),
+                                                  now carrying real tissue
+                                                  (cat 2) annotations too (245
+                                                  instrument + 99 tissue
+                                                  annotations, vs the old
+                                                  batch's 0 tissue). No code
+                                                  change needed beyond the
+                                                  path below -- an all-zero
+                                                  soft_mask only happens now
+                                                  for images that genuinely
+                                                  have zero cat-2 annotations
+                                                  in the new file, not as a
+                                                  blanket placeholder.
 
 Same core logic as grasp0: tissue mask has the instrument-overlap region
 cut out (instrument occludes tissue where they overlap) — trivially
@@ -52,7 +59,7 @@ from pycocotools.coco import COCO
 DATASET = Path('/media/mitiadmin/Micron_7450_1/tianming/dataset/CMC_grasp10_deinterlaced')
 ANNO_FILES = [
     DATASET / 'annotations/instances_default.json',
-    DATASET / 'annotations_108/instances_default.json',
+    DATASET / 'annotations_108_new/instances_default.json',
 ]
 JPEG_SRC = DATASET / 'JPEGImages'
 

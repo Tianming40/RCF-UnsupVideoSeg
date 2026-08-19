@@ -77,7 +77,35 @@ class RCFModel(nn.Module):
         self.save_dir_eval_export = os.path.join(args.checkpoints_dir, getattr(args, "saved_eval_export_dir_name", "saved_eval_export"))
 
         self.backbone2, self.backbone2_ema = self.create_backbone_with_ema(backbone2)
-        
+
+        # Stem-feature capture (discussed 260731, see models/
+        # multi_scale_seg_head_hires.py's docstring): backbone2's stem
+        # (conv1+norm1+relu, BEFORE maxpool) computes a stride-2 activation
+        # that's discarded today (out_indices only keeps the 4 res_layer
+        # outputs) -- captured here via a forward hook so it costs ZERO
+        # extra compute (it's produced on every backbone2 forward pass
+        # regardless) and requires no change to ResNet.forward() itself.
+        # Harmless/no-op for every decode_head2 that doesn't consume it
+        # (only MultiScaleSegHeadHiRes does, via use_stem_feat).
+        self._backbone_stem_feat = None
+        self._backbone_stem_feat_ema = None
+
+        def _make_stem_hook(target_attr):
+            def _hook(module, inp, out):
+                # NOT detached: gradient should flow back into backbone2's
+                # early layers through this path too (consistent with
+                # v146/v149's feat0/feat3 fusion, which also don't detach).
+                # .clone() only, to avoid aliasing the inplace-ReLU's output
+                # tensor (self.relu is nn.ReLU(inplace=True)) with whatever
+                # maxpool/downstream ops do to it afterward.
+                setattr(self, target_attr, out.clone())
+            return _hook
+
+        if hasattr(self.backbone2, 'relu'):
+            self.backbone2.relu.register_forward_hook(_make_stem_hook('_backbone_stem_feat'))
+        if self.backbone2_ema is not None and hasattr(self.backbone2_ema, 'relu'):
+            self.backbone2_ema.relu.register_forward_hook(_make_stem_hook('_backbone_stem_feat_ema'))
+
         # Moved from decoder in v1 to main module
         self.align_corners = align_corners
 
@@ -265,13 +293,17 @@ class RCFModel(nn.Module):
     def init_weights(self):
         self.backbone2.init_weights()
 
-    def _decode_head_forward(self, x, decode_head, flow_feat=None):
+    def _decode_head_forward(self, x, decode_head, flow_feat=None, stem_feat=None, dino_eigvecs=None):
         """Run forward function and calculate loss for decode head in
         training."""
+        kwargs = {}
         if flow_feat is not None:
-            pred = decode_head.forward(x, flow_feat=flow_feat)
-        else:
-            pred = decode_head.forward(x)
+            kwargs['flow_feat'] = flow_feat
+        if stem_feat is not None:
+            kwargs['stem_feat'] = stem_feat
+        if dino_eigvecs is not None:
+            kwargs['dino_eigvecs'] = dino_eigvecs
+        pred = decode_head.forward(x, **kwargs)
         return pred
 
     def _get_flow_feat_for_seg(self, gt_fw_flows, feat0_size, batch_size, im_num):
@@ -373,14 +405,53 @@ class RCFModel(nn.Module):
         img_3 = imgs.view(batch_size * im_num, num_channels, _h, _w)
         if self.eval_on_ema:
             all_feat = self.extract_feat(img_3, self.backbone2_ema)
-            all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2_ema) # [B, 256, 98, 175], [B, 2048, 49, 88], [B, 512, 49, 88], [B, 1024, 49, 88]
+            if getattr(self, 'dino_graph_fusion_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[0] = self.dino_graph_fusion_head(img_3, all_feat[0])
+            if getattr(self, 'dino_graph_fusion_deep_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[3] = self.dino_graph_fusion_deep_head(img_3, all_feat[3])
+            if getattr(self, 'dino_graph_attention_gate_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[3] = self.dino_graph_attention_gate_head(img_3, all_feat[3])
+            if getattr(self, 'dino_graph_fusion_deep2_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[2] = self.dino_graph_fusion_deep2_head(img_3, all_feat[2])
+            _stem_feat = self._backbone_stem_feat_ema if getattr(self.decode_head2_ema, 'use_stem_feat', False) else None
+            _dino_eigvecs = self.dino_graph_eigvec_extractor(img_3) if getattr(self, 'dino_graph_eigvec_extractor', None) is not None else None
+            all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2_ema, stem_feat=_stem_feat, dino_eigvecs=_dino_eigvecs) # [B, 256, 98, 175], [B, 2048, 49, 88], [B, 512, 49, 88], [B, 1024, 49, 88]
         else:
             all_feat = self.extract_feat(img_3, self.backbone2)
-            all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2) # [B, 256, 98, 175], [B, 2048, 49, 88], [B, 512, 49, 88], [B, 1024, 49, 88]
+            if getattr(self, 'dino_graph_fusion_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[0] = self.dino_graph_fusion_head(img_3, all_feat[0])
+            if getattr(self, 'dino_graph_fusion_deep_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[3] = self.dino_graph_fusion_deep_head(img_3, all_feat[3])
+            if getattr(self, 'dino_graph_attention_gate_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[3] = self.dino_graph_attention_gate_head(img_3, all_feat[3])
+            if getattr(self, 'dino_graph_fusion_deep2_head', None) is not None:
+                all_feat = list(all_feat)
+                all_feat[2] = self.dino_graph_fusion_deep2_head(img_3, all_feat[2])
+            _stem_feat = self._backbone_stem_feat if getattr(self.decode_head2, 'use_stem_feat', False) else None
+            _dino_eigvecs = self.dino_graph_eigvec_extractor(img_3) if getattr(self, 'dino_graph_eigvec_extractor', None) is not None else None
+            all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2, stem_feat=_stem_feat, dino_eigvecs=_dino_eigvecs) # [B, 256, 98, 175], [B, 2048, 49, 88], [B, 512, 49, 88], [B, 1024, 49, 88]
         _, _, _feat_h, _feat_w = all_pred_mask.shape
         all_pred_mask = all_pred_mask.view(
             batch_size, im_num, self.mask_layer, _feat_h, _feat_w)
+        # DINO graph BAYESIAN prior -- mirrors forward_train's injection, see
+        # that call site's comment / models/dino_graph_bayesian_prior.py.
+        if getattr(self, 'dino_graph_bayesian_prior_head', None) is not None:
+            _prior_logit = self.dino_graph_bayesian_prior_head(img_3, (_feat_h, _feat_w))
+            _prior_logit = _prior_logit.view(batch_size, im_num, self.mask_layer, _feat_h, _feat_w)
+            all_pred_mask = all_pred_mask + _prior_logit
         all_pred_mask = F.softmax(all_pred_mask, dim=2)
+        if getattr(self, 'dino_graph_estep_fusion_head', None) is not None:
+            _eB, _eI, _eC, _eHm, _eWm = all_pred_mask.shape
+            _fused_mask = self.dino_graph_estep_fusion_head(
+                img_3, all_pred_mask.view(_eB * _eI, _eC, _eHm, _eWm))
+            all_pred_mask = _fused_mask.view(_eB, _eI, _eC, _eHm, _eWm)
 
         ith_img = imgs[:, 0, :, :, :]
         ith_img = ith_img.detach()
@@ -608,14 +679,61 @@ class RCFModel(nn.Module):
         img_3 = imgs.view(batch_size * im_num, num_channels, _h, _w)
         # [B * I, 256, 96, 96], [B * I, 512, 48, 48], [B * I, 1024, 48, 48], [B * I, 2048, 48, 48]
         all_feat = self.extract_feat(img_3, self.backbone2)
+        # DINO graph-partitioning fusion into feat0 (discussed 260730, see
+        # models/dino_graph_fusion.py). hasattr-guarded, None-checked -> no-op
+        # for every config without use_dino_graph_fusion=True, incl. v102.
+        if getattr(self, 'dino_graph_fusion_head', None) is not None:
+            all_feat = list(all_feat)
+            all_feat[0] = self.dino_graph_fusion_head(img_3, all_feat[0])
+        # DINO graph-partitioning fusion into feat3 instead of feat0
+        # (discussed 260730 -- eigenvectors encode global/semantic structure,
+        # architecturally closer to feat1/2/3's role than feat0's local-
+        # boundary role). Separate attribute/hook from the feat0 block above.
+        if getattr(self, 'dino_graph_fusion_deep_head', None) is not None:
+            all_feat = list(all_feat)
+            all_feat[3] = self.dino_graph_fusion_deep_head(img_3, all_feat[3])
+        # DINO graph ATTENTION-GATE fusion into feat3 (discussed 260801) --
+        # alternative fusion TYPE to dino_graph_fusion_deep_head above
+        # (concat-based), same feat3 injection point. Separate attribute/
+        # hook, not intended to be combined with dino_graph_fusion_deep_head
+        # in the same config.
+        if getattr(self, 'dino_graph_attention_gate_head', None) is not None:
+            all_feat = list(all_feat)
+            all_feat[3] = self.dino_graph_attention_gate_head(img_3, all_feat[3])
+        # DINO graph fusion at feat2, a SECOND independent injection point on
+        # top of feat3 (discussed 260801, multi-scale injection) -- reuses
+        # DinoGraphFusionHead unchanged. Separate attribute/hook, meant to be
+        # combined with dino_graph_fusion_deep_head (feat3) in the same config.
+        if getattr(self, 'dino_graph_fusion_deep2_head', None) is not None:
+            all_feat = list(all_feat)
+            all_feat[2] = self.dino_graph_fusion_deep2_head(img_3, all_feat[2])
         # 光流指导分割头（仅当 decode_head2 开启 use_flow_feat 时生效）
         _flow_feat = None
         if getattr(self.decode_head2, 'use_flow_feat', False):
             _flow_feat = self._get_flow_feat_for_seg(
                 gt_fw_flows, all_feat[0].shape[-2:], batch_size, im_num)
 
+        # Backbone stem feature (discussed 260731, see models/
+        # multi_scale_seg_head_hires.py) -- only passed to decode_head2 types
+        # that declare use_stem_feat=True (MultiScaleSegHeadHiRes); a no-op
+        # for every other config, incl. v102/v146-v149.
+        _stem_feat = None
+        if getattr(self.decode_head2, 'use_stem_feat', False):
+            _stem_feat = self._backbone_stem_feat
+
+        # DINO graph eigenvectors for decoder-stage injection (discussed
+        # 260801, see models/dino_graph_eigvec_extractor.py) -- computed
+        # once here (if enabled) and passed to decode_head2 regardless of
+        # its type; only MultiScaleSegHeadDecoderPrior actually consumes it,
+        # every other decode_head2 type ignores the kwarg harmlessly.
+        _dino_eigvecs = None
+        if getattr(self, 'dino_graph_eigvec_extractor', None) is not None:
+            _dino_eigvecs = self.dino_graph_eigvec_extractor(img_3)
+
         # [B * I, C=5, 48, 48]
-        all_pred_mask = self._decode_head_forward(all_feat, self.decode_head2, flow_feat=_flow_feat)
+        all_pred_mask = self._decode_head_forward(
+            all_feat, self.decode_head2, flow_feat=_flow_feat, stem_feat=_stem_feat,
+            dino_eigvecs=_dino_eigvecs)
         if self.allow_mask_resize and (all_pred_mask.shape[-2:] != self.mask_size):
             all_pred_mask = self.resize(all_pred_mask, self.mask_size)
         # Change view in the feature: pass in the last feature map only
@@ -627,8 +745,27 @@ class RCFModel(nn.Module):
         _, _, _feat_h, _feat_w = all_pred_mask.shape
         all_pred_mask = all_pred_mask.view(
             batch_size, im_num, self.mask_layer, _feat_h, _feat_w)
+        # DINO graph BAYESIAN prior (discussed 260811, see models/
+        # dino_graph_bayesian_prior.py) -- additive LOG-PRIOR on the raw mask
+        # logits, BEFORE softmax (Bayes' rule in log-space: log-posterior =
+        # log P_cnn(appearance) + log P_dino_prior(appearance)). hasattr/
+        # getattr-guarded no-op for every config without
+        # use_dino_graph_bayesian_prior=True, incl. v102/v144-v160.
+        if getattr(self, 'dino_graph_bayesian_prior_head', None) is not None:
+            _prior_logit = self.dino_graph_bayesian_prior_head(img_3, (_feat_h, _feat_w))
+            _prior_logit = _prior_logit.view(batch_size, im_num, self.mask_layer, _feat_h, _feat_w)
+            all_pred_mask = all_pred_mask + _prior_logit
         # Take softmax across channel dimension (C=5 sum up to 1)
         all_pred_mask = F.softmax(all_pred_mask, dim=2)
+        # DINO graph E-step fusion (discussed 260730, see models/
+        # dino_graph_estep_fusion.py). Separate mechanism/attribute from
+        # dino_graph_fusion_head (v146) above -- hasattr/None-guarded, no-op
+        # for every config without use_dino_graph_estep_fusion=True.
+        if getattr(self, 'dino_graph_estep_fusion_head', None) is not None:
+            _eB, _eI, _eC, _eHm, _eWm = all_pred_mask.shape
+            _fused_mask = self.dino_graph_estep_fusion_head(
+                img_3, all_pred_mask.view(_eB * _eI, _eC, _eHm, _eWm))
+            all_pred_mask = _fused_mask.view(_eB, _eI, _eC, _eHm, _eWm)
         log_all_pred_mask = F.log_softmax(all_pred_mask, dim=2)
 
         # mask shape should be (48, 48), all_pred_mask.shape[-3:]: (2, 48, 48)
@@ -638,6 +775,70 @@ class RCFModel(nn.Module):
         # After resize and view: [B, 1, C=2, 48, 48]
         gt_fw_flows = gt_fw_flows.view(batch_size, flow_num, 2, *self.mask_size)
         gt_bw_flows = gt_bw_flows.view(batch_size, flow_num, 2, *self.mask_size)
+
+        # Image-edge-derived boundary weight (FlowAggregationHeadImageBoundary
+        # only, see that file's docstring) -- hasattr-guarded no-op for every
+        # other decode_head type, so this is a zero-behaviour-change no-op
+        # for v102 and every other existing config.
+        if hasattr(self.decode_head, 'set_external_weights') and hasattr(self.decode_head, 'compute_image_edge_weight'):
+            img_edge_fw = self.decode_head.compute_image_edge_weight(imgs[:, 0])
+            img_edge_bw = self.decode_head.compute_image_edge_weight(imgs[:, 1])
+            if getattr(self.decode_head, 'boundary_mode', 'image_edge') == 'union':
+                flow_fw_normed = self.decode_head.norm_and_clamp_flow(gt_fw_flows[:, 0], seq_names=seq_names)
+                flow_bw_normed = self.decode_head.norm_and_clamp_flow(gt_bw_flows[:, 0], seq_names=seq_names)
+                img_edge_fw = torch.max(img_edge_fw, self.decode_head.detect_flow_changes_batch(flow_fw_normed))
+                img_edge_bw = torch.max(img_edge_bw, self.decode_head.detect_flow_changes_batch(flow_bw_normed))
+            self.decode_head.set_external_weights(img_edge_fw, img_edge_bw)
+
+        # DINO graph motion weight (FlowAggregationHeadGraphMotion only, see
+        # models/flow_aggregation_head_graph_motion.py) -- distinct hasattr
+        # names from the image-edge block above, hasattr-guarded no-op for
+        # every other decode_head type, so v102/v144/v145/v146/v147 and every
+        # other existing config is completely unaffected.
+        if hasattr(self.decode_head, 'set_agg_mask_weights') and hasattr(self.decode_head, 'compute_graph_motion_weight'):
+            graph_motion_w_fw = self.decode_head.compute_graph_motion_weight(imgs[:, 0], all_pred_mask[:, 0])
+            graph_motion_w_bw = self.decode_head.compute_graph_motion_weight(imgs[:, 1], all_pred_mask[:, 1])
+            self.decode_head.set_agg_mask_weights(graph_motion_w_fw, graph_motion_w_bw)
+
+        # EMA-teacher instrument-mask-weighted background fit (discussed
+        # 260811, see FlowAggregationHeadWithResidualV2.set_ema_bg_weights).
+        # hasattr/getattr-guarded no-op for every config without
+        # use_ema_bg_mask=True, incl. v102/v144-v159 -- zero behaviour
+        # change for anything already in flight or completed.
+        if hasattr(self.decode_head, 'set_ema_bg_weights') and getattr(self.decode_head, 'use_ema_bg_mask', False):
+            _warmup_epoch = getattr(self.args, 'bg_mask_exclude_start_epoch', 0)
+            _cur_epoch = getattr(self, 'current_epoch', 0)
+            if (self.backbone2_ema is not None and self.decode_head2_ema is not None
+                    and _cur_epoch >= _warmup_epoch):
+                with torch.no_grad():
+                    ema_feat = self.extract_feat(img_3, self.backbone2_ema)
+                    # mirror forward_eval's eval_on_ema branch: apply the same
+                    # DINO fusion hooks to ema_feat so the EMA instrument-mask
+                    # used here matches what real EMA inference would predict
+                    # (e.g. v152/v157's use_dino_graph_fusion_deep).
+                    if getattr(self, 'dino_graph_fusion_head', None) is not None:
+                        ema_feat = list(ema_feat)
+                        ema_feat[0] = self.dino_graph_fusion_head(img_3, ema_feat[0])
+                    if getattr(self, 'dino_graph_fusion_deep_head', None) is not None:
+                        ema_feat = list(ema_feat)
+                        ema_feat[3] = self.dino_graph_fusion_deep_head(img_3, ema_feat[3])
+                    if getattr(self, 'dino_graph_attention_gate_head', None) is not None:
+                        ema_feat = list(ema_feat)
+                        ema_feat[3] = self.dino_graph_attention_gate_head(img_3, ema_feat[3])
+                    if getattr(self, 'dino_graph_fusion_deep2_head', None) is not None:
+                        ema_feat = list(ema_feat)
+                        ema_feat[2] = self.dino_graph_fusion_deep2_head(img_3, ema_feat[2])
+                    ema_pred_mask = self._decode_head_forward(ema_feat, self.decode_head2_ema)
+                    if self.allow_mask_resize and ema_pred_mask.shape[-2:] != self.mask_size:
+                        ema_pred_mask = self.resize(ema_pred_mask, self.mask_size)
+                    ema_pred_mask = ema_pred_mask.view(
+                        batch_size, im_num, self.mask_layer, *self.mask_size)
+                    ema_pred_mask = F.softmax(ema_pred_mask, dim=2)
+                    inst_chs = self.instrument_channels if self.instrument_channels else [self.instrument_channel]
+                    # background confidence = 1 - P(instrument), summed over
+                    # all configured instrument channels
+                    bg_conf = 1. - ema_pred_mask[:, :, inst_chs].sum(dim=2, keepdim=True)  # [B, I, 1, Hm, Wm]
+                self.decode_head.set_ema_bg_weights(bg_conf[:, 0], bg_conf[:, 1])
 
         # Get flow from the flow head (pred_flows is normalized for visualization)
         pred_flows, loss_flow = self.decode_head(imgs, all_pred_mask, gt_fw_flows, gt_bw_flows, all_pred_residual_fw, all_pred_residual_bw, seq_names=seq_names, gaps=gaps)

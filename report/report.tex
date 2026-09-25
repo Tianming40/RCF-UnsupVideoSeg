@@ -355,12 +355,68 @@ v64 & MultiScaleSegHead + ASPP (dil.\ 6/12/18 + GAP) & 65.57 & 73.32 \\
 MultiScaleSegHead with a parallel-dilation ASPP module, replacing a
 single fusion convolution, was the only architecture change in this
 search that produced a clean, reproducible improvement (v64, sum
-mIoU 138.89, the project's best result up to that point). Subsequent
-refinement attempts on top of this head (finer dilation schedules,
-additional pooling branches, alternative skip-connection patterns)
-consistently failed to exceed v64, indicating the segmentation head's own
-capacity had saturated for this data scale -- further gains, documented
-next, came from the training signal itself rather than the network.
+mIoU 138.89, the project's best result up to that point).
+
+\subsubsection{Multi-scale feature fusion architecture}
+\label{sec:method-fusion}
+
+The backbone (ResNet-50) exposes four feature maps, feat0--feat3, with
+channel widths $256, 512, 1024, 2048$; feat0 is at input resolution $H/4$
+while feat1--feat3 are all at $H/8$. The original FCN-style head used
+only feat0 and feat3; MultiScaleSegHead instead fuses all four in a
+fixed, deterministic sequence:
+
+\begin{enumerate}
+\item \textbf{Per-scale projection.} feat1, feat2 and feat3 are each
+independently projected to a common width of $256$ channels
+(\texttt{mid\_channels}) by their own $1{\times}1$ convolution (no bias)
+followed by batch normalization and ReLU -- three separate projection
+branches, one per scale, sharing no weights.
+\item \textbf{Fusion by summation.} The three projected maps, all at
+$H/8$ and all $256$ channels, are combined by element-wise addition (not
+concatenation): $\text{fused} = \text{proj}_1(\text{feat1}) +
+\text{proj}_2(\text{feat2}) + \text{proj}_3(\text{feat3})$.
+\item \textbf{Cross-scale spatial mixing.} The summed feature is passed
+through a context module operating at $H/8$. In the baseline
+configuration this is a single $3{\times}3$ dilated convolution
+(dilation $6$); v64 replaces it with an ASPP module: four parallel
+$256$-channel branches -- a $1{\times}1$ convolution, and $3{\times}3$
+dilated convolutions at rates $6$, $12$ and $18$ -- plus a fifth
+global-average-pooling branch ($1{\times}1$ convolution on the
+spatially-pooled input, then bilinearly upsampled back to the input
+resolution). All five branch outputs ($5{\times}256$ channels) are
+concatenated and fused back to $256$ channels by a final $1{\times}1$
+convolution with batch normalization and ReLU.
+\item \textbf{Upsample and concatenate feat0.} The $H/8$ fused feature is
+bilinearly upsampled to feat0's exact spatial size ($H/4$) and
+channel-concatenated with feat0 itself ($256$ channels), giving the
+network access to feat0's higher-resolution boundary detail that the
+$H/8$ branches lack.
+\item \textbf{Local refinement and classification.} Two further
+$3{\times}3$ convolutions (each with batch normalization and ReLU)
+refine the concatenated $512$-channel feature back down to $256$
+channels, followed by dropout and a final $1{\times}1$ convolution to
+the $5$ output mask channels. Output resolution is $H/4$, matching
+\texttt{mask\_size}, so no additional resizing is needed before the loss
+is computed.
+\end{enumerate}
+
+This design was later reused as an extension point rather than a fixed
+endpoint: the same summed, upsampled, pre-concatenation feature is where
+Section~\ref{sec:bayesian_prior}'s decoder-stage hooks and this
+project's optional edge/flow-guidance branches (Sobel response of feat0,
+and optical-flow features, each projected to the same $256$-channel
+width and added in, with the flow branch randomly dropped during
+training to close the train/val gap since flow guidance is unavailable
+at test time) are injected, without altering the core fusion path
+described above.
+
+Subsequent refinement attempts on top of this head (finer dilation
+schedules, additional pooling branches, alternative skip-connection
+patterns) consistently failed to exceed v64, indicating the segmentation
+head's own capacity had saturated for this data scale -- further gains,
+documented next, came from the training signal itself rather than the
+network.
 
 \subsection{Signal density and data quality}
 \label{sec:signal_quality}
@@ -676,6 +732,24 @@ and an architecture change (v64) -- and, consistent with the pattern
 argued throughout this paper, the two highest-ranked results are both
 signal-quality corrections rather than new architecture or new
 information sources.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\columnwidth]{figures/g0_miou_progression.pdf}
+\caption{Sum mIoU record progression on grasp0 alone, v9 through v102,
+labeled by the mechanism responsible for each new record. A later,
+same-protocol re-evaluation (this session, Section~\ref{sec:results_summary})
+confirms that none of the subsequent DINO-fusion or background-removal
+variants (v145--v152) surpass v102 on grasp0 in isolation -- their gains,
+discussed next, are concentrated on grasp10 and the combined metric.}
+\label{fig:g0_progression}
+\end{figure}
+
+Figure~\ref{fig:g0_progression} makes the same progression visual: each
+record-breaking version is a distinct, identifiable mechanism, and the
+line is not merely rising over time but rising in discrete, explainable
+steps -- with a long plateau after v102 that the rest of this section
+addresses directly.
 
 \begin{table}[htbp]
 \caption{This session's changes vs.\ the v102/v152 baselines, best checkpoint per configuration (grasp0 + grasp10 combined, sum mIoU)}
